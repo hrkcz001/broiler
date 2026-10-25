@@ -168,27 +168,17 @@ pub fn monitor_label(index: usize, total: usize, name: &str, show_name: bool) ->
     String::new()
 }
 
-/// The tooltip for one icon: monitor label, verified state, brightness when it is known.
+/// The tooltip for one icon: monitor label and the verified state, nothing else.
 ///
-/// The contract asks for all pieces, and for the tray tooltip to stay short enough for the
-/// notification area.
-pub fn tooltip(
-    index: usize,
-    total: usize,
-    name: &str,
-    show_name: bool,
-    state: &str,
-    brightness: Option<u32>,
-) -> String {
+/// A percentage of brightness is not shown. It reads as a claim about the hardware that a stale cache
+/// can get wrong, and the tooltip's job is to name the monitor and the profile.
+pub fn tooltip(index: usize, total: usize, name: &str, show_name: bool, state: &str) -> String {
     let mut text = monitor_label(index, total, name, show_name);
     if !state.is_empty() {
         if !text.is_empty() {
             text.push_str(" - ");
         }
         text.push_str(state);
-    }
-    if let Some(value) = brightness {
-        text.push_str(&format!(", {value}%"));
     }
     // The shell truncates at 127 characters plus a terminator.
     if text.chars().count() > 120 {
@@ -1423,18 +1413,18 @@ mod tests {
     }
 
     #[test]
-    fn a_tooltip_carries_index_state_and_brightness() {
+    fn a_tooltip_carries_the_index_and_the_state_but_no_percentage() {
         assert_eq!(
-            tooltip(2, 3, "MSI MAG275R", true, "Night", Some(0)),
-            "2/3 MSI MAG275R - Night, 0%"
+            tooltip(2, 3, "MSI MAG275R", true, "Night"),
+            "2/3 MSI MAG275R - Night"
         );
         // With one monitor the index is redundant; the name follows the preference.
         assert_eq!(
-            tooltip(1, 1, "MSI MAG275R", true, "Custom", None),
+            tooltip(1, 1, "MSI MAG275R", true, "Custom"),
             "MSI MAG275R - Custom"
         );
-        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Custom", None), "Custom");
-        assert!(tooltip(1, 1, "MSI MAG275R", true, "Custom", None).chars().count() <= 120);
+        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Custom"), "Custom");
+        assert!(tooltip(1, 1, "MSI MAG275R", true, "Custom").chars().count() <= 120);
     }
 
     #[test]
@@ -1447,13 +1437,16 @@ mod tests {
         assert_eq!(monitor_label(2, 2, "MSI MAG275R", false), "2/2 MSI MAG275R");
         assert_eq!(monitor_label(2, 2, "MSI MAG275R", true), "2/2 MSI MAG275R");
         // With the name omitted the tooltip starts at the state, with no leading separator.
-        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Night", Some(40)), "Night, 40%");
+        // The tooltip names the profile and nothing else: a brightness percentage here was a claim
+        // about the hardware that a stale cache could get wrong.
+        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Night"), "Night");
+        assert_eq!(tooltip(1, 1, "MSI MAG275R", true, "Night"), "MSI MAG275R - Night");
     }
 
     #[test]
     fn a_long_tooltip_is_truncated_without_splitting_a_character() {
         let name = "М".repeat(200);
-        let text = tooltip(1, 1, &name, true, "Night", None);
+        let text = tooltip(1, 1, &name, true, "Night");
         assert!(text.chars().count() <= 120, "{}", text.chars().count());
         assert!(text.ends_with('…'));
     }

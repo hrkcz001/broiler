@@ -401,35 +401,9 @@ unsafe extern "system" fn settings_proc(
             if settings.is_null() {
                 return 1;
             }
-            let settings = &*settings;
-            let snapshot = (settings.snapshot)(settings.user);
-            let combo = GetDlgItem(window, COMBO);
-            for (index, (label, _)) in left_click_items().iter().enumerate() {
-                let text = to_wide(label);
-                SendMessageW(combo, CB_ADDSTRING, index, text.as_ptr() as isize);
-            }
-            SendMessageW(
-                combo,
-                CB_SETCURSEL,
-                left_click_index(snapshot.left_click),
-                0,
-            );
-            SendMessageW(
-                settings.monitor_name,
-                BM_SETCHECK,
-                if snapshot.always_show_monitor_name {
-                    BST_CHECKED
-                } else {
-                    BST_UNCHECKED
-                },
-                0,
-            );
-            // This build registers nothing at logon, so the control is shown and disabled rather than
-            // offering a promise it cannot keep.
-            EnableWindow(GetDlgItem(window, STARTUP_BOX), 0);
-            let text = to_wide(&summary_text(snapshot.monitors, snapshot.profiles));
-            SetWindowTextW(settings.summary, text.as_ptr());
-            SetFocus(combo);
+            // Nothing else happens here. The controls are found through `GetDlgItem` after the dialog
+            // exists, so a checkbox set from this message would be set on a null handle and would show
+            // as unchecked no matter what was stored. `Settings::open` fills them once they are known.
             1
         }
         WM_COMMAND => {
@@ -550,6 +524,15 @@ impl Settings {
             state.monitor_name = GetDlgItem(window, MONITOR_NAME_BOX);
             // The summary static has no identifier, so it is found by position among the children.
             state.summary = summary_handle(window);
+            // The combo's items exist for the life of the window; its selection and the checkbox state
+            // are set from the stored settings now that every handle is real.
+            for (index, (label, _)) in left_click_items().iter().enumerate() {
+                let text = to_wide(label);
+                SendMessageW(state.combo, CB_ADDSTRING, index, text.as_ptr() as isize);
+            }
+            EnableWindow(GetDlgItem(window, STARTUP_BOX), 0);
+            state.set_snapshot(snapshot);
+            SetFocus(state.combo);
 
             let area = work_area_around_cursor().unwrap_or(RECT {
                 left: 0,
@@ -693,6 +676,20 @@ mod tests {
         // No maximise or minimise box: a settings dialog is not a resizable document window.
         assert_eq!(style & 0x0001_0000, 0, "WS_MAXIMIZEBOX must not be set");
         assert_eq!(style & 0x0002_0000, 0, "WS_MINIMIZEBOX must not be set");
+    }
+
+    fn read_snapshot(_: *mut c_void) -> Snapshot {
+        Snapshot {
+            left_click: LeftClick::Cycle,
+            always_show_monitor_name: true,
+            monitors: 1,
+            profiles: 2,
+            start_at_logon: false,
+        }
+    }
+
+    fn apply_nothing(_: *mut c_void, _: Action) -> bool {
+        true
     }
 
     #[test]

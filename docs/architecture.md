@@ -314,7 +314,9 @@ Use `Shell_NotifyIconW` with one stable GUID per monitor identity and `NOTIFYICO
   `WM_LBUTTONUP` and `NIN_SELECT` for one physical press of a version-4 icon, so the decoder accepts
   one event per negotiated encoding and ignores the rest.
 - Right activation: native `HMENU` with exactly `Settings` and `Exit`. Exit stops the whole broiler instance, not merely one icon.
-- Tooltip: monitor index/name, verified profile or Custom, observed brightness when known, and short operation/error state.
+- Tooltip: monitor index/name, verified profile or Custom, and short operation/error state. No brightness
+  percentage: it is a claim about the hardware that a stale cache can get wrong, and the tooltip's job
+  is to name the monitor and the profile.
 - Windows may initially place icons in notification overflow; do not hack shell preferences or promise forced pinning.
 
 ### Built-in icons and badges

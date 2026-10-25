@@ -814,21 +814,17 @@ fn tray_tooltip(user: *mut std::ffi::c_void, monitor: usize) -> String {
         .get(monitor)
         .cloned()
         .unwrap_or_else(|| fallback.clone());
-    let (brightness, state, show_name) = match host.coordinator.lock() {
+    let (state, show_name) = match host.coordinator.lock() {
         Ok(guard) => {
-            let brightness = guard
-                .cached_reading(&fallback, "brightness")
-                .map(|reading| reading.current as u32);
             // The display name of the profile, not the file id the user never sees.
             (
-                brightness,
                 state_label(&guard, &fallback),
                 guard.settings().always_show_monitor_name,
             )
         }
-        Err(_) => (None, String::from("Custom"), false),
+        Err(_) => (String::from("Custom"), false),
     };
-    crate::tray::tooltip(monitor + 1, total, &name, show_name, &state, brightness)
+    crate::tray::tooltip(monitor + 1, total, &name, show_name, &state)
 }
 
 fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate::tray::Activation) {
@@ -1711,8 +1707,8 @@ mod tests {
             .expect("direct set");
         assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Matched);
         assert_eq!(
-            crate::tray::tooltip(1, 1, "Panel", true, &state_label(&coordinator, "mon-a"), Some(40)),
-            "Panel - Night mode, 40%"
+            crate::tray::tooltip(1, 1, "Panel", true, &state_label(&coordinator, "mon-a")),
+            "Panel - Night mode"
         );
         let _ = std::fs::remove_dir_all(base);
     }

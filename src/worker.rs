@@ -20,6 +20,7 @@ use crate::win::ddc;
 /// Control names accepted by the worker. There is no numeric VCP code in the protocol.
 pub const CONTROL_BRIGHTNESS: &str = "brightness";
 pub const CONTROL_CONTRAST: &str = "contrast";
+pub const CONTROL_COLOR_TEMPERATURE: &str = "color_temperature";
 
 fn ok(id: u64, result: Value) -> Response {
     Response {
@@ -65,15 +66,18 @@ fn resolve_handle(id: &str) -> Result<isize, Failure> {
     }
 }
 
-fn control_of(params: &Value) -> Result<bool, Response> {
+fn control_of(params: &Value) -> Result<ddc::DdcControl, Response> {
     let control = string_param(params, "control")?;
     match control.as_str() {
-        CONTROL_BRIGHTNESS => Ok(false),
-        CONTROL_CONTRAST => Ok(true),
+        CONTROL_BRIGHTNESS => Ok(ddc::DdcControl::Brightness),
+        CONTROL_CONTRAST => Ok(ddc::DdcControl::Contrast),
+        CONTROL_COLOR_TEMPERATURE => Ok(ddc::DdcControl::ColorTemperature),
         other => Err(fail(
             0,
             "unsupported",
-            format!("`{other}` is not a worker control; only brightness and contrast exist"),
+            format!(
+                "`{other}` is not a worker control; brightness, contrast and color_temperature exist"
+            ),
         )),
     }
 }
@@ -123,7 +127,7 @@ fn handle_request(request: &Request) -> Response {
                     return response;
                 }
             };
-            let contrast = match control_of(&request.params) {
+            let control = match control_of(&request.params) {
                 Ok(value) => value,
                 Err(mut response) => {
                     response.id = request.id;
@@ -134,7 +138,7 @@ fn handle_request(request: &Request) -> Response {
                 Ok(handle) => handle,
                 Err(failure) => return fail(request.id, &failure.kind, failure.message),
             };
-            match ddc::with_physical_monitor(hmonitor, |handle| ddc::read_control(handle, contrast))
+            match ddc::with_physical_monitor(hmonitor, |handle| ddc::read_control(handle, control))
             {
                 Ok(Ok(reading)) => ok(
                     request.id,
@@ -157,7 +161,7 @@ fn handle_request(request: &Request) -> Response {
                     return response;
                 }
             };
-            let contrast = match control_of(&request.params) {
+            let control = match control_of(&request.params) {
                 Ok(value) => value,
                 Err(mut response) => {
                     response.id = request.id;
@@ -174,7 +178,7 @@ fn handle_request(request: &Request) -> Response {
             };
 
             let written = ddc::with_physical_monitor(hmonitor, |handle| {
-                ddc::write_control(handle, contrast, value)
+                ddc::write_control(handle, control, value)
             });
             let assigned_backend = match written {
                 Ok(Ok(backend)) => backend,
@@ -183,7 +187,7 @@ fn handle_request(request: &Request) -> Response {
             };
 
             // Read back inside the same process so the verified value belongs to this operation.
-            match ddc::with_physical_monitor(hmonitor, |handle| ddc::read_control(handle, contrast))
+            match ddc::with_physical_monitor(hmonitor, |handle| ddc::read_control(handle, control))
             {
                 Ok(Ok(reading)) => ok(
                     request.id,

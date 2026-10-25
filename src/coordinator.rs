@@ -26,7 +26,7 @@ use crate::transport::{ControlReading, MonitorSummary, Transport, TransportError
 /// The planner knows every control in the registry; this list is the narrower set the current
 /// backend can actually send. A requested control outside it is reported as `not_implemented`
 /// rather than silently dropped or misrepresented as a device limitation.
-const WRITE_PATH_CONTROLS: &[&str] = &["brightness", "contrast"];
+const WRITE_PATH_CONTROLS: &[&str] = &["brightness", "contrast", "color_temperature"];
 
 fn build_writes(control: &str) -> bool {
     WRITE_PATH_CONTROLS.contains(&control)
@@ -34,7 +34,7 @@ fn build_writes(control: &str) -> bool {
 
 /// Controls this build can read. Everything else a profile requests is recorded as unavailable for
 /// observation, which makes a candidate containing it unverified instead of silently ignored.
-const READABLE_CONTROLS: &[&str] = &["brightness", "contrast"];
+const READABLE_CONTROLS: &[&str] = &["brightness", "contrast", "color_temperature"];
 
 /// Controls a profile requests that this build cannot write at all.
 fn unimplemented_controls(profile: &Profile) -> Vec<&'static str> {
@@ -740,6 +740,30 @@ impl<T: Transport> Coordinator<T> {
                 "brightness" => metadata.brightness = support,
                 "contrast" => metadata.contrast = support,
                 _ => {}
+            }
+        }
+        if controls.iter().any(|control| *control == "color_temperature") {
+            // The preset table comes from the display itself. Without it a native 0x14 value cannot be
+            // validated, and writing one would be a guess about what the number means on this panel.
+            if let Ok(Some(raw)) = self.transport.capabilities(monitor) {
+                let parsed = crate::caps::parse(&crate::win::ddc::CapabilitiesRaw {
+                    declared_length: raw.chars().count() as u32,
+                    text: raw,
+                });
+                if let Some(values) = parsed.values_for(crate::win::ddc::VCP_COLOR_TEMPERATURE) {
+                    let values: Vec<u64> = values.iter().map(|value| *value as u64).collect();
+                    metadata.color_preset = DeviceValueSupport::Enumerated {
+                        values: values.clone(),
+                    };
+                    metadata.color_temperature.presets = values;
+                }
+                if let Some(values) = parsed.values_for(crate::config::profile::VCP_COLOR_REQUEST as u8) {
+                    // 0x0C is a plain integer request code, so only its advertised span is useful.
+                    if let (Some(first), Some(last)) = (values.first(), values.last()) {
+                        metadata.color_temperature.request_range =
+                            Some((*first as u64, *last as u64));
+                    }
+                }
             }
         }
         Ok(metadata)
@@ -1534,6 +1558,76 @@ mod tests {
         assert_eq!(error.kind, "invalid");
         assert!(coordinator.transport.writes.is_empty());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_native_temperature_value_is_validated_against_the_panels_own_list() {
+        // The regression this guards: writing 8 to VCP 0x14 because a standard table says 8 means
+        // something, on a panel whose own list may not even contain 8.
+        let directory = scratch("temperature");
+        let mut transport = FakeTransport::with_monitor("mon-a", "Panel")
+            .with_value("mon-a", "brightness", 40)
+            .with_value("mon-a", "contrast", 50);
+        transport.capabilities = Some(String::from(
+            "prot(monitor)type(lcd)vcp(020405080B0C101214(0506080B)D6(0104))mccs_ver(2.1)",
+        ));
+        let profiles = vec![sample_profile(
+            "day",
+            10,
+            "brightness = 100
+contrast = 50
+color_temperature = { vcp = 0x14, raw = 8 }",
+        )];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        let result = coordinator
+            .handle(
+                "profile.apply",
+                &json!({"id": "day", "monitor": "mon-a", "wait": true}),
+            )
+            .expect("apply");
+        assert_eq!(
+            result["status"], "applied",
+            "the panel lists 8, so the write is a validated one: {result}"
+        );
+        let temperature = result["monitors"][0]["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .find(|field| field["control"] == "color_temperature")
+            .cloned()
+            .expect("a color_temperature field");
+        assert_eq!(temperature["native"], 8);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_native_temperature_value_the_panel_does_not_list_is_refused_before_any_write() {
+        let directory = scratch("temperature-refused");
+        let mut transport = FakeTransport::with_monitor("mon-a", "Panel");
+        transport.capabilities = Some(String::from(
+            "prot(monitor)type(lcd)vcp(101214(0506080B))mccs_ver(2.1)",
+        ));
+        let profiles = vec![sample_profile(
+            "day",
+            10,
+            "brightness = 40
+color_temperature = { vcp = 0x14, raw = 9 }",
+        )];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        // The panel lists 5, 6, 8 and 11. A value outside that list is not "unsupported hardware", it
+        // is an invalid request, and it is refused in the preflight so nothing is written at all.
+        let error = coordinator
+            .handle(
+                "profile.apply",
+                &json!({"id": "day", "monitor": "mon-a", "wait": true}),
+            )
+            .expect_err("9 is not an accepted value on this panel");
+        assert_eq!(error.kind, "invalid");
+        assert!(error.message.contains("0x05"), "{}", error.message);
+        assert!(error.message.contains("0x08"), "{}", error.message);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

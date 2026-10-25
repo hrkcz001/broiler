@@ -92,6 +92,13 @@ pub trait Transport {
         value: u64,
     ) -> Result<WriteOutcome, TransportError>;
 
+    /// The display's own capabilities string, when it can be read.
+    ///
+    /// Used to validate a native value against what the panel advertises. A monitor that reports
+    /// nothing gets `None`, which is not evidence of absence: the planner then falls back to the
+    /// standard table or refuses, rather than inventing support.
+    fn capabilities(&mut self, monitor: &str) -> Result<Option<String>, TransportError>;
+
     /// Diagnostic hook: peak number of operations that were inside this transport at once.
     ///
     /// Only the fake transport implements it; a real transport returns `None` because the worker
@@ -170,6 +177,19 @@ impl Transport for WorkerTransport {
             .collect())
     }
 
+    fn capabilities(&mut self, monitor: &str) -> Result<Option<String>, TransportError> {
+        match self.call("capabilities", json!({"monitor": monitor})) {
+            Ok(result) => Ok(result
+                .get("raw")
+                .and_then(Value::as_str)
+                .map(str::to_string)),
+            // A display that cannot report its capabilities is not an error for the caller: it only
+            // means a native value cannot be checked against the panel's own list.
+            Err(TransportError::Unsupported(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn read(&mut self, monitor: &str, control: &str) -> Result<ControlReading, TransportError> {
         let result = self.call("read", json!({"monitor": monitor, "control": control}))?;
         Ok(ControlReading {
@@ -220,6 +240,8 @@ pub struct FakeTransport {
     pub fail_next_write: Option<TransportError>,
     /// Report a different value than the one written.
     pub observe_offset: i64,
+    /// A capabilities string the fake reports, so a test can exercise value validation.
+    pub capabilities: Option<String>,
     /// Controls a monitor positively does not offer; reads and writes report `unsupported`.
     pub absent: Vec<(String, String)>,
     /// Writes that fail once with the given error, in registration order.
@@ -302,6 +324,10 @@ impl FakeTransport {
 }
 
 impl Transport for FakeTransport {
+    fn capabilities(&mut self, _monitor: &str) -> Result<Option<String>, TransportError> {
+        Ok(self.capabilities.clone())
+    }
+
     fn monitors(&mut self) -> Result<Vec<MonitorSummary>, TransportError> {
         self.enter();
         let result = self.monitors.clone();

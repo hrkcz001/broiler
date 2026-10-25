@@ -28,6 +28,39 @@ use super::wide::from_wide_field;
 pub const VCP_BRIGHTNESS: u8 = 0x10;
 /// VCP code for contrast.
 pub const VCP_CONTRAST: u8 = 0x12;
+/// Colour temperature presets. The values are the display's own, not a standard table's.
+pub const VCP_COLOR_TEMPERATURE: u8 = 0x14;
+
+/// The controls this module is allowed to touch.
+///
+/// A closed enum rather than a caller-supplied code: configuration and the CLI can ask for one of
+/// these three and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DdcControl {
+    Brightness,
+    Contrast,
+    ColorTemperature,
+}
+
+impl DdcControl {
+    /// The VCP code this control is written and read with.
+    pub(crate) fn vcp(self) -> u8 {
+        match self {
+            DdcControl::Brightness => VCP_BRIGHTNESS,
+            DdcControl::Contrast => VCP_CONTRAST,
+            DdcControl::ColorTemperature => VCP_COLOR_TEMPERATURE,
+        }
+    }
+
+    /// Whether the Win32 high-level getter and setter cover this control.
+    ///
+    /// Colour temperature is excluded on purpose: `SetMonitorColorTemperature` takes an
+    /// `MC_COLOR_TEMPERATURE` ordinal, which is a different scale from the values VCP `0x14` accepts,
+    /// and mixing them would write a meaning the user did not ask for.
+    fn has_high_level(self) -> bool {
+        matches!(self, DdcControl::Brightness | DdcControl::Contrast)
+    }
+}
 
 /// How a failed DDC operation is described. Never conflated with "unsupported".
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,7 +411,7 @@ pub(crate) fn set_high_level(handle: HANDLE, contrast: bool, value: u32) -> Resu
 /// Only the codes in this module's control registry reach here; there is no caller-supplied code
 /// path from configuration or the CLI.
 pub(crate) fn set_vcp(handle: HANDLE, code: u8, value: u32) -> Result<(), DdcError> {
-    if code != VCP_BRIGHTNESS && code != VCP_CONTRAST {
+    if code != VCP_BRIGHTNESS && code != VCP_CONTRAST && code != VCP_COLOR_TEMPERATURE {
         return Err(DdcError::Api {
             call: "SetVCPFeature",
             win32_error: 87, // ERROR_INVALID_PARAMETER
@@ -405,8 +438,21 @@ pub(crate) struct ControlReading {
 }
 
 /// Read one allowlisted control through the high-level getter, falling back to VCP.
-pub(crate) fn read_control(handle: HANDLE, contrast: bool) -> Result<ControlReading, DdcError> {
-    match read_high_level(handle, contrast) {
+pub(crate) fn read_control(
+    handle: HANDLE,
+    control: DdcControl,
+) -> Result<ControlReading, DdcError> {
+    if !control.has_high_level() {
+        // Straight to VCP: there is no high-level getter whose scale matches this control's values.
+        let reading = read_vcp(handle, control.vcp())?;
+        return Ok(ControlReading {
+            minimum: None,
+            current: reading.current,
+            maximum: reading.maximum,
+            backend: "dxva2-vcp",
+        });
+    }
+    match read_high_level(handle, control == DdcControl::Contrast) {
         Ok(reading) => Ok(ControlReading {
             minimum: Some(reading.minimum),
             current: reading.current,
@@ -414,8 +460,7 @@ pub(crate) fn read_control(handle: HANDLE, contrast: bool) -> Result<ControlRead
             backend: "dxva2-high-level",
         }),
         Err(high_level_error) => {
-            let code = if contrast { VCP_CONTRAST } else { VCP_BRIGHTNESS };
-            match read_vcp(handle, code) {
+            match read_vcp(handle, control.vcp()) {
                 // The low-level getter reports no minimum: it is left absent rather than invented.
                 Ok(reading) => Ok(ControlReading {
                     minimum: None,
@@ -432,16 +477,16 @@ pub(crate) fn read_control(handle: HANDLE, contrast: bool) -> Result<ControlRead
 /// Write one allowlisted control, preferring the high-level setter.
 pub(crate) fn write_control(
     handle: HANDLE,
-    contrast: bool,
+    control: DdcControl,
     value: u32,
 ) -> Result<&'static str, DdcError> {
-    if set_high_level(handle, contrast, value).is_ok() {
+    if control.has_high_level() && set_high_level(handle, control == DdcControl::Contrast, value).is_ok()
+    {
         return Ok("dxva2-high-level");
     }
     // A high-level failure is not retried at the low level when the outcome is uncertain: only a
     // definite refusal falls through, and the caller verifies by readback either way.
-    let code = if contrast { VCP_CONTRAST } else { VCP_BRIGHTNESS };
-    set_vcp(handle, code, value)?;
+    set_vcp(handle, control.vcp(), value)?;
     Ok("dxva2-vcp")
 }
 

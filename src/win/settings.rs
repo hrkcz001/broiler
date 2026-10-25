@@ -678,20 +678,6 @@ mod tests {
         assert_eq!(style & 0x0002_0000, 0, "WS_MINIMIZEBOX must not be set");
     }
 
-    fn read_snapshot(_: *mut c_void) -> Snapshot {
-        Snapshot {
-            left_click: LeftClick::Cycle,
-            always_show_monitor_name: true,
-            monitors: 1,
-            profiles: 2,
-            start_at_logon: false,
-        }
-    }
-
-    fn apply_nothing(_: *mut c_void, _: Action) -> bool {
-        true
-    }
-
     #[test]
     fn the_selector_is_a_dropdown_list_and_not_an_editable_field() {
         let style = combo_style();

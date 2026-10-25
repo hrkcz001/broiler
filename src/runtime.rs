@@ -1480,6 +1480,13 @@ impl TransientTransport {
 }
 
 impl Transport for TransientTransport {
+    fn capabilities(
+        &mut self,
+        monitor: &str,
+    ) -> Result<Option<String>, crate::transport::TransportError> {
+        self.inner.capabilities(monitor)
+    }
+
     fn monitors(
         &mut self,
     ) -> Result<Vec<crate::transport::MonitorSummary>, crate::transport::TransportError> {

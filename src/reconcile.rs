@@ -140,6 +140,10 @@ pub enum CurrentState {
     Matched,
     /// This process applied this profile and verified the readback.
     Applied,
+    /// This process sent every write this profile asks for, but at least one field cannot be read
+    /// back, so the result is not certified. The profile is named, because it was chosen and written,
+    /// and the reason says which field could not be confirmed.
+    AppliedUnverified,
     /// Complete reads exclude every loaded profile.
     Custom,
     /// Reads are insufficient to certify a match or to exclude every candidate.
@@ -153,6 +157,7 @@ impl CurrentState {
             CurrentState::Checking => "checking",
             CurrentState::Matched => "matched",
             CurrentState::Applied => "applied_verified",
+            CurrentState::AppliedUnverified => "applied_unverified",
             CurrentState::Custom => "custom",
             CurrentState::Unknown => "unknown",
         }
@@ -184,6 +189,19 @@ impl CurrentProfile {
 
     pub fn checking() -> CurrentProfile {
         CurrentProfile::new(CurrentState::Checking)
+    }
+
+    /// A profile whose writes were all sent but not all verified.
+    pub fn applied_unverified(
+        profile_id: &str,
+        reason: impl Into<String>,
+        observed_at: &str,
+    ) -> CurrentProfile {
+        let mut profile = CurrentProfile::new(CurrentState::AppliedUnverified);
+        profile.profile_id = Some(profile_id.to_string());
+        profile.reason = Some(reason.into());
+        profile.observed_at = Some(observed_at.to_string());
+        profile
     }
 
     pub fn unknown(reason: impl Into<String>) -> CurrentProfile {

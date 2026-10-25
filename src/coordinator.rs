@@ -447,6 +447,22 @@ impl<T: Transport> Coordinator<T> {
         self.persist_state();
     }
 
+    /// Record a profile whose writes were all sent, at least one of them unverifiable.
+    ///
+    /// The profile is named and it becomes the base the next cycle starts from; the history is not
+    /// touched, so a tie-breaker is still only ever decided by verified evidence.
+    fn note_sent(&mut self, monitor: &str, profile: &Profile, reason: &str) {
+        let at = crate::clock::iso_local();
+        self.last_applied
+            .insert(monitor.to_string(), profile.id.clone());
+        self.current.insert(
+            monitor.to_string(),
+            CurrentProfile::applied_unverified(&profile.id, reason, &at),
+        );
+        self.state.forget(monitor);
+        self.persist_state();
+    }
+
     /// Drop any claim about a monitor after a write whose effect is not verified.
     ///
     /// A partial or unknown outcome means the hardware is in a state nobody observed. The old answer is
@@ -876,7 +892,6 @@ impl<T: Transport> Coordinator<T> {
                         // visibly changes. Claiming a failed write would be wrong, and claiming a
                         // verified one would be a lie, so the field is recorded as sent but unverified
                         // and the rest of the profile still runs.
-                        applied += 1;
                         fields.push(json!({
                             "control": control,
                             "status": "applied_unverified",
@@ -954,8 +969,15 @@ impl<T: Transport> Coordinator<T> {
                 .iter()
                 .filter(|field| field["status"] != "applied")
                 .count();
+            let unverified = fields
+                .iter()
+                .filter(|field| field["status"] == "applied_unverified")
+                .count();
             let status = if applied > 0 && not_applied_fields == 0 {
                 "applied"
+            } else if applied > 0 && unverified > 0 && unverified + applied == fields.len() {
+                // Every requested write was sent; at least one simply cannot be read back.
+                "applied_unverified"
             } else if applied > 0 {
                 "partial"
             } else {
@@ -966,6 +988,12 @@ impl<T: Transport> Coordinator<T> {
                 // Every requested field was written and the readback matched, which is the one case
                 // where the coordinator may claim the hardware is in this profile.
                 self.note_applied(&monitor, &profile);
+            } else if status == "applied_unverified" {
+                self.note_sent(
+                    &monitor,
+                    &profile,
+                    "every write was sent; one field cannot be read back on this display",
+                );
             } else {
                 // A partial or failed apply leaves the monitor in an unverified state; an older
                 // profile id must not stay labelled active.
@@ -996,8 +1024,14 @@ impl<T: Transport> Coordinator<T> {
             .iter()
             .filter(|row| row["status"] == "partial")
             .count();
+        let unverified_targets = results
+            .iter()
+            .filter(|row| row["status"] == "applied_unverified")
+            .count();
         let status = if applied_targets == results.len() {
             "applied"
+        } else if unverified_targets > 0 && unverified_targets + applied_targets == results.len() {
+            "applied_unverified"
         } else if applied_targets > 0 || partial_targets > 0 {
             "partial"
         } else {

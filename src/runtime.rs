@@ -500,6 +500,9 @@ pub fn run_resident(storage: StorageContext) -> i32 {
         storage: storage.clone(),
         targets: targets.clone(),
         left_click: left_click_behaviour(&coordinator),
+        tray_window: std::sync::atomic::AtomicIsize::new(0),
+        last_failure: Arc::new(Mutex::new(None)),
+        applying: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let user = Box::into_raw(host) as *mut std::ffi::c_void;
 
@@ -511,6 +514,10 @@ pub fn run_resident(storage: StorageContext) -> i32 {
             activate: tray_activate,
             settings: tray_settings,
             exit: tray_exit,
+            flyout: tray_flyout_content,
+            choose: tray_choose,
+            glyph: tray_glyph,
+            failure: tray_failure,
         },
     );
 
@@ -527,6 +534,15 @@ pub fn run_resident(storage: StorageContext) -> i32 {
     // A `stop` from the command line must end this process, not just its coordinator. The watcher
     // polls the shutdown flag, ends this message loop, and releases the daemon's blocked accept.
     let quit_window = tray.window_id();
+    unsafe {
+        if let Some(host) = (user as *mut TrayHost).as_ref() {
+            host.tray_window
+                .store(quit_window, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if let Ok(mut guard) = coordinator.lock() {
+        guard.set_ui_window(quit_window);
+    }
     spawn_stop_watchdog(Arc::clone(&coordinator), storage.clone(), Some(quit_window));
     let daemon_coordinator = Arc::clone(&coordinator);
     let daemon = std::thread::spawn(move || Daemon::new(endpoint, daemon_coordinator).run());
@@ -598,32 +614,25 @@ struct TrayHost {
     storage: StorageContext,
     targets: Vec<String>,
     left_click: crate::config::settings::LeftClick,
+    /// The tray owner window, so the coordinator thread can ask the UI thread for a flyout.
+    tray_window: std::sync::atomic::AtomicIsize,
+    /// Why the most recent apply failed, read by the row that reports it.
+    last_failure: Arc<Mutex<Option<String>>>,
+    /// The monitor a profile is being applied to, so a second click cannot start a second writer.
+    applying: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Which monitors a resident instance controls.
+///
+/// The list lives on the coordinator so the pipe answers `ui.flyout` with the same slot indices the
+/// tray icons use; two implementations would drift.
 fn resident_targets(
     coordinator: &Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
 ) -> Vec<String> {
-    let Ok(mut guard) = coordinator.lock() else {
-        return Vec::new();
-    };
-    let settings = guard.settings().clone();
-    let present: Vec<String> = guard
-        .monitors()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|monitor| monitor.id)
-        .collect();
-    if settings.monitor_ids.is_empty() {
-        return present;
+    match coordinator.lock() {
+        Ok(mut guard) => guard.resident_targets(),
+        Err(_) => Vec::new(),
     }
-    // A remembered selection with a display missing keeps its order and drops what is gone.
-    settings
-        .monitor_ids
-        .iter()
-        .filter(|id| present.iter().any(|seen| seen == *id))
-        .cloned()
-        .collect()
 }
 
 fn left_click_behaviour(
@@ -700,14 +709,283 @@ fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate
             }
         }
         crate::config::settings::LeftClick::Flyout => {
-            // The flyout is its own gate. Reporting it is better than silently cycling instead.
-            log_info!("the profile flyout is not implemented in this build; use the CLI or cycle profiles");
-            output::error_line(&format!(
-                "{}: the profile flyout is not implemented in this build",
-                PRODUCT_NAME
+            // The UI thread owns the window; this callback runs on it, so the message is queued and
+            // handled by the tray procedure with the rest of the window work.
+            let window = host
+                .tray_window
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if window != 0 {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        window as windows_sys::Win32::Foundation::HWND,
+                        crate::win::flyout::OPEN,
+                        monitor,
+                        0,
+                    );
+                }
+            } else {
+                log_error!("the flyout was requested before the tray window existed");
+                output::error_line(&format!(
+                    "{}: the profile flyout is not available yet",
+                    PRODUCT_NAME
+                ));
+            }
+        }
+    }
+}
+
+/// The rows the flyout shows: every profile in registry order, with the verified one marked.
+///
+/// The current marker comes from `applied_profile`, which only reports what this process verified;
+/// an edited file or a monitor that was never touched shows no marker rather than a guess.
+fn tray_flyout_content(
+    user: *mut std::ffi::c_void,
+    slot: usize,
+) -> crate::win::flyout::Content {
+    use crate::win::flyout::{Content, Item, State};
+
+    let Some(host) = (unsafe { host(user) }) else {
+        return Content {
+            title: crate::win::flyout::title_text(slot + 1, PRODUCT_NAME),
+            items: Vec::new(),
+        };
+    };
+    let Some(id) = host.targets.get(slot).cloned() else {
+        return Content {
+            title: crate::win::flyout::title_text(slot + 1, PRODUCT_NAME),
+            items: Vec::new(),
+        };
+    };
+    let Ok(mut guard) = host.coordinator.lock() else {
+        return Content {
+            title: crate::win::flyout::title_text(slot + 1, &id),
+            items: Vec::new(),
+        };
+    };
+    let name = guard
+        .monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|seen| seen.id == id)
+        .map(|seen| seen.friendly_name)
+        .unwrap_or_else(|| id.clone());
+    let current = guard.applied_profile(&id).map(str::to_string);
+    let listed = guard
+        .handle("profiles.list", &serde_json::Value::Null)
+        .ok()
+        .and_then(|result| result.get("profiles").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let items = listed
+        .iter()
+        .filter_map(|profile| {
+            let profile_id = profile.get("id")?.as_str()?.to_string();
+            let label = profile
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&profile_id)
+                .to_string();
+            let state = if current.as_deref() == Some(profile_id.as_str()) {
+                State::Current
+            } else {
+                State::Normal
+            };
+            Some(Item {
+                id: profile_id,
+                name: label,
+                state,
+            })
+        })
+        .collect();
+    Content {
+        title: crate::win::flyout::title_text(slot + 1, &name),
+        items,
+    }
+}
+
+/// Apply the profile the user picked, off the UI thread, and report the outcome back to the tray.
+///
+/// The UI thread must never wait for a DDC transaction, so the work happens here and the answer
+/// arrives as a posted message. A second click while one apply is in flight is refused with a
+/// reason, because two writers to the same monitor is exactly what the product forbids.
+fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
+    let Some(host) = (unsafe { host(user) }) else {
+        return;
+    };
+    let Some(monitor) = host.targets.get(slot).cloned() else {
+        return;
+    };
+    let window = host
+        .tray_window
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let profile = match host.coordinator.lock() {
+        Ok(mut guard) => guard
+            .handle("profiles.list", &serde_json::Value::Null)
+            .ok()
+            .and_then(|result| result.get("profiles").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .get(row)
+            .and_then(|profile| profile.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Err(_) => None,
+    };
+    let Some(profile) = profile else {
+        return;
+    };
+
+    if host
+        .applying
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        log_error!("a profile is already being applied; the click was ignored");
+        if let Ok(mut guard) = host.last_failure.lock() {
+            *guard = Some(String::from("another profile is being applied"));
+        }
+        if window != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    window as windows_sys::Win32::Foundation::HWND,
+                    crate::win::flyout::RESULT,
+                    row,
+                    1,
+                );
+            }
+        }
+        return;
+    }
+
+    let coordinator = Arc::clone(&host.coordinator);
+    let failure = Arc::clone(&host.last_failure);
+    let applying = Arc::clone(&host.applying);
+    std::thread::spawn(move || {
+        let outcome = match coordinator.lock() {
+            Ok(mut guard) => guard.handle(
+                "profile.apply",
+                &serde_json::json!({"id": profile, "monitor": monitor}),
+            ),
+            Err(_) => Err(crate::ipc::Failure::new(
+                "internal",
+                "the coordinator lock was poisoned",
+            )),
+        };
+        let applied = match &outcome {
+            Ok(result) => {
+                let status = result
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("failed");
+                status == "applied"
+            }
+            Err(_) => false,
+        };
+        match &outcome {
+            Ok(result) if applied => {
+                // A hardware write is only acceptable with a stated reason and recorded values, so
+                // the log carries the requested value, the value written and what the device reported
+                // for every control in the profile.
+                log_info!("{monitor}: {profile} applied from the flyout");
+                for field in applied_fields(result) {
+                    log_info!("{monitor}: {field}");
+                }
+                if let Ok(mut guard) = failure.lock() {
+                    *guard = None;
+                }
+            }
+            Ok(result) => {
+                let status = result
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("failed");
+                log_error!("{monitor}: {profile} was not applied ({status})");
+                if let Ok(mut guard) = failure.lock() {
+                    *guard = Some(format!("{status}"));
+                }
+            }
+            Err(error) => {
+                log_error!("{monitor}: {profile} failed: {}", error.message);
+                if let Ok(mut guard) = failure.lock() {
+                    *guard = Some(error.message.clone());
+                }
+            }
+        }
+        applying.store(false, std::sync::atomic::Ordering::SeqCst);
+        if window != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    window as windows_sys::Win32::Foundation::HWND,
+                    crate::win::flyout::RESULT,
+                    row,
+                    if applied { 0 } else { 1 },
+                );
+            }
+        }
+    });
+}
+
+/// One line per applied control: what was requested, what was written, what the device reports.
+fn applied_fields(result: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(monitors) = result.get("monitors").and_then(serde_json::Value::as_array) else {
+        return lines;
+    };
+    for monitor in monitors {
+        let Some(fields) = monitor.get("fields").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for field in fields {
+            if field.get("status").and_then(serde_json::Value::as_str) != Some("applied") {
+                continue;
+            }
+            lines.push(format!(
+                "{}: {} -> {} (device reports {})",
+                field
+                    .get("control")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                field
+                    .get("requested")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                field
+                    .get("native")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("?")),
+                field
+                    .get("observed")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("?")),
             ));
         }
     }
+    lines
+}
+
+/// The icon name of the profile the coordinator verified for this monitor, if any.
+fn tray_glyph(user: *mut std::ffi::c_void, slot: usize) -> Option<String> {
+    let host = unsafe { host(user) }?;
+    let id = host.targets.get(slot)?.clone();
+    let mut guard = host.coordinator.lock().ok()?;
+    let profile_id = guard.applied_profile(&id)?.to_string();
+    let listed = guard
+        .handle("profiles.list", &serde_json::Value::Null)
+        .ok()?;
+    let profiles = listed.get("profiles")?.as_array()?;
+    let icon = profiles
+        .iter()
+        .find(|profile| profile.get("id").and_then(serde_json::Value::as_str) == Some(&profile_id))?
+        .get("icon")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&profile_id)
+        .to_string();
+    Some(icon)
+}
+
+/// The reason a row reports as failed.
+fn tray_failure(user: *mut std::ffi::c_void) -> Option<String> {
+    let host = unsafe { host(user) }?;
+    host.last_failure.lock().ok().and_then(|guard| guard.clone())
 }
 
 fn tray_settings(user: *mut std::ffi::c_void) {

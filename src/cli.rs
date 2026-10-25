@@ -41,7 +41,7 @@ pub enum Program {
 }
 
 /// Commands that belong to the v1 contract but are not implemented in this build.
-const PLANNED_COMMANDS: &[&str] = &["flyout"];
+const PLANNED_COMMANDS: &[&str] = &[];
 
 fn help_text() -> String {
     format!(
@@ -61,6 +61,7 @@ fn help_text() -> String {
          Monitors and parameters:\n\
          \x20 monitors list [--json] | monitors capabilities --monitor <id> [--json]\n\
          \x20 monitors select --monitor <id> [--remember] | --none | --dialog\n\
+         \x20 flyout [--monitor <id>]             open the profile flyout of the running instance\n\
          \x20 monitors validate-value <parameter> <value> --vcp <code> --monitor <id> --confirm-write\n\
          \x20 get <parameter> --monitor <id> | set <parameter> <value> --monitor <id> [--wait]\n\
          \n\
@@ -138,6 +139,7 @@ fn dispatch_console(args: &[String], storage: &StorageContext) -> i32 {
         "profile" => handle_profile(&args[1..], storage),
         "startup" => handle_startup(&args[1..], storage),
         "icons" => handle_icons(&args[1..]),
+        "flyout" => handle_flyout(&args[1..], storage),
         "paths" => handle_paths(&args[1..], storage),
         "data" => handle_data(&args[1..], storage),
         "repository" => handle_repository(&args[1..]),
@@ -943,6 +945,48 @@ fn handle_icons(args: &[String]) -> i32 {
         }
         Some(other) => usage_error(&format!("icons: unknown subcommand: {other}")),
         None => usage_error("icons: expected 'list'"),
+    }
+}
+
+/// Ask the resident instance to show a profile flyout.
+///
+/// The window belongs to the process that owns the icons, so this is a request, not a window this
+/// command creates: the answer comes from the instance that will actually show it.
+fn handle_flyout(args: &[String], storage: &StorageContext) -> i32 {
+    let mut monitor: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => monitor = Some(value.clone()),
+                    None => return usage_error("flyout: --monitor needs a value"),
+                }
+            }
+            other => return usage_error(&format!("flyout: unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+    let params = match &monitor {
+        Some(id) => serde_json::json!({ "monitor": id }),
+        None => serde_json::Value::Null,
+    };
+    match crate::runtime::request(storage, "ui.flyout", params) {
+        Ok(result) => {
+            let opened = result
+                .get("opened")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if opened {
+                output::line("flyout requested");
+                EXIT_OK
+            } else {
+                output::error_line(&format!("{}: the flyout was not requested", PRODUCT_NAME));
+                EXIT_TRANSPORT
+            }
+        }
+        Err(error) => report_client_error(&error),
     }
 }
 
@@ -1855,9 +1899,17 @@ mod tests {
     }
 
     #[test]
-    fn planned_commands_report_not_implemented_rather_than_success() {
-        // The flyout is the only contract command with no implementation in this build.
-        assert_eq!(dispatch_console(&argv(&["flyout"])), EXIT_USAGE);
+    fn the_flyout_command_asks_a_running_instance_and_says_so_when_there_is_none() {
+        // No coordinator runs in the test process, so this reports the unavailable exit code and
+        // never creates a window of its own.
+        assert_eq!(dispatch_console(&argv(&["flyout"])), EXIT_DAEMON_UNAVAILABLE);
+        assert_eq!(
+            dispatch_console(&argv(&["flyout", "--monitor", "mon-a"])),
+            EXIT_DAEMON_UNAVAILABLE
+        );
+        // A missing value is a usage error, not a request about an empty monitor.
+        assert_eq!(dispatch_console(&argv(&["flyout", "--monitor"])), EXIT_USAGE);
+        assert_eq!(dispatch_console(&argv(&["flyout", "--nonsense"])), EXIT_USAGE);
     }
 
     #[test]

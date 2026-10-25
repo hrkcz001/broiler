@@ -191,9 +191,41 @@ pub struct Coordinator<T: Transport> {
     storage: Option<crate::storage::StorageContext>,
     shutdown_requested: bool,
     observed_at: String,
+    /// The tray owner window, or 0 when this process has no user interface.
+    ui_window: isize,
 }
 
 impl<T: Transport> Coordinator<T> {
+    /// Record the window the UI thread owns, so a pipe request can ask it for a flyout.
+    #[allow(dead_code)]
+    pub fn set_ui_window(&mut self, window: isize) {
+        self.ui_window = window;
+    }
+
+    /// The monitors this instance controls, in the order its tray icons use.
+    ///
+    /// A remembered selection keeps its order and drops displays that are gone; without a selection
+    /// every present monitor is controlled. One implementation, because the pipe answers `ui.flyout`
+    /// with slot indices that must match the icons.
+    pub fn resident_targets(&mut self) -> Vec<String> {
+        let present: Vec<String> = self
+            .transport
+            .monitors()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|monitor| monitor.id)
+            .collect();
+        if self.settings.monitor_ids.is_empty() {
+            return present;
+        }
+        self.settings
+            .monitor_ids
+            .iter()
+            .filter(|id| present.iter().any(|seen| seen == *id))
+            .cloned()
+            .collect()
+    }
+
     pub fn new(transport: T, settings: Settings, registry: ProfileRegistry, settings_path: PathBuf) -> Coordinator<T> {
         Coordinator {
             transport,
@@ -203,6 +235,7 @@ impl<T: Transport> Coordinator<T> {
             profiles_dir: None,
             last_applied: std::collections::HashMap::new(),
             storage: None,
+            ui_window: 0,
             shutdown_requested: false,
             observed_at: crate::clock::iso_local(),
         }
@@ -731,6 +764,37 @@ impl<T: Transport> Coordinator<T> {
                     other => return Err(invalid(format!("unknown unit `{other}`"))),
                 };
                 self.set(&monitor, control, typed)
+            }
+            "ui.flyout" => {
+                // The window belongs to the UI thread; a request from the pipe can only ask for it.
+                // The slot index is the position in the resident target list, which is the same list
+                // the tray icons were built from.
+                if self.ui_window == 0 {
+                    return Err(Failure::new(
+                        "ui_unavailable",
+                        "this process has no user interface to show a flyout",
+                    ));
+                }
+                let targets = self.resident_targets();
+                let requested = params.get("monitor").and_then(Value::as_str);
+                let slot = match requested {
+                    Some(id) => targets.iter().position(|target| target == id).ok_or_else(|| {
+                        Failure::new(
+                            "unknown_monitor",
+                            format!("monitor {id} is not controlled by this instance"),
+                        )
+                    })?,
+                    None => 0,
+                };
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        self.ui_window as windows_sys::Win32::Foundation::HWND,
+                        crate::win::flyout::OPEN,
+                        slot,
+                        0,
+                    );
+                }
+                Ok(json!({"opened": true, "monitor": targets.get(slot)}))
             }
             "profiles.list" => Ok(json!({
                 "profiles": self.registry.profiles().iter().map(|profile| json!({

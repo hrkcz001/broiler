@@ -14,14 +14,15 @@
 use std::ffi::c_void;
 
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_GUID, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP,
+    NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+    NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -378,6 +379,14 @@ pub struct Callbacks {
     pub settings: fn(*mut c_void),
     /// The user chose `Exit`: stop the whole instance.
     pub exit: fn(*mut c_void),
+    /// The rows the flyout shows for the monitor at this slot.
+    pub flyout: fn(*mut c_void, usize) -> crate::win::flyout::Content,
+    /// The user picked row `row` for the monitor at this slot. Must return without blocking.
+    pub choose: fn(*mut c_void, usize, usize),
+    /// The icon name of the profile this monitor is verified to be in, if any.
+    pub glyph: fn(*mut c_void, usize) -> Option<String>,
+    /// Why the last apply failed, for the row that reports it.
+    pub failure: fn(*mut c_void) -> Option<String>,
 }
 
 /// One installed icon.
@@ -415,6 +424,9 @@ pub struct Tray {
     version_four: bool,
     /// Monitor id per slot, used by the log lines so a failure names the monitor.
     monitors: Vec<String>,
+    /// The one reusable flyout. Clicking another icon closes this and opens a new one for that
+    /// monitor, which is what "a single reusable flyout" means in practice.
+    flyout: Option<Box<crate::win::flyout::Flyout>>,
 }
 
 impl Drop for Tray {
@@ -487,6 +499,16 @@ unsafe extern "system" fn tray_proc(
             tray.dispatch(event, uid);
             0
         }
+        crate::win::flyout::OPEN => {
+            // A request to show the flyout for the monitor at this slot, from a left click or from
+            // the command line.
+            tray.open_flyout(wparam as usize);
+            0
+        }
+        crate::win::flyout::RESULT => {
+            tray.flyout_result(wparam as usize, lparam == 0);
+            0
+        }
         0x0111 => {
             let command = (wparam & 0xFFFF) as usize;
             match command {
@@ -519,6 +541,7 @@ impl Tray {
             installed: false,
             version_four: true,
             monitors: specs.iter().map(|spec| spec.monitor.clone()).collect(),
+            flyout: None,
         });
         unsafe {
             let class_name = to_wide(ICON_CLASS);
@@ -789,6 +812,122 @@ impl Tray {
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    /// Show the profile flyout for the monitor at `slot`.
+    ///
+    /// The popup is anchored to the icon itself through `Shell_NotifyIconGetRect`; when the shell
+    /// cannot report a rectangle the flyout falls back to the pointer. A previously open flyout for
+    /// another monitor is replaced, so at most one popup exists.
+    pub fn open_flyout(&mut self, slot: usize) {
+        let Some(entry) = self.slots.iter().find(|entry| entry.monitor == slot) else {
+            return;
+        };
+        let anchor = self.icon_rect(entry);
+        let content = (self.callbacks.flyout)(self.callbacks.user, slot);
+        self.flyout = None;
+        self.flyout = crate::win::flyout::Flyout::open(
+            self.window,
+            anchor,
+            content,
+            slot,
+            self.callbacks.user,
+            self.callbacks.choose,
+        );
+        if self.flyout.is_none() {
+            crate::log_error!("the profile flyout could not be created for slot {slot}");
+        }
+    }
+
+    /// Report the outcome of a click back into the open flyout, then refresh what the icon claims.
+    pub fn flyout_result(&mut self, row: usize, applied: bool) {
+        let Some(flyout) = self.flyout.as_mut() else {
+            return;
+        };
+        if !flyout.is_open() {
+            self.flyout = None;
+            return;
+        }
+        if applied {
+            let items = flyout.item_count();
+            for index in 0..items {
+                flyout.set_state(
+                    index,
+                    if index == row {
+                        crate::win::flyout::State::Current
+                    } else {
+                        crate::win::flyout::State::Normal
+                    },
+                );
+            }
+        } else {
+            let reason = (self.callbacks.failure)(self.callbacks.user)
+                .unwrap_or_else(|| String::from("the coordinator refused the profile"));
+            flyout.set_state(row, crate::win::flyout::State::Failed(reason));
+        }
+        let slot = flyout.target();
+        self.refresh_icon(slot);
+        self.refresh_tooltip(slot);
+    }
+
+    /// Redraw the icon for a slot from the profile the caller verifies.
+    ///
+    /// The glyph only changes after a verified apply, so the icon never advertises a profile the
+    /// hardware did not confirm.
+    pub fn refresh_icon(&mut self, slot: usize) {
+        let Some(index) = self.slots.iter().position(|entry| entry.monitor == slot) else {
+            return;
+        };
+        let name = (self.callbacks.glyph)(self.callbacks.user, slot);
+        let glyph = name
+            .as_deref()
+            .map(Glyph::from_name)
+            .unwrap_or(Glyph::Monitor);
+        let (badge, size, uid, identity) = {
+            let entry = &self.slots[index];
+            (entry.badge, entry.size, entry.uid, entry.identity)
+        };
+        if self.slots[index].glyph == glyph {
+            return;
+        }
+        let Some(icon) = render_icon(glyph, badge, size as u32) else {
+            return;
+        };
+        let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = self.window;
+        data.uID = uid;
+        data.uFlags = NIF_ICON;
+        data.hIcon = icon as *mut c_void;
+        data.guidItem = guid(identity);
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
+            unsafe { DestroyIcon(self.slots[index].icon as *mut c_void) };
+            self.slots[index].icon = icon;
+            self.slots[index].glyph = glyph;
+        } else {
+            unsafe { DestroyIcon(icon as *mut c_void) };
+        }
+    }
+
+    /// Recompute the tooltip for a slot from the caller's view of the monitor.
+    pub fn refresh_tooltip(&mut self, slot: usize) {
+        let text = (self.callbacks.tooltip)(self.callbacks.user, slot);
+        self.set_tooltip(slot, &text);
+    }
+
+    /// The icon's screen rectangle, for anchoring the flyout.
+    fn icon_rect(&self, slot: &Slot) -> Option<RECT> {
+        let mut identifier: NOTIFYICONIDENTIFIER = unsafe { std::mem::zeroed() };
+        identifier.cbSize = std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32;
+        identifier.hWnd = self.window;
+        identifier.uID = slot.uid;
+        identifier.guidItem = guid(slot.identity);
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        let result = unsafe { Shell_NotifyIconGetRect(&identifier, &mut rect) };
+        if result < 0 {
+            return None;
+        }
+        Some(rect)
     }
 
     /// The owner window, as a number so another thread can post to it.

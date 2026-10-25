@@ -155,7 +155,7 @@ color_temperature = "6500k"
 
 Equivalent Kelvin intent: `{ kelvin = 6500 }`. This requests a supported temperature, not an approximated RGB transformation.
 
-Monitor with a small set of discrete hexadecimal presets:
+Monitor with a short list of preset values:
 
 ```toml
 [monitor]
@@ -171,7 +171,7 @@ Monitor driven by the temperature-request control instead:
 color_temperature = { vcp = 0x0C, raw = 0x23 }
 ```
 
-`0x23` is an illustrative native request, **not a verified MSI value and not a universal 6500 K encoding**. Read the real request range from your display. `0x0B` is read-only increment metadata, not a writable parameter. Kelvin conversion becomes available only when that mapping is validated. A bare integer temperature is rejected as ambiguous; neither temperatures nor discrete presets are percentages.
+`0x23` is an illustrative native request, **not a verified value for this monitor and not a universal 6500 K encoding**. Read the real request range from your display. `0x0B` is read-only increment metadata, not a writable parameter. Kelvin conversion becomes available only when that mapping is validated. A bare integer temperature is rejected as ambiguous; neither temperatures nor discrete presets are percentages.
 
 Temperature cannot coexist with `color_preset` or RGB gains in one profile. Preset plus gains is allowed only with an established user-adjustable preset. Temperature support must never be faked through gamma ramps, overlays or guessed RGB ratios.
 
@@ -182,7 +182,7 @@ Temperature cannot coexist with `color_preset` or RGB gains in one profile. Pres
 | `brightness` | percent integer, `{ percent = N }`, `{ raw = N }` | high-level brightness or allowlisted `0x10` |
 | `contrast` | same continuous forms | high-level contrast or `0x12` |
 | `color_temperature` | Kelvin string/table, `{ vcp = 0x14, raw = N }`, `{ vcp = 0x0C, raw = N }` | actual monitor white point |
-| `color_preset` | named string, native decimal/hex integer, `{ raw = N }` | `0x14` discrete choice |
+| `color_preset` | named string, native decimal/hex integer, `{ raw = N }` | `0x14` preset choice |
 | `rgb_gain.red/green/blue` | continuous forms, independently | high-level gains or `0x16`/`0x18`/`0x1A` |
 | `volume` | continuous forms, validated audio subrange only | `0x62`, monitor speakers |
 | `mute` | boolean, confirmed audio-only encoding | `0x8D`, conditional |

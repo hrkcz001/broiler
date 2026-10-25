@@ -139,10 +139,25 @@ fn logon_sid_token() -> io::Result<(String, Vec<u8>)> {
 }
 
 /// Build the endpoint for this logon session.
+///
+/// This is the only endpoint a production process can reach. A test binary can point its own thread
+/// at a fixture namespace through [`fixture`], which is compiled out of every non-test build.
 pub fn local_endpoint() -> io::Result<Endpoint> {
+    #[cfg(test)]
+    if let Some(name) = fixture::current() {
+        let (_, sid_bytes) = logon_sid_token()?;
+        return endpoint_named(name, &sid_bytes);
+    }
     let (token, sid_bytes) = logon_sid_token()?;
-    let name = format!("\\\\.\\pipe\\broiler.v1.{token}");
+    endpoint_named(format!("\\\\.\\pipe\\broiler.v1.{token}"), &sid_bytes)
+}
 
+/// Build one endpoint with an explicit pipe name and the DACL of this logon session.
+///
+/// The name is the whole identity of the endpoint: the pipe, and the instance mutex derived from it,
+/// are both functions of this string. Test fixtures therefore get their own namespace without a
+/// production code path that could name a second one.
+fn endpoint_named(name: String, sid_bytes: &[u8]) -> io::Result<Endpoint> {
     // A DACL granting only this logon SID read and write access.
     let mut descriptor: Box<SECURITY_DESCRIPTOR> = Box::new(unsafe { std::mem::zeroed() });
     let ok = unsafe {
@@ -437,6 +452,55 @@ pub fn dacl_sddl(connection: &ServerConnection) -> io::Result<String> {
 /// True when a coordinator already owns this endpoint.
 pub fn server_exists(endpoint_name: &str) -> bool {
     matches!(Client::connect(endpoint_name, Instant::now() + std::time::Duration::from_millis(50)), Ok(_))
+}
+
+/// A private endpoint namespace for tests, compiled only into a test build.
+///
+/// The product must have exactly one endpoint per logon session, and a test must not be able to reach
+/// it, be reached by it, or disturb a running owner. Both properties come from the same fact: this
+/// module exists only under `cfg(test)`, so no shipped binary contains a way to choose another
+/// namespace, and a fixture name can never equal the logon-SID token the product derives.
+#[cfg(test)]
+pub mod fixture {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    thread_local! {
+        /// The fixture endpoint this thread's `local_endpoint` resolves to, if any.
+        static NAMESPACE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// A fresh namespace, unique inside this process and marked as a fixture.
+    pub fn namespace(label: &str) -> String {
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "\\\\.\\pipe\\broiler.v1.fixture.{label}.{}.{count}",
+            std::process::id()
+        )
+    }
+
+    /// A namespace shared by one test binary, for cases that only need "somewhere else".
+    pub fn stable(label: &str) -> String {
+        format!(
+            "\\\\.\\pipe\\broiler.v1.fixture.{label}.{}.stable",
+            std::process::id()
+        )
+    }
+
+    /// Point this thread at `name` for the duration of `body`.
+    pub fn with_namespace<R>(name: &str, body: impl FnOnce() -> R) -> R {
+        NAMESPACE.with(|slot| *slot.borrow_mut() = Some(name.to_string()));
+        let result = body();
+        NAMESPACE.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    /// The fixture endpoint this thread currently resolves to.
+    pub fn current() -> Option<String> {
+        NAMESPACE.with(|slot| slot.borrow().clone())
+    }
 }
 
 #[cfg(test)]

@@ -288,9 +288,21 @@ Use `Shell_NotifyIconW` with one stable GUID per monitor identity and `NOTIFYICO
 >
 > It was proposed here during the research phase and is **not part of the owner's requirements**, so
 > v1 does not claim it. The implementation maps the message to the same action as a left click and
-> does nothing else with it. On the machine this was built on, `NIM_SETVERSION` is refused, so
-> version-4 packing is not in effect and the shell never sends that message: the branch is inert, not
-> a feature. Resolving the refusal is not scheduled work.
+> does nothing else with it.
+>
+> Corrected 2026-10-25, repair gate R1. The earlier version of this note recorded that
+> `NIM_SETVERSION` "is refused on this machine" and treated the refusal as an OS property. That was
+> wrong: the call was made with the version-3 structure size and with `uFlags = 0`, identifying the
+> icon by `uID` although it had been added under `NIF_GUID`. The documented contract is narrower than
+> the workaround assumed. `cbSize` is the size of this SDK's `NOTIFYICONDATAW`; the version-2 and
+> version-3 sizes are documented for older `Shell32.dll` versions. `NIM_SETVERSION` "must be called
+> every time a notification area icon is added", immediately, with no delay. And an icon is identified
+> by the member its addition used — `guidItem` here — so a version call without `NIF_GUID` cannot find
+> it. With the size and the identifier corrected, the current build's version-4 request is accepted on
+> the same machine: the log of the 2026-10-25 R1 run shows `icon 0 installed for
+> mon-227062c49310910f` with no refusal, where the previous build logged a refusal. Negotiation is per
+> icon, and both documented callback encodings are routed by each icon's own result. See
+> `docs/status-2026-10-25-r1.md`.
 
 - Left activation: cycle this monitor only, or show its flyout according to settings.
 - Right activation: native `HMENU` with exactly `Settings` and `Exit`. Exit stops the whole broiler instance, not merely one icon.

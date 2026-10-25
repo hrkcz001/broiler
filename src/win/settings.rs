@@ -28,6 +28,25 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::config::settings::LeftClick;
 use crate::win::wide::to_wide;
 
+// Combo-box styles, from `winuser.h`. Spelled out because this build takes no dependency on a
+// header crate that exports them, and a wrong literal here is exactly the defect this names.
+/// An editable combo box with a drop-down list. Never wanted: the user must choose, not type. Named
+/// so a test can assert the selector is not this.
+pub const CBS_DROPDOWN: u32 = 0x0002;
+/// A drop-down list that is not editable. This is the one the settings window uses.
+pub const CBS_DROPDOWNLIST: u32 = 0x0003;
+/// The list part keeps its own height instead of being sized to fit the edit field.
+const CBS_NOINTEGRALHEIGHT: u32 = 0x0040;
+
+/// The style bits for the left-click selector.
+///
+/// Pure, so the value is asserted by a test instead of being trusted from a comment: the previous
+/// build passed `CBS_DROPDOWN` with a comment claiming `CBS_DROPDOWNLIST`, which made the selector an
+/// editable text field with a misleading label.
+pub fn combo_style() -> u32 {
+    CBS_DROPDOWNLIST | CBS_NOINTEGRALHEIGHT | WS_TABSTOP
+}
+
 /// Control identifiers. `WM_COMMAND` reports these.
 pub const COMBO: i32 = 10;
 pub const STARTUP_BOX: i32 = 11;
@@ -344,7 +363,7 @@ impl Settings {
                 window,
                 "COMBOBOX",
                 "",
-                0x0002 | 0x0040 | WS_TABSTOP, // CBS_DROPDOWNLIST | CBS_NOINTEGRALHEIGHT
+                combo_style(),
                 metrics.margin,
                 metrics.combo_top(),
                 inner,
@@ -498,6 +517,19 @@ unsafe fn work_area_around_cursor() -> Option<RECT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selector_is_a_dropdown_list_and_not_an_editable_field() {
+        let style = combo_style();
+        // The two low bits are the combo type: 1 simple, 2 drop-down, 3 drop-down list.
+        assert_eq!(style & 0x0003, CBS_DROPDOWNLIST, "style was {style:#06X}");
+        assert_eq!(style & 0x0003, 0x0003);
+        assert_ne!(style & 0x0003, CBS_DROPDOWN);
+        // Not editable is the point: a drop-down list has no edit field at all.
+        assert_eq!(CBS_DROPDOWNLIST, CBS_DROPDOWN | 0x0001);
+        // It stays reachable from the keyboard.
+        assert_ne!(style & WS_TABSTOP, 0);
+    }
 
     #[test]
     fn the_combo_offers_both_behaviours_in_a_fixed_order() {

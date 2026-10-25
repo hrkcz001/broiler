@@ -1,9 +1,9 @@
 //! Command dispatch for both executables.
 //!
-//! The G1 skeleton owns argument dispatch, the version/help surface, exit codes and the
-//! logger bootstrap. Every hardware or configuration command is listed in the help text
-//! because it is part of the user-facing contract, and reports that it is not implemented
-//! in this build instead of pretending to succeed.
+//! This module owns argument dispatch, the version/help surface, exit codes and the logger
+//! bootstrap. The help text is part of the user-facing contract, so it lists what this build
+//! actually does and names what it does not; it must be updated in the same commit as a capability,
+//! because a help screen that denies a working feature is as wrong as one that promises a missing one.
 
 use std::path::PathBuf;
 
@@ -40,9 +40,6 @@ pub enum Program {
     Tray,
 }
 
-/// Commands that belong to the v1 contract but are not implemented in this build.
-const PLANNED_COMMANDS: &[&str] = &[];
-
 fn help_text() -> String {
     format!(
         "{name} {version} - native Windows DDC/CI monitor controller\n\
@@ -77,13 +74,14 @@ fn help_text() -> String {
          \x20 --version, -V         print the version\n\
          \x20 --help, -h            print this help\n\
          \n\
-         Implemented: storage resolution and copy-only migration, monitor discovery, high-level\n\
-         brightness and contrast reads and writes, profile parsing and planning, the resident\n\
-         coordinator, the startup lifecycle, the monitor selection dialog and the zero-profile\n\
-         setup window, and the bounded log.\n\
-         Not implemented in this build: tray icons and the profile flyout, the settings window,\n\
-         colour temperature and the remaining conditional controls, speaker volume and mute, and\n\
-         startup registration. A command that is not implemented reports it and exits 2.\n\
+         Implemented: storage resolution and copy-only migration, monitor discovery, brightness and\n\
+         contrast reads and writes, profile parsing and planning, the resident coordinator, the\n\
+         startup lifecycle, the monitor selection dialog, the zero-profile setup window, one tray\n\
+         icon per controlled monitor with a Settings/Exit menu and tooltips, the modeless profile\n\
+         flyout, the native settings window with a live left-click selector, and the bounded log.\n\
+         Not implemented in this build: colour temperature and the remaining conditional controls,\n\
+         speaker volume and mute writes, and launch-at-logon registration. A command that needs one\n\
+         of those reports it and exits 2; nothing writes a value it cannot verify.\n\
          Exit codes: 0 success, 2 validation error, 3 daemon unavailable, 4 missing target,\n\
          5 unsupported control, 6 transport or verification failure, 7 partial application.",
         name = PRODUCT_NAME,
@@ -107,13 +105,6 @@ fn print_version() {
     output::line(&format!("{} {}", PRODUCT_NAME, VERSION));
 }
 
-fn report_unimplemented(command: &str) -> i32 {
-    output::error_line(&format!(
-        "{}: command is not implemented in this build: {}",
-        PRODUCT_NAME, command
-    ));
-    EXIT_USAGE
-}
 
 fn dispatch_console(args: &[String], storage: &StorageContext) -> i32 {
     let Some(first) = args.first() else {
@@ -146,7 +137,6 @@ fn dispatch_console(args: &[String], storage: &StorageContext) -> i32 {
         "repository" => handle_repository(&args[1..]),
         "get" => handle_get(&args[1..], storage),
         "set" => handle_set(&args[1..], storage),
-        other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
         other => {
             output::error_line(&format!("{}: unknown command: {}", PRODUCT_NAME, other));
             EXIT_USAGE
@@ -1786,11 +1776,13 @@ fn dispatch_tray(args: &[String], storage: &StorageContext) -> i32 {
             EXIT_OK
         }
         Some("--internal-ddc-worker") => {
-            // The worker performs no file I/O, so it receives no data root: nothing it does can
-            // create a second copy of the user's configuration.
+            // The worker mode belongs to the tray executable, which enters it before this module is
+            // reached; it performs no file I/O, so it receives no data root and can never create a
+            // second copy of the user's configuration. Reaching this arm means the console binary was
+            // asked for it, which is a usage error rather than a missing feature.
             output::error_line(&format!(
-                "{}: the internal DDC worker is not implemented in this build",
-                PRODUCT_NAME
+                "{}: --internal-ddc-worker is the tray executable's private worker mode, not a {} command",
+                PRODUCT_NAME, PRODUCT_NAME
             ));
             EXIT_USAGE
         }
@@ -1889,12 +1881,26 @@ mod tests {
         (StorageContext::for_test(&base.join("data")), base)
     }
 
+    /// The fixture endpoint every CLI test talks to.
+    ///
+    /// A CLI command that needs a coordinator asks one on this namespace, which no process outside
+    /// the test binary can name. Without it, a resident instance the developer is running would answer
+    /// with its own root and turn an expected `daemon unavailable` into a `storage_conflict`.
+    fn endpoint_namespace() -> &'static str {
+        static NAME: OnceLock<String> = OnceLock::new();
+        NAME.get_or_init(|| crate::pipe::fixture::stable("cli"))
+    }
+
     fn dispatch_console(args: &[String]) -> i32 {
-        super::dispatch_console(args, test_root())
+        crate::pipe::fixture::with_namespace(endpoint_namespace(), || {
+            super::dispatch_console(args, test_root())
+        })
     }
 
     fn dispatch_tray(args: &[String]) -> i32 {
-        super::dispatch_tray(args, test_root())
+        crate::pipe::fixture::with_namespace(endpoint_namespace(), || {
+            super::dispatch_tray(args, test_root())
+        })
     }
 
     #[test]
@@ -1906,6 +1912,32 @@ mod tests {
     fn help_is_success_for_both_programs() {
         assert_eq!(dispatch_console(&argv(&["--help"])), EXIT_OK);
         assert_eq!(dispatch_tray(&argv(&["--help"])), EXIT_OK);
+    }
+
+    #[test]
+    fn the_help_does_not_deny_a_feature_this_build_implements() {
+        // The regression: the help screen described tray icons, the flyout and the settings window as
+        // unimplemented long after they shipped, so the owner read a false status from the product.
+        let text = super::help_text();
+        for implemented in [
+            "tray",
+            "flyout",
+            "settings window",
+            "left-click",
+            "monitors select",
+        ] {
+            assert!(
+                text.contains(implemented),
+                "the help must mention `{implemented}`, which exists"
+            );
+            assert!(
+                !text.contains(&format!("not implemented in this build: {implemented}")),
+                "the help must not deny `{implemented}`"
+            );
+        }
+        // And it must still name what is genuinely missing, instead of implying a complete build.
+        assert!(text.contains("colour temperature"));
+        assert!(text.contains("launch-at-logon"));
     }
 
     #[test]

@@ -176,6 +176,15 @@ fn reading_json(reading: &ControlReading) -> Value {
     })
 }
 
+/// One control value this coordinator has actually seen, with the moment it was seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedReading {
+    pub current: u64,
+    pub minimum: Option<u64>,
+    pub maximum: Option<u64>,
+    pub at: String,
+}
+
 /// Commands over one transport, plus the configuration they act on.
 pub struct Coordinator<T: Transport> {
     transport: T,
@@ -186,6 +195,17 @@ pub struct Coordinator<T: Transport> {
     /// Last fully applied profile per monitor. A profile id is not a claim about current hardware
     /// state; it only records what this coordinator last applied and verified.
     last_applied: std::collections::HashMap<String, String>,
+    /// The last value this coordinator read or wrote per monitor and control.
+    ///
+    /// A UI surface reads this instead of the hardware, so opening the flyout, refreshing a tooltip or
+    /// answering `status` never waits for the DDC mutex. An entry that is absent is simply unknown and
+    /// is not shown, which is why no surface has to invent a value.
+    readings: std::collections::HashMap<(String, String), CachedReading>,
+    /// Monitors whose user-visible state changed since the last publication.
+    dirty: Vec<String>,
+    /// What the last command published, so a caller can see that a change was announced rather than
+    /// applied silently. Production reads it only for the log; a test asserts on it.
+    last_published: Vec<String>,
     /// The data root this coordinator owns. Every filesystem decision goes through it, and a client
     /// that resolved another root is refused rather than answered about data it never read.
     storage: Option<crate::storage::StorageContext>,
@@ -234,6 +254,9 @@ impl<T: Transport> Coordinator<T> {
             settings_path,
             profiles_dir: None,
             last_applied: std::collections::HashMap::new(),
+            readings: std::collections::HashMap::new(),
+            dirty: Vec::new(),
+            last_published: Vec::new(),
             storage: None,
             ui_window: 0,
             shutdown_requested: false,
@@ -275,6 +298,75 @@ impl<T: Transport> Coordinator<T> {
         self.last_applied.get(monitor).map(String::as_str)
     }
 
+    /// The display name of a profile id, as the user wrote it in the profile file.
+    ///
+    /// Every surface shows this rather than the file id: `night` is the file name, not something the
+    /// user typed to see in a tooltip.
+    pub fn profile_name(&self, id: &str) -> Option<&str> {
+        self.registry
+            .find(id)
+            .map(|profile| profile.name.as_str())
+    }
+
+    /// The icon name of a profile id, for the tray and the flyout rows.
+    pub fn profile_icon(&self, id: &str) -> Option<&str> {
+        self.registry.find(id).map(|profile| profile.icon.as_str())
+    }
+
+    /// The last value seen for one control, without touching the hardware.
+    pub fn cached_reading(&self, monitor: &str, control: &str) -> Option<&CachedReading> {
+        self.readings
+            .get(&(monitor.to_string(), control.to_string()))
+    }
+
+    fn remember_reading(&mut self, monitor: &str, control: &str, reading: &ControlReading) {
+        self.readings.insert(
+            (monitor.to_string(), control.to_string()),
+            CachedReading {
+                current: reading.current,
+                minimum: reading.minimum,
+                maximum: reading.maximum,
+                at: crate::clock::iso_local(),
+            },
+        );
+    }
+
+    /// Note that a monitor's user-visible state changed and will have to be published.
+    ///
+    /// The set is a queue of monitor ids, not a flag per surface: the tray icons, the tooltips, the
+    /// open flyout and `status` all read the same coordinator state, so one notification serves all
+    /// of them and a surface cannot be left showing an older answer.
+    fn mark_changed(&mut self, monitors: &[String]) {
+        for monitor in monitors {
+            if !self.dirty.iter().any(|seen| seen == monitor) {
+                self.dirty.push(monitor.clone());
+            }
+        }
+    }
+
+    /// Publish pending changes to the user interface and report which monitors changed.
+    ///
+    /// This is the single notification path. Every mutating command ends here — a CLI `profile apply`,
+    /// a GUI click, a cycle, a reload, a settings write, a selection change or a finished
+    /// reconciliation — so the tray cannot learn about one of them and miss another. A process with no
+    /// user interface still gets the list back, which is how a test observes that a change was
+    /// announced rather than applied silently.
+    pub fn publish_pending(&mut self) -> Vec<String> {
+        let changed = std::mem::take(&mut self.dirty);
+        if changed.is_empty() || self.ui_window == 0 {
+            return changed;
+        }
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                self.ui_window as windows_sys::Win32::Foundation::HWND,
+                crate::tray::STATE_CHANGED,
+                0,
+                0,
+            );
+        }
+        changed
+    }
+
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -301,6 +393,7 @@ impl<T: Transport> Coordinator<T> {
             .transport
             .read(monitor, control)
             .map_err(transport_failure)?;
+        self.remember_reading(monitor, control, &reading);
 
         let native = match value {
             ControlValue::Percent(percent) => {
@@ -334,6 +427,7 @@ impl<T: Transport> Coordinator<T> {
         if !outcome.verified() {
             // The monitor is in an unverified state, so no profile is claimed for it either.
             self.last_applied.remove(monitor);
+            self.mark_changed(std::slice::from_ref(&monitor.to_string()));
             return Err(Failure::new(
                 "verification_failed",
                 format!(
@@ -344,6 +438,21 @@ impl<T: Transport> Coordinator<T> {
         }
 
         self.last_applied.remove(monitor);
+        // The readback is a fresh observation of this control, so the cache carries it with the range
+        // the earlier read reported rather than losing that range.
+        let (minimum, maximum) = self
+            .cached_reading(monitor, control)
+            .map(|reading| (reading.minimum, reading.maximum))
+            .unwrap_or((None, None));
+        let observed = CachedReading {
+            current: outcome.observed,
+            minimum,
+            maximum,
+            at: crate::clock::iso_local(),
+        };
+        self.readings
+            .insert((monitor.to_string(), control.to_string()), observed);
+        self.mark_changed(std::slice::from_ref(&monitor.to_string()));
         Ok(json!({
             "monitor": monitor,
             "control": control,
@@ -445,13 +554,16 @@ impl<T: Transport> Coordinator<T> {
         let mut metadata = crate::plan::DeviceMetadata::default();
         for control in controls {
             let support = match self.transport.read(monitor, control) {
-                Ok(reading) => match (reading.minimum, reading.maximum) {
-                    (Some(minimum), Some(maximum)) if maximum >= minimum => {
-                        DeviceValueSupport::Range { minimum, maximum }
+                Ok(reading) => {
+                    self.remember_reading(monitor, control, &reading);
+                    match (reading.minimum, reading.maximum) {
+                        (Some(minimum), Some(maximum)) if maximum >= minimum => {
+                            DeviceValueSupport::Range { minimum, maximum }
+                        }
+                        // A getter that reports no usable range cannot validate a percentage.
+                        _ => DeviceValueSupport::Unknown,
                     }
-                    // A getter that reports no usable range cannot validate a percentage.
-                    _ => DeviceValueSupport::Unknown,
-                },
+                }
                 Err(TransportError::Unsupported(_)) => DeviceValueSupport::Unsupported,
                 Err(error) => return Err(error),
             };
@@ -648,6 +760,8 @@ impl<T: Transport> Coordinator<T> {
                 // profile id must not stay labelled active.
                 self.last_applied.remove(&monitor);
             }
+            // Whatever the outcome, this monitor's icon, tooltip and flyout row changed.
+            self.mark_changed(std::slice::from_ref(&monitor));
 
             let mut row = json!({
                 "monitor": monitor,
@@ -688,7 +802,21 @@ impl<T: Transport> Coordinator<T> {
     }
 
     /// Dispatch one request. The returned value is the `result` field of the response.
+    ///
+    /// Every entry point goes through here — the pipe, the tray callbacks and the startup path — so
+    /// the publication step below cannot be forgotten by one of them.
     pub fn handle(&mut self, method: &str, params: &Value) -> Result<Value, Failure> {
+        let result = self.dispatch_command(method, params);
+        self.last_published = self.publish_pending();
+        result
+    }
+
+    /// The monitors the last command announced to the user interface.
+    pub fn last_published(&self) -> &[String] {
+        &self.last_published
+    }
+
+    fn dispatch_command(&mut self, method: &str, params: &Value) -> Result<Value, Failure> {
         match method {
             "ping" => Ok(json!({"protocol": PROTOCOL_VERSION})),
             "status" => {
@@ -740,6 +868,7 @@ impl<T: Transport> Coordinator<T> {
                     .transport
                     .read(&monitor, control)
                     .map_err(transport_failure)?;
+                self.remember_reading(&monitor, control, &reading);
                 Ok(json!({"control": control, "reading": reading_json(&reading)}))
             }
             "parameters.set" => {
@@ -846,6 +975,10 @@ impl<T: Transport> Coordinator<T> {
                 settings::replace_text(&self.settings_path, &original, &updated)
                     .map_err(|error| Failure::new("invalid_config", error.render()))?;
                 self.settings = parsed;
+                // A setting the tray obeys takes effect now, so the surfaces that show it are told so:
+                // a failed save returns above and never reaches this line.
+                let targets = self.resident_targets();
+                self.mark_changed(&targets);
                 Ok(json!({"key": key, "value": settings_value(&self.settings, &key).unwrap_or(Value::Null)}))
             }
             "monitors.select" => {
@@ -884,6 +1017,8 @@ impl<T: Transport> Coordinator<T> {
                     self.settings.monitor_ids = ids;
                 }
                 self.persist_settings()?;
+                let targets = self.resident_targets();
+                self.mark_changed(&targets);
                 Ok(json!({
                     "remember": self.settings.remember,
                     "monitor_ids": self.settings.monitor_ids,
@@ -896,6 +1031,9 @@ impl<T: Transport> Coordinator<T> {
                 match ProfileRegistry::load_dir(&directory) {
                     Ok(registry) => {
                         self.registry = registry;
+                        // Names and icons may have changed under every icon and row.
+                        let targets = self.resident_targets();
+                        self.mark_changed(&targets);
                         Ok(json!({
                             "reloaded": true,
                             "count": self.registry.len(),

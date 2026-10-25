@@ -2,12 +2,20 @@
 //!
 //! One icon per controlled monitor, with a stable identity GUID derived from the monitor id, so a
 //! restarted coordinator or a restarted Explorer gets the same icon back instead of a duplicate. The
-//! shell integration follows the documented rules: `NOTIFYICON_VERSION_4`, `NIM_SETVERSION` after
-//! every addition, callbacks decoded from the packed version-4 `lParam`, a hidden top-level owner
-//! window for broadcast lifecycle notifications, recovery when Explorer restarts, and every icon
-//! handle destroyed exactly once.
+//! shell integration follows the documented contract:
 //!
-//! The icons are drawn here rather than loaded from a vendor asset: a monochrome glyph with an opaque
+//! * `cbSize` is the size of the SDK's `NOTIFYICONDATAW`. The smaller version-2 and version-3 values
+//!   are documented only for running against an older `Shell32.dll`, not for this one.
+//! * `NIM_SETVERSION` is called immediately after every `NIM_ADD`, as documented, and identifies the
+//!   icon with the same member the addition used. This build adds icons with `NIF_GUID`, so the
+//!   version call sets `NIF_GUID` and the same `guidItem`: the shell looks an icon up "either through
+//!   its uID or guidItem member", and an identifier that does not match the addition cannot be found.
+//! * The version is negotiated per icon, not once per process, and the decoder routes both documented
+//!   callback encodings according to the negotiation of the icon the message belongs to.
+//! * A refused `NIM_SETVERSION` means "this version is not supported" and nothing more; the API does
+//!   not promise `GetLastError`, so no error code is reported as an OS fact.
+//!
+//! The icons are drawn here rather than loaded from a vendor asset: a coloured glyph with an opaque
 //! numeric badge in the bottom-right corner. Icon geometry, the badge and the tooltip text are pure
 //! functions, so they are tested without a shell.
 
@@ -27,10 +35,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    InsertMenuW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
-    KillTimer, CREATESTRUCTW,
-    GWLP_USERDATA, ICONINFO, MF_SEPARATOR, MF_STRING, SM_CXSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
+    CREATESTRUCTW,
+    GWLP_USERDATA, ICONINFO, MF_STRING, SM_CXSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -46,15 +54,23 @@ const NIN_KEYSELECT: u32 = 0x0401;
 const MENU_SETTINGS: usize = 1;
 const MENU_EXIT: usize = 2;
 
+/// The two commands of the right-click menu, in the order they appear.
+///
+/// A single ordered list, because building the menu out of ad-hoc `AppendMenuW`/`InsertMenuW` calls is
+/// how a separator once landed above both items: `InsertMenuW(menu, MENU_SETTINGS, MF_SEPARATOR, ...)`
+/// inserted at position 1 while only one item existed.
+pub fn menu_items() -> [(usize, &'static str); 2] {
+    [(MENU_SETTINGS, "Settings"), (MENU_EXIT, "Exit")]
+}
+
 /// Tray to itself: show the settings window for the current state.
 pub const SETTINGS_OPEN: u32 = WM_APP + 42;
 
 /// Tray to itself: re-read the state and update the open settings window.
 pub const SETTINGS_REFRESH: u32 = WM_APP + 43;
 
-/// Timer id for the one-shot version-4 retry.
-const VERSION_RETRY_TIMER: usize = 1;
-const WM_TIMER: u32 = 0x0113;
+/// Tray to itself: the coordinator published a state change. Every surface reads the same state.
+pub const STATE_CHANGED: u32 = WM_APP + 44;
 
 const ICON_CLASS: &str = "BroilerTrayHost";
 
@@ -423,6 +439,10 @@ struct Slot {
     badge: Option<u32>,
     icon: isize,
     size: i32,
+    /// True when this icon's own `NIM_SETVERSION` call was accepted, so its callbacks arrive in the
+    /// packed version-4 form. Negotiated per icon: one global flag cannot decode a set where one icon
+    /// accepted version 4 and another did not.
+    version_four: bool,
 }
 
 impl Drop for Slot {
@@ -443,9 +463,6 @@ pub struct Tray {
     callbacks: Callbacks,
     taskbar_created: u32,
     installed: bool,
-    /// True when `NIM_SETVERSION` was accepted, which is what makes the packed version-4 `lParam`
-    /// meaningful. A shell that refuses it sends the legacy packing instead.
-    version_four: bool,
     /// Monitor id per slot, used by the log lines so a failure names the monitor.
     monitors: Vec<String>,
     /// The settings window, while it is open.
@@ -511,24 +528,24 @@ unsafe extern "system" fn tray_proc(
             tray.rebuild_for_dpi();
             0
         }
-        WM_TIMER => {
-            // The one-shot retry for the version-4 behaviour, see `schedule_version_retry`.
-            if wparam == VERSION_RETRY_TIMER {
-                unsafe { KillTimer(window, VERSION_RETRY_TIMER) };
-                tray.request_version_four();
+        CALLBACK_MESSAGE => {
+            // Two documented encodings exist, and which one arrives depends on what each icon's own
+            // `NIM_SETVERSION` call achieved, so the decoder asks the icon table instead of guessing
+            // from the message.
+            let slots: Vec<(u32, bool)> = tray
+                .slots
+                .iter()
+                .map(|slot| (slot.uid, slot.version_four))
+                .collect();
+            if let Some((uid, event)) = decode_callback(&slots, wparam, lparam) {
+                tray.dispatch(event, uid);
             }
             0
         }
-        CALLBACK_MESSAGE => {
-            // Version 4 packs the event in the low word and the icon id in the high word; the legacy
-            // packing puts the icon id in `wParam` and the mouse message in `lParam`.
-            let packed = lparam as u32;
-            let (event, uid) = if packed >> 16 != 0 {
-                (packed & 0xFFFF, packed >> 16)
-            } else {
-                (packed, wparam as u32)
-            };
-            tray.dispatch(event, uid);
+        STATE_CHANGED => {
+            // One publication path: the coordinator said some state changed, so every surface that
+            // shows state re-reads the same cached snapshot.
+            tray.publish_state();
             0
         }
         SETTINGS_OPEN => {
@@ -594,7 +611,6 @@ impl Tray {
             callbacks,
             taskbar_created: 0,
             installed: false,
-            version_four: true,
             monitors: specs.iter().map(|spec| spec.monitor.clone()).collect(),
             settings: None,
             flyout: None,
@@ -653,6 +669,7 @@ impl Tray {
                     badge,
                     icon: 0,
                     size,
+                    version_four: false,
                 };
                 tray.slots.push(slot);
                 let index = tray.slots.len() - 1;
@@ -662,9 +679,6 @@ impl Tray {
                 }
             }
             tray.installed = true;
-            if !tray.version_four {
-                tray.schedule_version_retry();
-            }
         }
         tray.installed.then_some(tray)
     }
@@ -689,19 +703,15 @@ impl Tray {
             crate::log_error!("the shell refused icon {index} (NIM_ADD)");
             return false;
         }
-        // Required after every addition, including after an Explorer restart. A shell that refuses
-        // it still shows the icon, so the refusal downgrades the callback format instead of
-        // discarding a working icon: `dispatch` decodes both packings.
-        let mut version = self.data(index, 0);
-        // `NIM_SETVERSION` is validated against the version-3 size of the structure; passing the
-        // Windows 10 size is refused, which would silently leave legacy callbacks in place.
-        version.cbSize = version_three_size() as u32;
-        version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        if Shell_NotifyIconW(NIM_SETVERSION, &version) == 0 {
-            let code = windows_sys::Win32::Foundation::GetLastError();
-            self.version_four = false;
-            crate::log_error!(
-                "the shell refused the version-4 behaviour (Win32 error {code}); falling back to legacy callbacks"
+        // Required after every addition, including one after an Explorer restart. A shell that
+        // refuses it still shows the icon, so the refusal only downgrades this icon's callback format
+        // instead of discarding a working icon: `decode_callback` routes both encodings.
+        let version_four = self.request_version_four(index);
+        self.slots[index].version_four = version_four;
+        if !version_four {
+            crate::log_info!(
+                "the shell did not accept the version-4 callback behaviour for icon {index}; \
+                 this icon keeps the legacy callback encoding"
             );
         }
         crate::log_info!(
@@ -731,39 +741,18 @@ impl Tray {
         }
     }
 
-    /// Ask again once, shortly after installation.
+    /// Ask the shell for the version-4 callback behaviour on one icon.
     ///
-    /// The shell accepts `NIM_SETVERSION` only once it has registered the icon, and it refuses a call
-    /// that arrives in the same instant as `NIM_ADD` on this Windows build. A single delayed retry
-    /// costs nothing and either upgrades the callbacks or leaves the logged fallback in place.
-    fn schedule_version_retry(&self) {
-        unsafe {
-            SetTimer(self.window, VERSION_RETRY_TIMER, 400, None);
-        }
-    }
-
-    /// Retry the version-4 request for every installed icon.
-    fn request_version_four(&mut self) {
-        let mut accepted = 0;
-        for index in 0..self.slots.len() {
-            let mut version = self.data(index, 0);
-            version.cbSize = version_three_size() as u32;
-            version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            unsafe {
-                if Shell_NotifyIconW(NIM_SETVERSION, &version) != 0 {
-                    accepted += 1;
-                }
-            }
-        }
-        self.version_four = accepted == self.slots.len() && !self.slots.is_empty();
-        if self.version_four {
-            crate::log_info!("version-4 icon callbacks accepted after the retry");
-        } else {
-            crate::log_error!(
-                "version-4 icon callbacks were refused {accepted}/{} time(s); legacy callbacks stay in effect",
-                self.slots.len()
-            );
-        }
+    /// The documented contract for `NIM_SETVERSION` is narrow: call it after every `NIM_ADD`, identify
+    /// the icon the way the addition identified it, and read `FALSE` as "this version is not
+    /// supported". `cbSize` is the size of the structure this SDK defines; the version-2 and version-3
+    /// sizes are documented for older `Shell32.dll` versions, not for this one, so no truncated size
+    /// and no delayed retry is needed or claimed. The API does not promise `GetLastError` for this
+    /// call, so no error code is reported.
+    unsafe fn request_version_four(&mut self, index: usize) -> bool {
+        let mut version = self.data(index, NIF_GUID);
+        version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &version) != 0
     }
 
     /// Update one tooltip, for a state change that matters to the user.
@@ -823,11 +812,10 @@ impl Tray {
         if menu.is_null() {
             return;
         }
-        let settings = to_wide("Settings");
-        let exit = to_wide("Exit");
-        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, settings.as_ptr());
-        InsertMenuW(menu, MENU_SETTINGS as u32, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(menu, MF_STRING, MENU_EXIT, exit.as_ptr());
+        for (command, label) in menu_items() {
+            let text = to_wide(label);
+            AppendMenuW(menu, MF_STRING, command, text.as_ptr());
+        }
 
         let mut point = POINT { x: 0, y: 0 };
         GetCursorPos(&mut point);
@@ -890,7 +878,7 @@ impl Tray {
             let glyph = self.slots[index].glyph;
             let badge = self.slots[index].badge;
             if let Some(icon) = render_icon(glyph, badge, size as u32) {
-                let mut data = self.data(index, NIF_ICON);
+                let mut data = self.data(index, NIF_ICON | NIF_GUID);
                 data.hIcon = icon as *mut c_void;
                 if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
                     unsafe { DestroyIcon(self.slots[index].icon as *mut c_void) };
@@ -1001,6 +989,39 @@ impl Tray {
         self.refresh_tooltip(slot);
     }
 
+    /// Update every surface that shows state, after one publication from the coordinator.
+    ///
+    /// This is the only place a completed operation becomes visible. It is called from the tray's own
+    /// `STATE_CHANGED` handler, which the coordinator posts for a GUI click, a CLI command, a cycle, a
+    /// reload, a settings write or a selection change, so no path can update one surface and forget
+    /// another.
+    pub fn publish_state(&mut self) {
+        for index in 0..self.slots.len() {
+            let monitor = self.slots[index].monitor;
+            self.refresh_icon(monitor);
+            self.refresh_tooltip(monitor);
+        }
+        self.refresh_flyout();
+        self.refresh_settings();
+    }
+
+    /// Bring the open flyout in line with the state the icons read.
+    ///
+    /// Rows are matched by profile id, so a reproduced row keeps the marker the coordinator reports
+    /// instead of the marker of whatever the user clicked last.
+    pub fn refresh_flyout(&mut self) {
+        let Some(flyout) = self.flyout.as_mut() else {
+            return;
+        };
+        if !flyout.is_open() {
+            self.flyout = None;
+            return;
+        }
+        let slot = flyout.target();
+        let content = (self.callbacks.flyout)(self.callbacks.user, slot);
+        flyout.sync(&content);
+    }
+
     /// Redraw the icon for a slot from the profile the caller verifies.
     ///
     /// The glyph only changes after a verified apply, so the icon never advertises a profile the
@@ -1028,7 +1049,8 @@ impl Tray {
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = self.window;
         data.uID = uid;
-        data.uFlags = NIF_ICON;
+        // The icon was added under its GUID, so every later call must name it the same way.
+        data.uFlags = NIF_ICON | NIF_GUID;
         data.hIcon = icon as *mut c_void;
         data.guidItem = guid(identity);
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
@@ -1134,11 +1156,32 @@ fn render_icon(glyph: Glyph, badge: Option<u32>, size: u32) -> Option<isize> {
     }
 }
 
-/// Size of the version-3 `NOTIFYICONDATAW`: everything up to the GUID-pair tail.
-fn version_three_size() -> usize {
-    std::mem::size_of::<NOTIFYICONDATAW>()
-        - std::mem::size_of::<windows_sys::core::GUID>()
-        - std::mem::size_of::<isize>()
+/// Read a tray callback in whichever encoding the icon that sent it negotiated.
+///
+/// `slots` is `(icon id, version-4 accepted)` per installed icon. Under version 4 the shell packs the
+/// notification event into `LOWORD(lParam)` and the icon id into `HIWORD(lParam)`; without it, the icon
+/// id is in `wParam` and `lParam` is the raw mouse or keyboard message. Because each icon has exactly
+/// one negotiated encoding, the two readings can never both be valid for the same message, so a mixed
+/// set is decided per icon and no activation is delivered twice.
+fn decode_callback(slots: &[(u32, bool)], wparam: usize, lparam: isize) -> Option<(u32, u32)> {
+    let packed = lparam as u32;
+    let packed_event = packed & 0xFFFF;
+    let packed_uid = packed >> 16;
+    let legacy_uid = wparam as u32;
+
+    if slots
+        .iter()
+        .any(|(uid, version_four)| *uid == packed_uid && *version_four)
+    {
+        return Some((packed_uid, packed_event));
+    }
+    if slots
+        .iter()
+        .any(|(uid, version_four)| *uid == legacy_uid && !*version_four)
+    {
+        return Some((legacy_uid, packed));
+    }
+    None
 }
 
 fn guid(bytes: [u8; 16]) -> windows_sys::core::GUID {
@@ -1232,6 +1275,70 @@ mod tests {
         // The badge is opaque and touches the bottom-right corner.
         let corner = ((31 * 32 + 31) * 4) as usize;
         assert_eq!(tenth.pixels[corner + 3], 255);
+    }
+
+    #[test]
+    fn the_menu_is_settings_then_exit_with_nothing_else() {
+        let items = menu_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].1, "Settings");
+        assert_eq!(items[1].1, "Exit");
+        assert_ne!(items[0].0, items[1].0);
+        // The regression: a separator is not a command and must not be inserted by position.
+        assert!(items.iter().all(|(_, label)| !label.is_empty()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Callback decoding: one encoding per icon, chosen by that icon's own negotiation
+    // -----------------------------------------------------------------------
+
+    /// `LOWORD(event) | HIWORD(icon id)`, the version-4 packing.
+    fn packed(uid: u32, event: u32) -> isize {
+        (((uid as u32) << 16) | (event & 0xFFFF)) as isize
+    }
+
+    #[test]
+    fn a_version_four_icon_is_decoded_from_the_packed_lparam() {
+        let slots = [(1u32, true), (2u32, true)];
+        // NIN_SELECT on icon 2: the id travels in HIWORD, the event in LOWORD.
+        assert_eq!(decode_callback(&slots, 0, packed(2, NIN_SELECT)), Some((2, NIN_SELECT)));
+        assert_eq!(
+            decode_callback(&slots, 0, packed(1, WM_CONTEXTMENU)),
+            Some((1, WM_CONTEXTMENU))
+        );
+    }
+
+    #[test]
+    fn a_legacy_icon_is_decoded_from_wparam_and_lparam() {
+        let slots = [(1u32, false)];
+        // Legacy: wParam carries the id, lParam is the raw message.
+        assert_eq!(
+            decode_callback(&slots, 1, WM_LBUTTONUP as isize),
+            Some((1, WM_LBUTTONUP))
+        );
+        // A legacy click whose lParam happens to have a non-zero high word is still legacy, because
+        // the icon that owns this id never accepted version 4.
+        assert_eq!(
+            decode_callback(&slots, 1, packed(9, NIN_SELECT)),
+            Some((1, packed(9, NIN_SELECT) as u32))
+        );
+    }
+
+    #[test]
+    fn a_mixed_set_routes_each_icon_by_its_own_negotiation() {
+        // Icon 1 accepted version 4, icon 2 did not. One global flag cannot decode this set: with the
+        // flag false, the packed message for icon 1 would be read as a legacy click on icon 0.
+        let slots = [(1u32, true), (2u32, false)];
+        assert_eq!(
+            decode_callback(&slots, 0, packed(1, NIN_KEYSELECT)),
+            Some((1, NIN_KEYSELECT))
+        );
+        assert_eq!(
+            decode_callback(&slots, 2, WM_LBUTTONUP as isize),
+            Some((2, WM_LBUTTONUP))
+        );
+        // No icon owns this message, so nothing is activated.
+        assert_eq!(decode_callback(&slots, 7, WM_LBUTTONUP as isize), None);
     }
 
     #[test]

@@ -466,6 +466,29 @@ impl Flyout {
         }
     }
 
+    /// Bring the rows in line with state that was just re-read, without rebuilding the window.
+    ///
+    /// Rows are matched by profile id, so the marker follows the coordinator's answer rather than the
+    /// row the user last clicked. A registry that gained or lost a profile needs new rows, which this
+    /// call refuses instead of half-applying: it returns false and leaves the window as it was.
+    pub fn sync(&mut self, content: &Content) -> bool {
+        if self.items.len() != content.items.len() {
+            return false;
+        }
+        for (index, fresh) in content.items.iter().enumerate() {
+            match self.items.get(index) {
+                Some(current) if current.id == fresh.id => {}
+                _ => return false,
+            }
+        }
+        for (index, fresh) in content.items.iter().enumerate() {
+            if self.items[index].state != fresh.state {
+                self.set_state(index, fresh.state.clone());
+            }
+        }
+        true
+    }
+
     /// How many rows the popup shows.
     pub fn item_count(&self) -> usize {
         self.rows.len()

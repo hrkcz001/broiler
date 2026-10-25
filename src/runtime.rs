@@ -79,8 +79,22 @@ pub fn request(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, ClientError> {
     let endpoint = pipe::local_endpoint().map_err(|error| ClientError::Channel(error.to_string()))?;
+    request_on(&endpoint.name, storage, method, params)
+}
+
+/// Send one request to the coordinator answering on a named endpoint.
+///
+/// Production callers use [`request`], which resolves the one endpoint of this logon session. An
+/// explicit name exists so a test can address its own fixture coordinator and prove that it never
+/// reaches, and is never reached by, the owner's instance.
+pub fn request_on(
+    endpoint_name: &str,
+    storage: &StorageContext,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
     let deadline = Instant::now() + CLIENT_TIMEOUT;
-    let client = Client::connect(&endpoint.name, deadline).map_err(|error| {
+    let client = Client::connect(endpoint_name, deadline).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut
             || error.kind() == std::io::ErrorKind::NotFound
         {
@@ -499,7 +513,7 @@ pub fn run_resident(storage: StorageContext) -> i32 {
         coordinator: Arc::clone(&coordinator),
         storage: storage.clone(),
         targets: targets.clone(),
-        left_click: left_click_behaviour(&coordinator),
+        names: resident_names(&coordinator, &targets),
         tray_window: std::sync::atomic::AtomicIsize::new(0),
         last_failure: Arc::new(Mutex::new(None)),
         applying: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -614,8 +628,11 @@ fn spawn_stop_watchdog(
 struct TrayHost {
     coordinator: Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
     storage: StorageContext,
+    /// The controlled monitors, in the order the tray slots use.
     targets: Vec<String>,
-    left_click: crate::config::settings::LeftClick,
+    /// Their display names, read once when the icons were built, so a tooltip refresh costs no
+    /// transport call at all.
+    names: Vec<String>,
     /// The tray owner window, so the coordinator thread can ask the UI thread for a flyout.
     tray_window: std::sync::atomic::AtomicIsize,
     /// Why the most recent apply failed, read by the row that reports it.
@@ -637,8 +654,38 @@ fn resident_targets(
     }
 }
 
-fn left_click_behaviour(
+/// The display name of each controlled monitor, in slot order.
+///
+/// Captured once, when the icons are built. A surface that needs a monitor name then reads memory
+/// instead of the worker.
+fn resident_names(
     coordinator: &Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+    targets: &[String],
+) -> Vec<String> {
+    let monitors = match coordinator.lock() {
+        Ok(mut guard) => guard.monitors().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    targets
+        .iter()
+        .map(|id| {
+            monitors
+                .iter()
+                .find(|monitor| &monitor.id == id)
+                .map(|monitor| monitor.friendly_name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect()
+}
+
+/// What a left click on a tray icon does right now.
+///
+/// Read from the coordinator on every activation, never captured when the icons were installed: the
+/// settings window changes this value while the tray is running, and the point of that window is that
+/// the change takes effect without a restart. A poisoned lock keeps the cycle behaviour, which cannot
+/// open a window that would then be unresponsive.
+fn click_behaviour<T: crate::transport::Transport>(
+    coordinator: &Arc<Mutex<Coordinator<T>>>,
 ) -> crate::config::settings::LeftClick {
     coordinator
         .lock()
@@ -646,48 +693,48 @@ fn left_click_behaviour(
         .unwrap_or(crate::config::settings::LeftClick::Cycle)
 }
 
+/// The state label a tooltip or a flyout header shows for one monitor: the profile's display name when
+/// this coordinator verified one, and `Custom` otherwise.
+fn state_label<T: crate::transport::Transport>(coordinator: &Coordinator<T>, monitor: &str) -> String {
+    match coordinator.applied_profile(monitor) {
+        Some(id) => coordinator.profile_name(id).unwrap_or(id).to_string(),
+        None => String::from("Custom"),
+    }
+}
+
 unsafe fn host<'a>(user: *mut std::ffi::c_void) -> Option<&'a mut TrayHost> {
     (user as *mut TrayHost).as_mut()
 }
 
+/// The tooltip text for one icon, from cached state only.
+///
+/// Nothing here touches the hardware: the shell asks for a tooltip whenever the pointer rests on the
+/// icon, and a DDC read at that moment would stall the UI thread and the message loop behind it. The
+/// brightness shown is the last value this coordinator observed, and it is omitted while unknown.
 fn tray_tooltip(user: *mut std::ffi::c_void, monitor: usize) -> String {
     let Some(host) = (unsafe { host(user) }) else {
         return String::from(PRODUCT_NAME);
     };
     let total = host.targets.len();
-    let Some(id) = host.targets.get(monitor).cloned() else {
-        return String::from(PRODUCT_NAME);
-    };
-    let (name, brightness, state) = match host.coordinator.lock() {
-        Ok(mut guard) => {
-            let name = guard
-                .monitors()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|seen| seen.id == id)
-                .map(|seen| seen.friendly_name)
-                .unwrap_or_else(|| id.clone());
-            // A read here is bounded and read-only; an unknown value is simply not shown.
+    let fallback = host
+        .targets
+        .get(monitor)
+        .cloned()
+        .unwrap_or_else(|| String::from(PRODUCT_NAME));
+    let name = host
+        .names
+        .get(monitor)
+        .cloned()
+        .unwrap_or_else(|| fallback.clone());
+    let (brightness, state) = match host.coordinator.lock() {
+        Ok(guard) => {
             let brightness = guard
-                .handle(
-                    "parameters.get",
-                    &serde_json::json!({"monitor": id, "control": "brightness"}),
-                )
-                .ok()
-                .and_then(|result| {
-                    result
-                        .get("reading")
-                        .and_then(|reading| reading.get("current"))
-                        .and_then(serde_json::Value::as_u64)
-                })
-                .map(|value| value as u32);
-            let state = match guard.applied_profile(&id) {
-                Some(profile) => profile.to_string(),
-                None => String::from("Custom"),
-            };
-            (name, brightness, state)
+                .cached_reading(&fallback, "brightness")
+                .map(|reading| reading.current as u32);
+            // The display name of the profile, not the file id the user never sees.
+            (brightness, state_label(&guard, &fallback))
         }
-        Err(_) => (id.clone(), None, String::from("Custom")),
+        Err(_) => (None, String::from("Custom")),
     };
     crate::tray::tooltip(monitor + 1, total, &name, &state, brightness)
 }
@@ -699,16 +746,20 @@ fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate
     let Some(id) = host.targets.get(monitor).cloned() else {
         return;
     };
-    match host.left_click {
+    // Read on every activation. Snapshotting this when the icons were installed is what made a change
+    // in the settings window take effect only after a restart.
+    match click_behaviour(&host.coordinator) {
         crate::config::settings::LeftClick::Cycle => {
-            let result = host.coordinator.lock().ok().map(|mut guard| {
-                guard.handle("profile.next", &serde_json::json!({"monitor": id}))
-            });
-            match result {
-                Some(Ok(_)) => log_info!("cycled the profile of {id}"),
-                Some(Err(error)) => log_error!("the profile of {id} was not changed: {}", error.message),
-                None => log_error!("the coordinator lock was poisoned"),
-            }
+            // One cycle is a DDC transaction: it must not run on the UI thread, and its result becomes
+            // visible through the same publication every other command uses.
+            start_operation(
+                host,
+                id.clone(),
+                String::from("cycle"),
+                "profile.next",
+                serde_json::json!({"monitor": id}),
+                None,
+            );
         }
         crate::config::settings::LeftClick::Flyout => {
             // The UI thread owns the window; this callback runs on it, so the message is queued and
@@ -764,12 +815,10 @@ fn tray_flyout_content(
             items: Vec::new(),
         };
     };
-    let name = guard
-        .monitors()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|seen| seen.id == id)
-        .map(|seen| seen.friendly_name)
+    let name = host
+        .names
+        .get(slot)
+        .cloned()
         .unwrap_or_else(|| id.clone());
     let current = guard.applied_profile(&id).map(str::to_string);
     let listed = guard
@@ -811,11 +860,10 @@ fn tray_flyout_content(
     }
 }
 
-/// Apply the profile the user picked, off the UI thread, and report the outcome back to the tray.
+/// Apply the profile the user picked in the flyout.
 ///
-/// The UI thread must never wait for a DDC transaction, so the work happens here and the answer
-/// arrives as a posted message. A second click while one apply is in flight is refused with a
-/// reason, because two writers to the same monitor is exactly what the product forbids.
+/// The row index is resolved to a profile id here, on the UI thread, and the write itself is handed to
+/// [`start_operation`]: a click must return to the message loop immediately.
 fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
     let Some(host) = (unsafe { host(user) }) else {
         return;
@@ -823,9 +871,6 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
     let Some(monitor) = host.targets.get(slot).cloned() else {
         return;
     };
-    let window = host
-        .tray_window
-        .load(std::sync::atomic::Ordering::Relaxed);
     let profile = match host.coordinator.lock() {
         Ok(mut guard) => guard
             .handle("profiles.list", &serde_json::Value::Null)
@@ -842,16 +887,44 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
     let Some(profile) = profile else {
         return;
     };
+    start_operation(
+        host,
+        monitor.clone(),
+        profile.clone(),
+        "profile.apply",
+        serde_json::json!({"id": profile, "monitor": monitor}),
+        Some(row),
+    );
+}
 
+/// Run one coordinator command off the UI thread and report the outcome back to the tray.
+///
+/// Every hardware operation that a click can start goes through here — a flyout apply and a cycle
+/// alike — for three reasons. A DDC transaction can take tens of milliseconds or time out, and the UI
+/// thread must never wait for it. One serialized writer is the product invariant, so a second request
+/// while one is in flight is refused with a reason instead of queued behind it. And the outcome is
+/// reported through the coordinator's own publication, so the icon, the tooltip and the flyout all
+/// learn about a completed cycle or apply instead of only the surface that started it.
+fn start_operation(
+    host: &TrayHost,
+    monitor: String,
+    what: String,
+    method: &'static str,
+    params: serde_json::Value,
+    row: Option<usize>,
+) {
+    let window = host
+        .tray_window
+        .load(std::sync::atomic::Ordering::Relaxed);
     if host
         .applying
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
-        log_error!("a profile is already being applied; the click was ignored");
+        log_error!("{monitor}: {what} was ignored; another hardware operation is in progress");
         if let Ok(mut guard) = host.last_failure.lock() {
-            *guard = Some(String::from("another profile is being applied"));
+            *guard = Some(String::from("another operation is in progress"));
         }
-        if window != 0 {
+        if let (Some(row), true) = (row, window != 0) {
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
                     window as windows_sys::Win32::Foundation::HWND,
@@ -869,31 +942,22 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
     let applying = Arc::clone(&host.applying);
     std::thread::spawn(move || {
         let outcome = match coordinator.lock() {
-            Ok(mut guard) => guard.handle(
-                "profile.apply",
-                &serde_json::json!({"id": profile, "monitor": monitor}),
-            ),
+            Ok(mut guard) => guard.handle(method, &params),
             Err(_) => Err(crate::ipc::Failure::new(
                 "internal",
                 "the coordinator lock was poisoned",
             )),
         };
-        let applied = match &outcome {
-            Ok(result) => {
-                let status = result
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("failed");
-                status == "applied"
-            }
-            Err(_) => false,
-        };
+        let applied = matches!(
+            &outcome,
+            Ok(result) if result.get("status").and_then(serde_json::Value::as_str) == Some("applied")
+        );
         match &outcome {
             Ok(result) if applied => {
                 // A hardware write is only acceptable with a stated reason and recorded values, so
                 // the log carries the requested value, the value written and what the device reported
                 // for every control in the profile.
-                log_info!("{monitor}: {profile} applied from the flyout");
+                log_info!("{monitor}: {what} applied ({method})");
                 for field in applied_fields(result) {
                     log_info!("{monitor}: {field}");
                 }
@@ -906,20 +970,22 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
                     .get("status")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("failed");
-                log_error!("{monitor}: {profile} was not applied ({status})");
+                log_error!("{monitor}: {what} was not applied ({status})");
                 if let Ok(mut guard) = failure.lock() {
-                    *guard = Some(format!("{status}"));
+                    *guard = Some(status.to_string());
                 }
             }
             Err(error) => {
-                log_error!("{monitor}: {profile} failed: {}", error.message);
+                log_error!("{monitor}: {what} failed: {}", error.message);
                 if let Ok(mut guard) = failure.lock() {
                     *guard = Some(error.message.clone());
                 }
             }
         }
         applying.store(false, std::sync::atomic::Ordering::SeqCst);
-        if window != 0 {
+        // The coordinator has already published the change; this message only tells the flyout which
+        // row it was, so an error can be shown against the row the user clicked.
+        if let (Some(row), true) = (row, window != 0) {
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
                     window as windows_sys::Win32::Foundation::HWND,
@@ -1299,6 +1365,139 @@ mod tests {
         (step, transport)
     }
 
+    /// A coordinator over the fake transport, with `profiles` in its registry and its own root.
+    fn fixture_host(
+        name: &str,
+        profiles: &[&str],
+    ) -> (
+        Arc<Mutex<Coordinator<crate::transport::FakeTransport>>>,
+        PathBuf,
+    ) {
+        let (storage, base) = isolated(name);
+        let transport = crate::transport::FakeTransport::with_monitor("mon-a", "Panel")
+            .with_value("mon-a", "brightness", 40);
+        let coordinator = Coordinator::new(
+            transport,
+            Settings::default(),
+            registry(profiles),
+            storage.settings_file(),
+        )
+        .with_profiles_dir(storage.profiles_dir())
+        .with_storage(storage);
+        (Arc::new(Mutex::new(coordinator)), base)
+    }
+
+    #[test]
+    fn a_left_click_follows_the_setting_that_is_stored_now() {
+        // The regression: the behaviour was captured when the icons were installed, so changing it in
+        // the settings window did nothing until the process restarted.
+        use crate::config::settings::LeftClick;
+        let (coordinator, base) = fixture_host("live-click", &["day", "night"]);
+        assert_eq!(click_behaviour(&coordinator), LeftClick::Flyout);
+
+        coordinator
+            .lock()
+            .expect("lock")
+            .handle(
+                "settings.set",
+                &serde_json::json!({"key": "tray.left_click", "value": "cycle"}),
+            )
+            .expect("settings.set");
+        assert_eq!(
+            click_behaviour(&coordinator),
+            LeftClick::Cycle,
+            "a stored change must be what the next click obeys"
+        );
+
+        coordinator
+            .lock()
+            .expect("lock")
+            .handle(
+                "settings.set",
+                &serde_json::json!({"key": "tray.left_click", "value": "flyout"}),
+            )
+            .expect("settings.set");
+        assert_eq!(click_behaviour(&coordinator), LeftClick::Flyout);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn the_tooltip_state_is_the_profile_display_name_and_not_its_id() {
+        // The regression: the tooltip printed `applied_profile`, which is the file id.
+        let (storage, base) = isolated("tooltip-name");
+        let text = "schema_version = 1\nid = \"night\"\nname = \"Night mode\"\nicon = \"night\"\norder = 10\n\n[monitor]\nbrightness = 40\n";
+        let profile = crate::config::profile::parse(text, std::path::Path::new("night.toml"))
+            .expect("profile");
+        let transport = crate::transport::FakeTransport::with_monitor("mon-a", "Panel");
+        let mut coordinator = Coordinator::new(
+            transport,
+            Settings::default(),
+            ProfileRegistry::new(vec![profile]).expect("registry"),
+            storage.settings_file(),
+        )
+        .with_profiles_dir(storage.profiles_dir())
+        .with_storage(storage);
+
+        // The default before anything was verified is Custom, not a guess.
+        assert_eq!(state_label(&coordinator, "mon-a"), "Custom");
+        coordinator
+            .handle("profile.apply", &serde_json::json!({"id": "night", "monitor": "mon-a"}))
+            .expect("apply");
+        assert_eq!(
+            state_label(&coordinator, "mon-a"),
+            "Night mode",
+            "the tooltip must show the name the user wrote, not the file id"
+        );
+        assert_eq!(
+            crate::tray::tooltip(1, 1, "Panel", &state_label(&coordinator, "mon-a"), Some(40)),
+            "Panel - Night mode, 40%"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn every_mutating_command_announces_a_change_and_a_read_does_not() {
+        let (coordinator, base) = fixture_host("publish", &["day", "night"]);
+        let mut guard = coordinator.lock().expect("lock");
+
+        // A read or a query publishes nothing: no surface shows anything new.
+        guard.handle("status", &serde_json::Value::Null).expect("status");
+        assert!(guard.last_published().is_empty());
+        guard.handle("profiles.list", &serde_json::Value::Null).expect("list");
+        assert!(guard.last_published().is_empty());
+
+        // Apply, cycle, reload, settings and selection each publish the monitor they changed. The
+        // publication happens inside `handle`, so one command cannot be implemented without it.
+        for (method, params) in [
+            ("profile.apply", serde_json::json!({"id": "day", "monitor": "mon-a"})),
+            ("profile.next", serde_json::json!({"monitor": "mon-a"})),
+            (
+                "settings.set",
+                serde_json::json!({"key": "tray.left_click", "value": "cycle"}),
+            ),
+            (
+                "monitors.select",
+                serde_json::json!({"monitor_ids": ["mon-a"], "remember": true}),
+            ),
+            ("profiles.reload", serde_json::Value::Null),
+        ] {
+            guard.handle(method, &params).expect(method);
+            assert_eq!(
+                guard.last_published(),
+                [String::from("mon-a")],
+                "{method} must announce the monitor it changed"
+            );
+        }
+
+        // A failed command still publishes nothing new: its own state did not change.
+        guard
+            .handle("settings.set", &serde_json::json!({"key": "nonsense.key", "value": "1"}))
+            .expect_err("unknown key");
+        assert!(guard.last_published().is_empty());
+        drop(guard);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn a_launch_with_no_monitor_exits_silently_and_writes_nothing() {
         let (step, transport) = launch(
@@ -1420,19 +1619,64 @@ mod tests {
 
     #[test]
     fn a_request_without_a_coordinator_reports_not_running() {
-        // No daemon is started in the test process; the endpoint simply has no server.
+        // No daemon is started for this fixture namespace; the endpoint simply has no server. The
+        // owner's resident instance must not answer it either, which is why the namespace exists.
         let (storage, base) = isolated("no-coordinator");
-        assert_eq!(
-            request(&storage, "ping", serde_json::Value::Null),
-            Err(ClientError::NotRunning)
-        );
+        let name = crate::pipe::fixture::namespace("runtime-none");
+        let answer = crate::pipe::fixture::with_namespace(&name, || {
+            request(&storage, "ping", serde_json::Value::Null)
+        });
+        assert_eq!(answer, Err(ClientError::NotRunning));
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn stopping_without_a_coordinator_is_idempotent() {
         let (storage, base) = isolated("stop");
-        assert_eq!(stop_resident(&storage), Ok(false));
+        let name = crate::pipe::fixture::namespace("runtime-stop");
+        let answer = crate::pipe::fixture::with_namespace(&name, || stop_resident(&storage));
+        assert_eq!(answer, Ok(false));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A fixture coordinator answering on its own namespace, so the next test can prove that a live
+    /// instance is invisible to a namespace that is not its own.
+    #[test]
+    fn one_fixture_namespace_never_answers_another() {
+        use crate::config::registry::ProfileRegistry;
+        use crate::daemon::handle_connection;
+        use crate::pipe::{fixture, local_endpoint, ServerConnection};
+        use crate::transport::FakeTransport;
+
+        let (storage, base) = isolated("namespaces");
+        let serving = fixture::namespace("runtime-serving");
+        let endpoint = fixture::with_namespace(&serving, || local_endpoint().expect("endpoint"));
+        let server = ServerConnection::create(&endpoint, true).expect("fixture server");
+
+        let transport = FakeTransport::with_monitor("mon-a", "Panel");
+        let coordinator = Arc::new(Mutex::new(
+            Coordinator::new(
+                transport,
+                Settings::default(),
+                ProfileRegistry::default(),
+                storage.settings_file(),
+            )
+            .with_storage(storage.clone()),
+        ));
+        let handle = std::thread::spawn(move || {
+            server.connect().expect("client connected");
+            handle_connection(server, coordinator);
+        });
+
+        // The same fixture instance answers on its own namespace ...
+        let answered = request_on(&serving, &storage, "ping", serde_json::Value::Null);
+        assert!(answered.is_ok(), "{answered:?}");
+        handle.join().expect("fixture server thread");
+
+        // ... and an unrelated namespace, which is where every other test lives, sees nothing.
+        let other = fixture::namespace("runtime-other");
+        let silent = request_on(&other, &storage, "ping", serde_json::Value::Null);
+        assert_eq!(silent, Err(ClientError::NotRunning));
         let _ = std::fs::remove_dir_all(base);
     }
 }

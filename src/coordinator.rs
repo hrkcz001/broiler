@@ -236,6 +236,12 @@ impl<T: Transport> Coordinator<T> {
         self.transport.peak_concurrency()
     }
 
+    /// The profile this monitor was last verified against, when the values were actually applied by
+    /// this process. `None` means the state is unknown or custom, and no icon may claim otherwise.
+    pub fn applied_profile(&self, monitor: &str) -> Option<&str> {
+        self.last_applied.get(monitor).map(String::as_str)
+    }
+
     pub fn settings(&self) -> &Settings {
         &self.settings
     }

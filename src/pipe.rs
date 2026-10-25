@@ -45,6 +45,13 @@ pub struct Endpoint {
     attributes: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
 }
 
+// The descriptor and its ACL are owned by this value and move with it; nothing is shared and no
+// thread reads those buffers concurrently. Windows consumes them during `CreateNamedPipeW`, which
+// runs on whichever thread owns the endpoint, so moving the endpoint to the serving thread is sound.
+// The declaration exists so the daemon can live on a worker thread and leave the UI thread free for
+// the tray message loop.
+unsafe impl Send for Endpoint {}
+
 impl Endpoint {
     fn attributes(&self) -> *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
         &self.attributes

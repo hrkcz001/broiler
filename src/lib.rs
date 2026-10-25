@@ -31,6 +31,7 @@ pub mod paths;
 pub mod plan;
 pub mod runtime;
 pub mod storage;
+pub mod tray;
 pub mod supervisor;
 pub mod transport;
 pub mod win;

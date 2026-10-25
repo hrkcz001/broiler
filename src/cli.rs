@@ -93,7 +93,12 @@ fn help_text() -> String {
 const DEFAULT_LOG_LEVEL: Level = Level::Warn;
 
 fn init_logging(storage: &StorageContext) {
-    logging::init(DEFAULT_LOG_LEVEL, storage.log_file());
+    // The level the user configured, not a constant: `settings get logging.level` must not claim a
+    // verbosity the log file does not honour. An unreadable settings file keeps the default.
+    let level = crate::config::settings::load(&storage.settings_file())
+        .map(|settings| settings.log_level)
+        .unwrap_or(DEFAULT_LOG_LEVEL);
+    logging::init(level, storage.log_file());
 }
 
 fn print_version() {

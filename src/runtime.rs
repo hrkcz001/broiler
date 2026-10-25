@@ -481,8 +481,69 @@ pub fn run_resident(storage: StorageContext) -> i32 {
         PROTOCOL_VERSION
     );
 
-    let daemon = Daemon::new(endpoint, coordinator);
-    match daemon.run() {
+    let targets = resident_targets(&coordinator);
+    let specs: Vec<crate::tray::IconSpec> = targets
+        .iter()
+        .enumerate()
+        .map(|(position, monitor)| crate::tray::IconSpec {
+            monitor: monitor.clone(),
+            // A persisted profile id proves nothing about the current hardware state, so the icon
+            // starts neutral.
+            glyph: crate::tray::Glyph::Monitor,
+            index: position + 1,
+            badges: true,
+        })
+        .collect();
+
+    let host = Box::new(TrayHost {
+        coordinator: Arc::clone(&coordinator),
+        storage: storage.clone(),
+        targets: targets.clone(),
+        left_click: left_click_behaviour(&coordinator),
+    });
+    let user = Box::into_raw(host) as *mut std::ffi::c_void;
+
+    let tray = crate::tray::Tray::install(
+        &specs,
+        crate::tray::Callbacks {
+            user,
+            tooltip: tray_tooltip,
+            activate: tray_activate,
+            settings: tray_settings,
+            exit: tray_exit,
+        },
+    );
+
+    let Some(mut tray) = tray else {
+        // Without a notification area the resident process would be invisible; serve anyway, because
+        // the pipe still works, and say so instead of pretending there is an icon.
+        log_info!("no notification area: serving without tray icons");
+        spawn_stop_watchdog(Arc::clone(&coordinator), storage.clone(), None);
+        let result = Daemon::new(endpoint, Arc::clone(&coordinator)).run();
+        unsafe { drop(Box::from_raw(user as *mut TrayHost)) };
+        return report_daemon(result);
+    };
+
+    // A `stop` from the command line must end this process, not just its coordinator. The watcher
+    // polls the shutdown flag, ends this message loop, and releases the daemon's blocked accept.
+    let quit_window = tray.window_id();
+    spawn_stop_watchdog(Arc::clone(&coordinator), storage.clone(), Some(quit_window));
+    let daemon_coordinator = Arc::clone(&coordinator);
+    let daemon = std::thread::spawn(move || Daemon::new(endpoint, daemon_coordinator).run());
+    tray.run();
+    log_info!("tray message loop finished");
+
+    // The daemon's accept loop is blocked; one request on the pipe wakes it so it can notice the
+    // shutdown flag and return.
+    let _ = stop_resident(&storage);
+    let result = daemon.join().unwrap_or_else(|_| Ok(0));
+    drop(tray);
+    unsafe { drop(Box::from_raw(user as *mut TrayHost)) };
+    report_daemon(result)
+}
+
+fn report_daemon(result: std::io::Result<u64>) -> i32 {
+    match result {
         Ok(served) => {
             log_info!("coordinator stopped after {served} connection(s)");
             0
@@ -492,6 +553,199 @@ pub fn run_resident(storage: StorageContext) -> i32 {
             output::error_line(&format!("{}: {error}", PRODUCT_NAME));
             6
         }
+    }
+}
+
+/// End the process once a shutdown has been requested.
+///
+/// The accept loop can be blocked in its next `ConnectNamedPipe` when the shutdown flag is set by a
+/// handler thread, so a flag check alone is not enough: the watcher polls the flag, then releases the
+/// blocked accept with one real request and, when a tray exists, ends its message loop. Without this
+/// `broiler stop` returns success while the process stays alive.
+fn spawn_stop_watchdog(
+    coordinator: Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+    storage: StorageContext,
+    quit_window: Option<isize>,
+) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let stopping = coordinator
+            .lock()
+            .map(|guard| guard.shutdown_requested())
+            .unwrap_or(true);
+        if !stopping {
+            continue;
+        }
+        if let Some(window) = quit_window {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    window as windows_sys::Win32::Foundation::HWND,
+                    0x0010,
+                    0,
+                    0,
+                );
+            }
+        }
+        // Release the accept loop; the request itself does nothing.
+        let _ = request(&storage, "ping", serde_json::Value::Null);
+        return;
+    });
+}
+
+/// Everything the tray callbacks need. Reached through the `user` pointer, always on the UI thread.
+struct TrayHost {
+    coordinator: Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+    storage: StorageContext,
+    targets: Vec<String>,
+    left_click: crate::config::settings::LeftClick,
+}
+
+/// Which monitors a resident instance controls.
+fn resident_targets(
+    coordinator: &Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+) -> Vec<String> {
+    let Ok(mut guard) = coordinator.lock() else {
+        return Vec::new();
+    };
+    let settings = guard.settings().clone();
+    let present: Vec<String> = guard
+        .monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|monitor| monitor.id)
+        .collect();
+    if settings.monitor_ids.is_empty() {
+        return present;
+    }
+    // A remembered selection with a display missing keeps its order and drops what is gone.
+    settings
+        .monitor_ids
+        .iter()
+        .filter(|id| present.iter().any(|seen| seen == *id))
+        .cloned()
+        .collect()
+}
+
+fn left_click_behaviour(
+    coordinator: &Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+) -> crate::config::settings::LeftClick {
+    coordinator
+        .lock()
+        .map(|guard| guard.settings().left_click)
+        .unwrap_or(crate::config::settings::LeftClick::Cycle)
+}
+
+unsafe fn host<'a>(user: *mut std::ffi::c_void) -> Option<&'a mut TrayHost> {
+    (user as *mut TrayHost).as_mut()
+}
+
+fn tray_tooltip(user: *mut std::ffi::c_void, monitor: usize) -> String {
+    let Some(host) = (unsafe { host(user) }) else {
+        return String::from(PRODUCT_NAME);
+    };
+    let total = host.targets.len();
+    let Some(id) = host.targets.get(monitor).cloned() else {
+        return String::from(PRODUCT_NAME);
+    };
+    let (name, brightness, state) = match host.coordinator.lock() {
+        Ok(mut guard) => {
+            let name = guard
+                .monitors()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|seen| seen.id == id)
+                .map(|seen| seen.friendly_name)
+                .unwrap_or_else(|| id.clone());
+            // A read here is bounded and read-only; an unknown value is simply not shown.
+            let brightness = guard
+                .handle(
+                    "parameters.get",
+                    &serde_json::json!({"monitor": id, "control": "brightness"}),
+                )
+                .ok()
+                .and_then(|result| {
+                    result
+                        .get("reading")
+                        .and_then(|reading| reading.get("current"))
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .map(|value| value as u32);
+            let state = match guard.applied_profile(&id) {
+                Some(profile) => profile.to_string(),
+                None => String::from("Custom"),
+            };
+            (name, brightness, state)
+        }
+        Err(_) => (id.clone(), None, String::from("Custom")),
+    };
+    crate::tray::tooltip(monitor + 1, total, &name, &state, brightness)
+}
+
+fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate::tray::Activation) {
+    let Some(host) = (unsafe { host(user) }) else {
+        return;
+    };
+    let Some(id) = host.targets.get(monitor).cloned() else {
+        return;
+    };
+    match host.left_click {
+        crate::config::settings::LeftClick::Cycle => {
+            let result = host.coordinator.lock().ok().map(|mut guard| {
+                guard.handle("profile.next", &serde_json::json!({"monitor": id}))
+            });
+            match result {
+                Some(Ok(_)) => log_info!("cycled the profile of {id}"),
+                Some(Err(error)) => log_error!("the profile of {id} was not changed: {}", error.message),
+                None => log_error!("the coordinator lock was poisoned"),
+            }
+        }
+        crate::config::settings::LeftClick::Flyout => {
+            // The flyout is its own gate. Reporting it is better than silently cycling instead.
+            log_info!("the profile flyout is not implemented in this build; use the CLI or cycle profiles");
+            output::error_line(&format!(
+                "{}: the profile flyout is not implemented in this build",
+                PRODUCT_NAME
+            ));
+        }
+    }
+}
+
+fn tray_settings(user: *mut std::ffi::c_void) {
+    let Some(host) = (unsafe { host(user) }) else {
+        return;
+    };
+    let text = format!(
+        "The settings window belongs to a later build. Until then the same settings are available \
+         from the command line, and the profiles live in:\n\n{}",
+        host.storage.profiles_dir().display()
+    );
+    message_box("broiler: settings", &text);
+}
+
+fn tray_exit(user: *mut std::ffi::c_void) {
+    let Some(host) = (unsafe { host(user) }) else {
+        return;
+    };
+    // Exit stops the whole instance: the coordinator flag ends the daemon, and the quit message ends
+    // this message loop. Both, or the process would outlive its icons.
+    if let Ok(mut guard) = host.coordinator.lock() {
+        let _ = guard.handle("shutdown", &serde_json::Value::Null);
+    }
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
+}
+
+/// A modal message box, used where this build has no window of its own yet.
+fn message_box(title: &str, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let title = crate::win::wide::to_wide(title);
+    let text = crate::win::wide::to_wide(text);
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
     }
 }
 

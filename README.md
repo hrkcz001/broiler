@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Working today: both executables; `monitors list` and `monitors capabilities` (read-only); `get` and `set brightness|contrast` with readback verification through the isolated DDC worker; a resident coordinator with a logon-SID-scoped pipe and the `start`/`stop`/`status`/`settings` commands; and the validated profile, value and planning model. Missing: profile apply, monitor selection, colour temperature and the remaining controls, tray, flyout and settings window.**Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
+**Status: early implementation. Working today: both executables; a resident coordinator with a logon-SID-scoped pipe; `start`/`stop`/`status`/`reload`; `monitors list`, `capabilities`, `select`; `profiles list`/`validate`, `profile apply`, `profile next`; `get`/`set` for brightness and contrast with readback verification; `settings get`/`set`; `startup status`; `icons list`. Profiles in this build write only brightness and contrast; colour temperature and the remaining controls, the tray, the flyout and every window are not implemented yet.** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 
 ## What it controls
 

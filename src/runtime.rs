@@ -183,12 +183,16 @@ pub fn run_resident() -> i32 {
     };
 
     let transport = crate::transport::WorkerTransport::new(tray);
-    let coordinator = Arc::new(Mutex::new(Coordinator::new(
+    let mut coordinator_state = Coordinator::new(
         transport,
         settings,
         registry,
         settings_path().unwrap_or_else(|| PathBuf::from("settings.toml")),
-    )));
+    );
+    if let Some(directory) = profiles_dir() {
+        coordinator_state = coordinator_state.with_profiles_dir(directory);
+    }
+    let coordinator = Arc::new(Mutex::new(coordinator_state));
 
     log_info!(
         "coordinator listening on {} (protocol {})",

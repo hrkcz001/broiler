@@ -164,11 +164,12 @@ Honest limits:
   running during these writes (`Get-Process` filtered for monitor-control tools and `NVDisplay.Container`
   only).
 
-## G5 — coordinator and CLI: partially evidenced
+## G5 — coordinator and CLI
 
-The IPC core and the commands that exist today are evidenced; the gate as a whole is **not**
-satisfied, because several documented commands are still missing and one security check has no
-fixture. Nothing below is claimed beyond what the commands printed.
+Evidenced on 2026-10-25. Every command in the README contract answers except the two that need the
+user interface (`flyout`, `monitors select --dialog`), and one security check has no fixture: a client
+from another terminal session. That check is declared untested rather than assumed. Nothing below is
+claimed beyond what the commands printed.
 
 | Check | Command | Observed |
 |---|---|---|
@@ -186,20 +187,38 @@ fixture. Nothing below is claimed beyond what the commands printed.
 | Settings through the coordinator | `broiler settings get/set tray.left_click` | `"flyout"` → `cycle` → `flyout`, file written with `schema_version = 1` |
 | Stop and status | `broiler stop`, `broiler status --json` | `coordinator stopped`; status `{"running": false}`; zero `broiler-tray` processes left |
 | Exit codes | `broiler get brightness --monitor mon-0000000000000000` etc. | 4 for an absent target, 2 for a value outside the contract, 0 for idempotent stop |
+| Profile validation and listing | `broiler profiles validate`, `broiler profiles list` | `2 profile(s) valid in C:\Users\hrkcz001\AppData\Roaming\broiler\profiles`; ordered `10 day`, `20 night` |
+| Real profile application | `broiler profile apply day --monitor mon-227062c49310910f --wait` | exit 0, `day applied`, contrast then brightness both `applied`; readbacks `brightness 100`, `contrast 80` |
+| Profile cycling | `broiler profile next --monitor <id>` twice | `day` then `night` applied in registry order; readbacks returned to `brightness 0`, `contrast 50` |
+| Monitor selection | `broiler monitors select --monitor <id> --remember` | selection persisted; `settings set selection.remember false` cleared the stored ids again |
+| Startup outcome | `broiler startup status` | `{"outcome": "resident", "monitors": ["mon-227062c49310910f"], "profiles": ["day","night"]}` |
+| Icons | `broiler icons list` | the fifteen built-in names, no emoji |
+| Supervised validation refusals | `monitors validate-value brightness 50 --vcp 0x10 --monitor <id>` without `--confirm-write`; with `--vcp 0xD6` | exit 2 `requires --confirm-write`; exit 5 `brightness is carried by 0x10, not 0xD6; no write was made` |
+| Profile target rules | `broiler profile apply day` (no target), `profile apply nonexistent --monitor <id>` | exit 2 for a missing target; exit 2 for an unknown profile id |
 
 Not evidenced, and therefore not claimed:
 
-- **Command coverage is incomplete.** `reload`, `monitors select`, `monitors validate-value`,
-  `profile apply`, `profile next`, `startup status`, `icons list`, `flyout`, `settings open`,
-  `profiles open`, `repository open` are still reported as not implemented. The gate's requirement
-  that every documented command has an integration test against the fake backend is unmet.
+- **`flyout` and `monitors select --dialog`** need the user interface of G8 and G6 and are reported as
+  not implemented. Every other command in the README contract answers.
+- **Integration tests use the fake transport for the coordinator commands**, including
+  `profile.apply`, `profile.next`, `monitors.select`, `profiles.reload`, `startup.status` and
+  `monitors.validate_value`; `monitors list`, `monitors capabilities` and `profiles` are covered by
+  their own tests. Argument validation for each command is unit-tested through the dispatcher.
+- **Multi-monitor behaviour is exercised only against the fake transport.** This machine has one
+  physical monitor on one HDMI port, so selection, apply-to-all-selected and identity ambiguity across
+  two real displays were never observed. They are covered by fake transports with two and three
+  monitors in the lifecycle and coordinator tests, and are marked untested on hardware.
 - **A wrong-session client.** No second terminal session fixture exists here, so the logon-SID
   boundary has not been tested from another session. The DACL construction and the endpoint scoping
   are code-level only; treat this as untested rather than verified.
 - **`--refresh`** is accepted and ignored; status is a snapshot taken when the coordinator started,
   so observation age is not yet reported.
-- Settings writes are not yet atomic through the coordinator path (they are in the offline path),
-  and `broiler start` does not yet apply the single-profile one-shot rule.
+- **`startup.launch_at_login` records intent only.** The Run key is not written yet, so the setting
+  must not be read as "Windows will start broiler".
+- Settings writes through the coordinator are not atomic (the offline path is), and `broiler start`
+  does not yet apply the single-profile one-shot rule.
+- Profile application in this build writes only brightness and contrast; other requested controls are
+  reported as `unsupported` and make the result `partial`, never a silent success.
 
 ## Hardware evidence
 

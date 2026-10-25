@@ -40,17 +40,7 @@ pub enum Program {
 }
 
 /// Commands that belong to the v1 contract but are not implemented in this build.
-const PLANNED_COMMANDS: &[&str] = &[
-    "reload",
-    "profile",
-    "startup",
-    "repository",
-    "icons",
-    "flyout",
-    "paths",
-    "operations",
-    "ping",
-];
+const PLANNED_COMMANDS: &[&str] = &["flyout"];
 
 fn help_text() -> String {
     format!(
@@ -126,6 +116,11 @@ fn dispatch_console(args: &[String]) -> i32 {
         "status" => handle_status(&args[1..]),
         "profiles" => handle_profiles(&args[1..]),
         "settings" => handle_settings(&args[1..]),
+        "reload" => handle_reload(&args[1..]),
+        "profile" => handle_profile(&args[1..]),
+        "startup" => handle_startup(&args[1..]),
+        "icons" => handle_icons(&args[1..]),
+        "repository" => handle_repository(&args[1..]),
         "get" => handle_get(&args[1..]),
         "set" => handle_set(&args[1..]),
         other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
@@ -473,6 +468,200 @@ fn settings_key_value(
         "profiles.unsupported" => Some(json!(settings.unsupported.as_str())),
         "logging.level" => Some(json!(settings.log_level.as_str())),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// profiles, monitor selection, startup, icons
+// ---------------------------------------------------------------------------
+
+fn handle_reload(args: &[String]) -> i32 {
+    if let Some(argument) = args.first() {
+        return usage_error(&format!("reload: unexpected argument: {argument}"));
+    }
+    match crate::runtime::request("profiles.reload", json!(null)) {
+        Ok(result) => {
+            let count = result.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            output::line(&format!("reloaded {count} profile(s)"));
+            EXIT_OK
+        }
+        Err(error) => report_client_error(&error),
+    }
+}
+
+fn handle_profile(args: &[String]) -> i32 {
+    let Some(subcommand) = args.first() else {
+        return usage_error("profile: expected 'apply' or 'next'");
+    };
+
+    match subcommand.as_str() {
+        "apply" => {
+            let Some(id) = args.get(1) else {
+                return usage_error("profile apply: a profile id is required");
+            };
+            let mut monitor: Option<String> = None;
+            let mut all_selected = false;
+            let mut json_output = false;
+            let mut index = 2usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--monitor" => {
+                        index += 1;
+                        match args.get(index) {
+                            Some(value) => monitor = Some(value.clone()),
+                            None => return usage_error("profile apply: --monitor requires an identifier"),
+                        }
+                    }
+                    "--all-selected" => all_selected = true,
+                    "--wait" => {}
+                    "--json" => json_output = true,
+                    other => {
+                        return usage_error(&format!("profile apply: unexpected argument: {other}"))
+                    }
+                }
+                index += 1;
+            }
+            if monitor.is_some() && all_selected {
+                return usage_error("profile apply: use either --monitor or --all-selected");
+            }
+            let params = match (&monitor, all_selected) {
+                (Some(monitor), _) => json!({"id": id, "monitor": monitor}),
+                (None, true) => json!({"id": id, "all_selected": true}),
+                (None, false) => {
+                    return usage_error(
+                        "profile apply: a target is required: --monitor <id> or --all-selected",
+                    )
+                }
+            };
+            match crate::runtime::request("profile.apply", params) {
+                Ok(result) => report_apply(&result, json_output),
+                Err(error) => report_client_error(&error),
+            }
+        }
+        "next" => {
+            let mut monitor: Option<String> = None;
+            let mut json_output = false;
+            let mut index = 1usize;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--monitor" => {
+                        index += 1;
+                        match args.get(index) {
+                            Some(value) => monitor = Some(value.clone()),
+                            None => return usage_error("profile next: --monitor requires an identifier"),
+                        }
+                    }
+                    "--json" => json_output = true,
+                    other => return usage_error(&format!("profile next: unexpected argument: {other}")),
+                }
+                index += 1;
+            }
+            let Some(monitor) = monitor else {
+                return usage_error("profile next: --monitor <id> is required");
+            };
+            match crate::runtime::request("profile.next", json!({"monitor": monitor})) {
+                Ok(result) => report_apply(&result, json_output),
+                Err(error) => report_client_error(&error),
+            }
+        }
+        other => usage_error(&format!("profile: unknown subcommand: {other}")),
+    }
+}
+
+/// Print an apply result and map its status to an exit code.
+fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not_applied");
+
+    if json_output {
+        emit_json(result);
+    } else {
+        let profile = result
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        for monitor in result
+            .get("monitors")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let id = monitor
+                .get("monitor")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let monitor_status = monitor
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            output::line(&format!("{id}: {profile} {monitor_status}"));
+            for field in monitor
+                .get("fields")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let control = field
+                    .get("control")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let field_status = field
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let detail = field
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                output::line(&format!("  {control:<20} {field_status} {detail}"));
+            }
+        }
+    }
+
+    match status {
+        "applied" => EXIT_OK,
+        "partial" => EXIT_PARTIAL,
+        _ => EXIT_TRANSPORT,
+    }
+}
+
+fn handle_startup(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("status") => match crate::runtime::request("startup.status", json!(null)) {
+            Ok(result) => {
+                emit_json(&result);
+                EXIT_OK
+            }
+            Err(error) => report_client_error(&error),
+        },
+        Some(other) => usage_error(&format!("startup: unknown subcommand: {other}")),
+        None => usage_error("startup: expected 'status'"),
+    }
+}
+
+fn handle_icons(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            for icon in crate::config::profile::ICON_NAMES {
+                output::line(icon);
+            }
+            EXIT_OK
+        }
+        Some(other) => usage_error(&format!("icons: unknown subcommand: {other}")),
+        None => usage_error("icons: expected 'list'"),
+    }
+}
+
+fn handle_repository(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("open") => match open_path(std::path::Path::new("https://github.com/hrkcz001/broiler")) {
+            Ok(()) => EXIT_OK,
+            Err(reason) => usage_error(&reason),
+        },
+        Some(other) => usage_error(&format!("repository: unknown subcommand: {other}")),
+        None => usage_error("repository: expected 'open'"),
     }
 }
 
@@ -1067,12 +1256,165 @@ fn monitors_capabilities(args: &[String]) -> i32 {
     }
 }
 
+fn monitors_select(args: &[String]) -> i32 {
+    let mut ids: Vec<String> = Vec::new();
+    let mut remember = false;
+    let mut none = false;
+    let mut dialog = false;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => ids.push(value.clone()),
+                    None => return usage_error("monitors select: --monitor requires an identifier"),
+                }
+            }
+            "--remember" => remember = true,
+            "--none" => none = true,
+            "--dialog" => dialog = true,
+            other => return usage_error(&format!("monitors select: unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+
+    if dialog {
+        return usage_error(
+            "monitors select: the selection dialog arrives with the user-interface gate; \
+             use --monitor <id> or --none",
+        );
+    }
+    if none && !ids.is_empty() {
+        return usage_error("monitors select: --none cannot be combined with --monitor");
+    }
+    if !none && ids.is_empty() {
+        return usage_error("monitors select: choose --monitor <id> (repeatable) or --none");
+    }
+
+    match crate::runtime::request(
+        "monitors.select",
+        json!({"monitor_ids": ids, "remember": remember}),
+    ) {
+        Ok(result) => {
+            emit_json(&result);
+            EXIT_OK
+        }
+        Err(error) => report_client_error(&error),
+    }
+}
+
+fn monitors_validate_value(args: &[String]) -> i32 {
+    let mut parameter: Option<&'static str> = None;
+    let mut value: Option<u64> = None;
+    let mut vcp: Option<u64> = None;
+    let mut monitor: Option<String> = None;
+    let mut confirm_write = false;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm-write" => confirm_write = true,
+            "--vcp" => {
+                index += 1;
+                match args.get(index).and_then(|text| parse_number(text)) {
+                    Some(code) => vcp = Some(code),
+                    None => return usage_error("monitors validate-value: --vcp requires a code"),
+                }
+            }
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => monitor = Some(value.clone()),
+                    None => {
+                        return usage_error("monitors validate-value: --monitor requires an identifier")
+                    }
+                }
+            }
+            other if parameter.is_none() => match control_from_name(other) {
+                Some(name) => parameter = Some(name),
+                None => {
+                    return usage_error(&format!(
+                        "monitors validate-value: `{other}` has no supervised validation path in this build; brightness and contrast exist"
+                    ))
+                }
+            },
+            other if value.is_none() => match parse_number(other) {
+                Some(parsed) => value = Some(parsed),
+                None => return usage_error(&format!("monitors validate-value: `{other}` is not a number")),
+            },
+            other => {
+                return usage_error(&format!(
+                    "monitors validate-value: unexpected argument: {other}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(parameter) = parameter else {
+        return usage_error("monitors validate-value: a control name is required");
+    };
+    let Some(value) = value else {
+        return usage_error("monitors validate-value: a native value is required");
+    };
+    let Some(monitor) = monitor else {
+        return usage_error("monitors validate-value: --monitor <id> is required");
+    };
+    if !confirm_write {
+        return usage_error(
+            "monitors validate-value: this performs one real write and requires --confirm-write",
+        );
+    }
+
+    // The code must be the one this control actually uses; no arbitrary VCP access exists.
+    let expected = match parameter {
+        "brightness" => 0x10u64,
+        "contrast" => 0x12u64,
+        _ => 0,
+    };
+    if let Some(code) = vcp {
+        if code != expected {
+            output::error_line(&format!(
+                "{}: {} is carried by 0x{expected:02X}, not 0x{code:02X}; no write was made",
+                PRODUCT_NAME, parameter
+            ));
+            return EXIT_UNSUPPORTED;
+        }
+    }
+
+    match crate::runtime::request(
+        "monitors.validate_value",
+        json!({
+            "monitor": monitor,
+            "control": parameter,
+            "value": value,
+            "confirm_write": true,
+        }),
+    ) {
+        Ok(result) => {
+            emit_json(&result);
+            if result.get("verified").and_then(serde_json::Value::as_bool) == Some(true) {
+                EXIT_OK
+            } else {
+                EXIT_TRANSPORT
+            }
+        }
+        Err(error) => report_client_error(&error),
+    }
+}
+
 fn handle_monitors(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("list") => monitors_list(&args[1..]),
         Some("capabilities") => monitors_capabilities(&args[1..]),
+        Some("select") => monitors_select(&args[1..]),
+        Some("validate-value") => monitors_validate_value(&args[1..]),
         Some(other) => usage_error(&format!("monitors: unknown subcommand: {other}")),
-        None => usage_error("monitors: expected 'list' or 'capabilities'"),
+        None => usage_error(
+            "monitors: expected 'list', 'capabilities', 'select' or 'validate-value'",
+        ),
     }
 }
 
@@ -1148,11 +1490,21 @@ mod tests {
 
     #[test]
     fn planned_commands_report_not_implemented_rather_than_success() {
-        // These stay unimplemented, so the test never touches hardware.
-        assert_eq!(dispatch_console(&argv(&["reload"])), EXIT_USAGE);
+        // The flyout is the only contract command with no implementation in this build.
+        assert_eq!(dispatch_console(&argv(&["flyout"])), EXIT_USAGE);
+    }
+
+    #[test]
+    fn daemon_only_commands_report_the_unavailable_exit_code_without_a_coordinator() {
+        // No coordinator runs in the test process, so these must be exit 3 and never touch hardware.
+        assert_eq!(dispatch_console(&argv(&["reload"])), EXIT_DAEMON_UNAVAILABLE);
         assert_eq!(
-            dispatch_console(&argv(&["set", "brightness", "42"])),
-            EXIT_USAGE
+            dispatch_console(&argv(&["profile", "apply", "day", "--monitor", "mon-a"])),
+            EXIT_DAEMON_UNAVAILABLE
+        );
+        assert_eq!(
+            dispatch_console(&argv(&["startup", "status"])),
+            EXIT_DAEMON_UNAVAILABLE
         );
     }
 

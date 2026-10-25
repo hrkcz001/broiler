@@ -7,7 +7,7 @@ Status: proposed design, not an implementation. No Rust source, Cargo project, r
 - Target Windows 10 22H2 and Windows 11 desktop sessions, initially x86-64 MSVC. ARM64 is a later verified target, not an implied supported build.
 - Use TOML for both user settings and one-file-per-profile storage.
 - Ship `broiler.exe`, a console CLI, and `broiler-tray.exe`, a GUI-subsystem user-session daemon. The daemon includes the native tray, settings, selection dialog, and profile flyout. It is not a Windows service.
-- Use direct Win32 bindings through `windows-sys`, with narrow safe wrappers and RAII for handles. Use Dxva2 monitor configuration APIs, not a custom I2C driver or GPU-vendor API.
+- Use direct Win32 bindings through `windows-sys`, with narrow safe wrappers and RAII for handles. Use Dxva2 monitor configuration APIs, preferring high-level controls where available and limiting low-level VCP operations to explicit needs, not a custom I2C driver or GPU-vendor API.
 - Keep a single command coordinator and a single active DDC executor. Isolate potentially blocking DDC calls in an on-demand child process using the tray executable's internal worker mode.
 - Use local named pipes for CLI-to-daemon IPC, with explicit logon-SID ACLs and remote clients rejected. Do not use TCP or HTTP.
 - Support brightness and contrast as the baseline control set. Expose RGB gains, color presets, volume, and audio-only mute conditionally. Never equate a standardized VCP code with a universally reliable implementation.
@@ -17,7 +17,9 @@ Status: proposed design, not an implementation. No Rust source, Cargo project, r
 
 Microsoft explicitly warns that many monitors do not fully implement MCCS and that these APIs can cause undefined monitor behavior. It recommends physical validation before using them on arbitrary monitors.[3] Therefore no responsible implementation can promise that a list of VCP codes will never lock up any monitor. The product promise is conservative commands, bounded application-side waits, truthful status, and a published tested-device matrix, not universal firmware safety.
 
-Windows provides monitor enumeration, physical-monitor handles, capabilities reads, VCP reads, and VCP writes. Continuous controls have vendor-dependent maxima; noncontinuous controls have vendor-dependent allowed values.[2] A successful `GetVCPFeatureAndVCPFeatureReply` is evidence of readability, not proof that writing is implemented safely. Its `MC_VCP_CODE_TYPE` describes set-parameter versus momentary behavior, not the continuous/noncontinuous classification; maintain the latter in the version-aware control registry. The returned maximum is undefined for noncontinuous features.[14]
+Microsoft recommends high-level monitor configuration functions unless a needed feature is available only at the low level.[21] Accordingly, prefer Get/SetMonitorBrightness, Get/SetMonitorContrast, and Get/SetMonitorRedGreenOrBlueGain when the device supports them. Normalize high-level controls using their reported minimum and maximum, not an assumed zero minimum. Low-level VCP is an explicit allowlisted fallback with separately validated metadata, not an automatic second write attempt after an uncertain high-level failure. High-level settings still use arbitrary manufacturer-dependent units, and their ranges may change with monitor state.[22]
+
+Windows provides monitor enumeration, physical-monitor handles, capabilities reads, VCP reads, and VCP writes. Continuous controls have vendor-dependent maxima; noncontinuous controls have vendor-dependent allowed values.[2] A successful `GetVCPFeatureAndVCPFeatureReply` is evidence of readability, not proof that writing is implemented safely. Matching readback verifies a reported value, not necessarily visible brightness, calibrated luminance, or audible output; physical validation must check the actual effect. Its `MC_VCP_CODE_TYPE` describes set-parameter versus momentary behavior, not the continuous/noncontinuous classification; maintain the latter in the version-aware control registry. The returned maximum is undefined for noncontinuous features.[14]
 
 The capabilities string is advisory. ddcutil documents omitted supported codes, inaccurate replies, and slow/error-prone multi-exchange capabilities requests.[18] Discovery should not reject an otherwise readable brightness control merely because the capabilities string omits it. Conversely, advertised presence must not authorize a write automatically.
 
@@ -183,7 +185,7 @@ Conditional features are part of the common config schema but not automatically 
 - Cache capability evidence by stable identity and connection/mode context. Revalidate after wake, HDR/picture mode changes when detectable, reconnection, or a contradictory reply. Cache is a hint, not authorization.
 - Build an apply plan first. For `unsupported = fail`, preflight every requested control on every explicit target before the first write. This catches missing support but cannot make a multi-monitor hardware operation atomic.
 - For `skip`, skip only positively unsupported controls and return their names. Unknown transport failures stop that monitor's operation. If nothing can be applied, report `not_applied`, not success.
-- Serialize DDC globally at first; no overlapping monitor transactions and no concurrent CLI writer. Start with 100 ms minimum between completed transactions, one bounded retry for transient errors, and an initial 2 s worker-operation watchdog. These are proposed conservative defaults to tune against real measurements, not protocol guarantees.
+- Serialize DDC globally at first; no overlapping monitor transactions and no concurrent CLI writer. Start with 100 ms minimum between completed transactions, one bounded retry for transient reads; no automatic replay of a timed-out or outcome-unknown write, and an initial 2 s worker-operation watchdog. These are proposed conservative defaults to tune against real measurements, not protocol guarantees.
 - Order: explicitly requested user preset, settle/re-read relevant ranges, gains, contrast, brightness, volume, mute. Re-read after a preset because it may reset dependent values. Stop on a dependency failure; never write gains assuming a failed user-mode change succeeded.
 - Coalesce queued writes for the same monitor/field and rapid cycle requests to their latest intended target; do not enqueue an unbounded number of profile applications. Retain one in-flight transaction plus bounded pending intent.
 - Read back after settling. Keep commanded percentage, native target, observed native value, timestamp, and verification status separate. Match rounded native values, not an unrepresentable requested percentage. Any further tolerance must be backed by observed model behavior, never silently widened.
@@ -197,7 +199,7 @@ Run all Dxva2 calls, including slow enumeration/capabilities operations, inside 
 
 Create the worker on demand and retire it after approximately 30 seconds idle. It holds no tray/UI ownership. This keeps ordinary steady-state residency to one GUI process, with temporary isolation when hardware is touched. The exact idle policy is tunable after memory and launch-latency measurement.
 
-A parent-side timeout stops waiting and can terminate the worker process; it does not cancel a command already sent to monitor firmware, fix a wedged GPU driver, or prove the hardware state unchanged. Do not start another writer until the old worker is confirmed dead; if termination/reaping cannot complete, quarantine that connection and report a degraded backend. Use bounded circuit breaking after repeated failures, with explicit refresh/wake/reconnect recovery rather than tight automatic restarts. Bound discovery as a whole as well as individual operations. A proposed 8 s discovery budget must be tested; silent startup does not mean mathematically instantaneous detection.
+TerminateProcess is asynchronous and a worker cannot exit until pending I/O completes or cancels; always confirm termination before replacement.[23] A parent-side timeout stops waiting and can request termination of the worker process; it does not cancel a command already sent to monitor firmware, fix a wedged GPU driver, or prove the hardware state unchanged. Record a timed-out write as outcome unknown, and reconcile with a read after recovery rather than blindly replaying it. Do not start another writer until the old worker is confirmed dead; if termination/reaping cannot complete, quarantine that connection and report a degraded backend. Use bounded circuit breaking after repeated failures, with explicit refresh/wake/reconnect recovery rather than tight automatic restarts. Bound discovery as a whole as well as individual operations. A proposed 8 s discovery budget must be tested; silent startup does not mean mathematically instantaneous detection.
 
 ## 5. Monitor identity and selection
 
@@ -216,7 +218,7 @@ Maintain an application-assigned positive `display_index`, shown consistently in
 Remembered selection behavior:
 
 - No remembered choice and exactly one controllable external monitor: select it automatically.
-- No remembered choice and more than one: show selection dialog with checkboxes and `Remember choice`.
+- No remembered choice and more than one: show selection dialog with checkboxes and `Remember choice`, including at logon/autostart. Do not silently select all monitors in an autostart-only exception.
 - A valid saved selection: control only those IDs currently present; new displays are never silently enrolled.
 - Some selected devices missing: continue with remaining selected devices; retain missing IDs for reconnection.
 - All selected devices missing but other controllable displays present: show selection again, with an explicit explanation; do not retarget automatically.
@@ -485,9 +487,13 @@ Sources:
 [9] https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfiggetdeviceinfo
 [10] https://github.com/hrkcz001/scoop_bucket/blob/master/bucket/paveconel.json
 [11] https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys
+[13] https://www.ddcutil.com/faq
 [14] https://learn.microsoft.com/en-us/windows/win32/api/lowlevelmonitorconfigurationapi/nf-lowlevelmonitorconfigurationapi-getvcpfeatureandvcpfeaturereply
 [16] https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipea
 [17] https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-notifyicondataw
 [18] https://www.ddcutil.com/command_capabilities
 [19] https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_target_device_name
 [20] https://docs.rs/windows-sys/0.61.2/windows_sys/Win32/Devices/Display/index.html
+[21] https://learn.microsoft.com/en-us/windows/win32/monitor/about-monitor-configuration
+[22] https://learn.microsoft.com/en-us/windows/win32/monitor/using-the-high-level-monitor-configuration-functions
+[23] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess

@@ -924,15 +924,11 @@ impl Tray {
             return;
         };
         let monitor = slot.monitor;
-        match event {
-            WM_CONTEXTMENU | WM_RBUTTONUP => unsafe { self.show_menu() },
-            NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP => {
-                (self.callbacks.activate)(self.callbacks.user, monitor, Activation::Primary)
-            }
-            WM_LBUTTONDBLCLK => {
-                (self.callbacks.activate)(self.callbacks.user, monitor, Activation::Secondary)
-            }
-            _ => {}
+        let negotiated = slot.version_four;
+        if let Some(activation) = activation_for(event, negotiated) {
+            (self.callbacks.activate)(self.callbacks.user, monitor, activation);
+        } else if opens_menu(event, negotiated) {
+            unsafe { self.show_menu() };
         }
     }
 
@@ -996,6 +992,18 @@ impl Tray {
                 && unsafe { IsDialogMessageW(settings_window, &message) } != 0
             {
                 continue;
+            }
+            // Escape belongs to the flyout, but the list view holds the keyboard focus, so the key
+            // arrives addressed to the control rather than to the popup. The window procedure would
+            // never see it; the loop has to close the popup here.
+            if message.message == 0x0100 && message.wParam == 0x1B {
+                let dismissed = match self.flyout.as_ref() {
+                    Some(flyout) => flyout.dismiss_from(message.hwnd),
+                    None => false,
+                };
+                if dismissed {
+                    continue;
+                }
             }
             unsafe {
                 TranslateMessage(&message);
@@ -1342,6 +1350,37 @@ fn decode_callback(slots: &[(u32, bool)], wparam: usize, lparam: isize) -> Optio
     None
 }
 
+/// Which activation one callback event means, given what this icon's own version negotiation achieved.
+///
+/// One physical click delivers several events: with version 4 the shell sends `WM_LBUTTONDOWN`,
+/// `WM_LBUTTONUP` and `NIN_SELECT` for the same press, which is an observed fact on this machine, not
+/// an inference. Reacting to each of them opened the flyout three times and would have applied a
+/// profile three times, so exactly one event per encoding counts as the primary activation and the
+/// rest are ignored.
+pub fn activation_for(event: u32, version_four: bool) -> Option<Activation> {
+    let primary = if version_four {
+        matches!(event, NIN_SELECT | NIN_KEYSELECT)
+    } else {
+        matches!(event, WM_LBUTTONUP | NIN_KEYSELECT)
+    };
+    if primary {
+        return Some(Activation::Primary);
+    }
+    if event == WM_LBUTTONDBLCLK {
+        return Some(Activation::Secondary);
+    }
+    None
+}
+
+/// Whether one callback event is the request for the context menu, by the same rule.
+pub fn opens_menu(event: u32, version_four: bool) -> bool {
+    if version_four {
+        event == WM_CONTEXTMENU
+    } else {
+        matches!(event, WM_RBUTTONUP | WM_CONTEXTMENU)
+    }
+}
+
 fn guid(bytes: [u8; 16]) -> windows_sys::core::GUID {
     windows_sys::core::GUID {
         data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -1603,6 +1642,39 @@ mod tests {
         );
         // No icon owns this message, so nothing is activated.
         assert_eq!(decode_callback(&slots, 7, WM_LBUTTONUP as isize), None);
+    }
+
+    #[test]
+    fn one_physical_click_starts_exactly_one_activation() {
+        // Observed on this machine with a version-4 icon: one left click delivers all three of these.
+        // Reacting to each one opened the flyout three times and would have applied a profile three
+        // times, which is a hardware write nobody asked for.
+        let events = [0x0201, WM_LBUTTONUP, NIN_SELECT];
+        let activations: Vec<Activation> = events
+            .iter()
+            .filter_map(|event| activation_for(*event, true))
+            .collect();
+        assert_eq!(activations, vec![Activation::Primary]);
+        // A legacy icon never receives NIN_SELECT, so its button-up is the activation.
+        let legacy: Vec<Activation> = events
+            .iter()
+            .filter_map(|event| activation_for(*event, false))
+            .collect();
+        assert_eq!(legacy, vec![Activation::Primary]);
+        assert_eq!(
+            activation_for(WM_LBUTTONDBLCLK, true),
+            Some(Activation::Secondary)
+        );
+    }
+
+    #[test]
+    fn the_context_menu_opens_once_per_click() {
+        // Version 4 reports a right click as WM_CONTEXTMENU; the legacy pair also arrives with it.
+        assert!(opens_menu(WM_CONTEXTMENU, true));
+        assert!(!opens_menu(WM_RBUTTONUP, true));
+        assert!(opens_menu(WM_RBUTTONUP, false));
+        assert!(opens_menu(WM_CONTEXTMENU, false));
+        assert!(!opens_menu(NIN_SELECT, true));
     }
 
     #[test]

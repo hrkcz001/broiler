@@ -27,7 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DestroyWindow, GetDlgItem, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, IsWindow, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, DLGTEMPLATE, GWLP_USERDATA, SM_CXSCREEN, SM_CYSCREEN,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WS_CHILD, WS_VISIBLE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
@@ -303,16 +303,25 @@ fn items(snapshot: &Snapshot) -> Vec<Item> {
     ]
 }
 
-/// Serialise a `DLGTEMPLATE` and its items exactly as `CreateDialogIndirectParamW` expects.
+/// Serialise a `DLGTEMPLATEEX` and its items exactly as `CreateDialogIndirectParamW` expects.
 ///
-/// The structure is a sequence of 16-bit words: header, menu, class, title, font, then per item the
-/// `DLGITEMTEMPLATE` followed by its class, title and creation-data length. Item records must start on
-/// a `DWORD` boundary, which is why every item is preceded by an alignment step.
+/// The extended form is used because its fields are unambiguous: a `WORD` dialog id would have been a
+/// plausible reading of the plain `DLGTEMPLATE`, and a wrong width there silently invalidates the rest
+/// of the record, so the dialog is created as nothing at all. That is exactly how this window failed
+/// the first time, with `CreateDialogIndirectParamW` returning null and no reason.
+///
+/// Every item record must start on a `DWORD` boundary; `align_dword` runs before each one.
 fn build_template(snapshot: &Snapshot) -> Vec<u16> {
     let rows = items(snapshot);
     let mut out: Vec<u16> = Vec::new();
-    push_u32(&mut out, dialog_style());
+    // The extended form opens with its version and then its signature: `dlgVer` first, `signature`
+    // second. Writing the signature first makes the loader read the words as a standard template,
+    // whose first field would then be a 0xFFFF style, and it creates nothing at all.
+    push_u16(&mut out, 0x0001); // dlgVer
+    push_u16(&mut out, 0xFFFF); // signature
+    push_u32(&mut out, 0); // no help id
     push_u32(&mut out, 0); // no extended style
+    push_u32(&mut out, dialog_style());
     push_u16(&mut out, rows.len() as u16);
     push_i16(&mut out, 0); // x
     push_i16(&mut out, 0); // y
@@ -321,15 +330,22 @@ fn build_template(snapshot: &Snapshot) -> Vec<u16> {
     push_u16(&mut out, 0); // no menu
     push_u16(&mut out, 0); // default window class
     push_text(&mut out, "broiler settings");
-    // DS_SETFONT: point size and typeface. `MS Shell Dlg` is the shell's UI font alias, so the dialog
-    // follows the user's font and DPI instead of pinning a bitmap font.
+    // DS_SETFONT: point size, weight, italic, character set, then the typeface. `MS Shell Dlg` is the
+    // shell's UI font alias, so the window follows the user's font and DPI.
     push_u16(&mut out, 9);
+    push_u16(&mut out, 400); // FW_NORMAL
+    // One word holds the two byte fields: italic 0, ANSI character set 0.
+    push_u16(&mut out, 0);
     push_text(&mut out, "MS Shell Dlg");
 
     for row in rows {
         align_dword(&mut out);
-        push_u32(&mut out, row.style);
-        push_u32(&mut out, 0);
+        push_u32(&mut out, 0); // no help id
+        push_u32(&mut out, 0); // no extended style
+        // Every control in a dialog template carries WS_CHILD and WS_VISIBLE. A resource compiler adds
+        // them; a hand-built template has to add them too, and without WS_CHILD the loader creates the
+        // control as a top-level window, which leaves a dialog with an empty body.
+        push_u32(&mut out, row.style | WS_CHILD | WS_VISIBLE);
         push_i16(&mut out, row.rect.0);
         push_i16(&mut out, row.rect.1);
         push_i16(&mut out, row.rect.2);
@@ -518,6 +534,10 @@ impl Settings {
                 &mut *state as *mut Settings as isize,
             );
             if window.is_null() {
+                // The loader reports a rejected template only through a null handle, so the error code
+                // is the one thing worth keeping.
+                let error = windows_sys::Win32::Foundation::GetLastError();
+                crate::log_error!("the dialog template was rejected, error {error}");
                 return None;
             }
             state.window = window;
@@ -680,27 +700,74 @@ mod tests {
         assert_ne!(style & WS_TABSTOP, 0);
     }
 
+    fn word32(words: &[u16], offset: usize) -> u32 {
+        words[offset] as u32 | ((words[offset + 1] as u32) << 16)
+    }
+
+    /// Index of the word after the NUL that ends the string starting at `offset`.
+    fn skip_string(words: &[u16], offset: usize) -> usize {
+        let mut index = offset;
+        while index < words.len() && words[index] != 0 {
+            index += 1;
+        }
+        index + 1
+    }
+
     #[test]
     fn the_template_is_the_shape_the_loader_expects() {
         let rows = items(&snapshot());
         let words = build_template(&snapshot());
-        // Header: style, exStyle, item count, rectangle, menu, class, title, font.
-        // The header is style (two words), extended style (two words), then the item count.
-        assert_eq!(words[0] as u32 | ((words[1] as u32) << 16), dialog_style());
-        assert_eq!(words[2] as u32 | ((words[3] as u32) << 16), 0);
-        assert_eq!(words[4], rows.len() as u16);
-        let mut expected: Vec<u16> = Vec::new();
-        push_text(&mut expected, "broiler settings");
-        assert!(words
-            .windows(expected.len())
-            .any(|window| window == expected.as_slice()));
+        // Version, then signature, then help id, extended style and style, then the item count: a
+        // loader that reads the header at the wrong offsets rejects the template and creates nothing.
+        assert_eq!(&words[0..2], &[0x0001, 0xFFFF]);
+        assert_eq!(word32(&words, 2), 0);
+        assert_eq!(word32(&words, 4), 0);
+        assert_eq!(word32(&words, 6), dialog_style());
+        assert_eq!(words[8], rows.len() as u16);
+        // The title and the font are present as NUL-terminated strings.
+        let mut title: Vec<u16> = Vec::new();
+        push_text(&mut title, "broiler settings");
+        assert!(words.windows(title.len()).any(|window| window == title));
         let mut font: Vec<u16> = Vec::new();
         push_text(&mut font, "MS Shell Dlg");
-        assert!(words
-            .windows(font.len())
-            .any(|window| window == font.as_slice()));
-        // Every item record starts on a DWORD boundary, which the dialog manager requires.
+        assert!(words.windows(font.len()).any(|window| window == font));
+        // The whole template stays DWORD aligned, which the dialog manager requires of every record.
         assert_eq!(words.len() % 2, 0);
+    }
+
+    #[test]
+    fn every_item_record_starts_on_a_dword_boundary() {
+        // A misaligned record does not fail loudly: the loader reads a shifted class or id and creates
+        // no dialog at all. Walking the items the way the loader does is the only way to see it.
+        let words = build_template(&snapshot());
+        let rows = items(&snapshot());
+        // Header words: signature 2, help id 2, extended style 2, style 2, item count 1, rectangle 4,
+        // menu 1, class 1, and then the title.
+        let mut offset = skip_string(&words, 15);
+        offset += 3; // point size, weight, and the italic/character-set word
+        offset = skip_string(&words, offset); // typeface
+        for (index, row) in rows.iter().enumerate() {
+            // The loader aligns each record; a pad word appears exactly when the previous one ended odd.
+            offset += offset % 2;
+            assert_eq!(offset % 2, 0, "item {index} starts at word {offset}");
+            assert_eq!(word32(&words, offset), 0, "item {index} help id");
+            assert_eq!(word32(&words, offset + 2), 0, "item {index} extended style");
+            assert_eq!(
+                word32(&words, offset + 4),
+                row.style | WS_CHILD | WS_VISIBLE,
+                "item {index} style"
+            );
+            assert_eq!(
+                word32(&words, offset + 10),
+                row.id as u32,
+                "item {index} id"
+            );
+            assert_eq!(words[offset + 12], 0xFFFF, "item {index} class atom");
+            assert_eq!(words[offset + 13], row.class.ordinal(), "item {index} ordinal");
+            offset = skip_string(&words, offset + 14) + 1; // text, then the creation-data word
+        }
+        // Nothing but the trailing alignment pad may follow the last record.
+        assert!(words.len() - offset <= 1, "{offset} of {}", words.len());
     }
 
     #[test]

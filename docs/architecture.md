@@ -97,6 +97,11 @@ Semantics:
 
 - `left_click`: `cycle` or `flyout`, live-changeable.
 - `badges`: `when_multiple` in v1; required multi-monitor identification is not a freely disableable option.
+- `always_show_monitor_name`: default `false`, live-changeable through `broiler settings set
+  tray.always_show_monitor_name` and the settings window. With exactly one controlled monitor and the
+  preference off, the monitor name is omitted from the tooltip and the flyout heading. With several
+  controlled monitors the name and index are always shown, whatever the preference says: the popup
+  belongs to one icon and the user has to be able to tell which monitor it controls.
 - `remember`: whether the selection persists across application launches. With false, `monitor_ids` must be empty and the current choice exists only in memory. Turning it off clears the persisted IDs.
 - `monitor_ids`: opaque application IDs returned by `broiler monitors list --json`, never user-authored `DISPLAY1` guesses. Display examples do not invent real IDs.
 - `profiles.startup`: `preserve` in v1. Multiple profiles do not imply permission to change the monitor at every logon. Single-profile startup is a separate mandatory one-shot rule.
@@ -304,7 +309,10 @@ Use `Shell_NotifyIconW` with one stable GUID per monitor identity and `NOTIFYICO
 > icon, and both documented callback encodings are routed by each icon's own result. See
 > `docs/status-2026-10-25-r1.md`.
 
-- Left activation: cycle this monitor only, or show its flyout according to settings.
+- Left activation: cycle this monitor only, or show its flyout according to settings. Exactly one
+  callback event per click starts an activation: the shell was observed delivering `WM_LBUTTONDOWN`,
+  `WM_LBUTTONUP` and `NIN_SELECT` for one physical press of a version-4 icon, so the decoder accepts
+  one event per negotiated encoding and ignores the rest.
 - Right activation: native `HMENU` with exactly `Settings` and `Exit`. Exit stops the whole broiler instance, not merely one icon.
 - Tooltip: monitor index/name, verified profile or Custom, observed brightness when known, and short operation/error state.
 - Windows may initially place icons in notification overflow; do not hack shell preferences or promise forced pinning.
@@ -313,11 +321,11 @@ Use `Shell_NotifyIconW` with one stable GUID per monitor identity and `NOTIFYICO
 
 Initial named set: `day`, `night`, `dawn`, `dusk`, `coding`, `reading`, `movie`, `gaming`, `work`, `presentation`, `photo`, `eco`, `focus`, `monitor`, `custom`.
 
-Use original monochrome artwork: sun, crescent, sunrise, sunset, code brackets, open book, film frame, controller, briefcase, screen/lectern, camera, leaf, target, monitor, and sliders. These are semantic names, not emoji, vendor logos, or external font glyph dependencies. UI icons carry no hidden settings behavior.
+Use original coloured artwork: sun, crescent, sunrise, sunset, code brackets, open book, film frame, controller, briefcase, screen/lectern, camera, leaf, target, monitor, and sliders. These are semantic names, not emoji, vendor logos, or external font glyph dependencies. UI icons carry no hidden settings behavior.
 
 Embed pre-rasterized RGBA assets at 16/20/24/32/40/48 px. Compose a bottom-right opaque high-contrast badge into the icon bitmap because the tray API takes a whole HICON, not a separately managed numeric overlay. Use hand-tuned bitmap digits and reserved icon/badge geometry so the badge does not erase the entire symbol. Single controlled monitor: no badge. Multiple controlled monitors: stable indices on every icon. Two-digit indices require an expanded badge and dedicated 16 px visual tests; do not cap supported monitors at nine or silently replace 10 with 0. Badge layout and tooltip are both required for accessibility.
 
-Cache HICON objects by `(icon_name, display_index, DPI, theme, status)`. Recompose only when one of those changes. Update colors for taskbar/light/dark and high-contrast settings; verify actual appearance on supported Windows builds rather than assuming app theme equals taskbar theme. Profile icons remain recognizable by shape, not color.
+Cache HICON objects by `(icon_name, display_index, DPI, theme, status)`. Recompose only when one of those changes. Update colors for taskbar/light/dark and high-contrast settings; verify actual appearance on supported Windows builds rather than assuming app theme equals taskbar theme. Profile icons remain recognizable by shape, not color: colour is a second cue, never the only one, because a colour-blind user and a High Contrast theme both remove it.
 
 ### Profile flyout
 
@@ -326,6 +334,21 @@ A modeless owned top-level `WS_POPUP`/tool window, not a dialog box and not a co
 Anchor with `Shell_NotifyIconGetRect`, which returns the icon's screen rectangle.[7] Clamp to the nearest monitor work area; fall back to the activation point if the rectangle is unavailable. Respect negative desktop coordinates, overflow tray placement, taskbar edge, and per-monitor DPI. Enable Per-Monitor V2 DPI awareness and handle DPI changes without stretching a 16 px bitmap.
 
 Allow arrow keys, Enter, Space, Tab, and Escape; restore focus on dismissal. Close on outside activation/focus loss without fighting focus acquisition. Clicking another monitor's icon retargets the single reusable flyout. A click starts an asynchronous apply; mark pending and only commit the tray's profile icon after successful verification. Surface partial/failure state without pretending it applied. Use native controls for baseline keyboard/screen-reader accessibility; any owner drawing must preserve accessible names, selection, and focus states and be checked with Narrator.
+
+### Implemented 2026-10-25 (appearance gate R3)
+
+- The settings window is a native dialog created from an in-memory `DLGTEMPLATEEX`
+  (`CreateDialogIndirectParamW`) with `DS_SETFONT` and `MS Shell Dlg`, so it follows the user's font
+  and DPI. Tab, `Escape` and the default button come from `IsDialogMessageW` in the message loop.
+  The template opens with `dlgVer` and then `signature`, and every control carries `WS_CHILD`; both
+  details are silent when wrong — the loader returns null with no error, or creates an empty body.
+- The flyout is a modeless `WS_POPUP` tool window holding a standard `SysListView32` with an image
+  list. The current profile is a leading column with the text `Current` and a marker dot; focus and
+  selection remain the control's own, so "what is true" and "what is focused" are never the same
+  signal. Pending and failed operations appear in a short status line, never in a profile name.
+- Profile names in the popup are the profiles' own names; nothing appends operation state to them.
+- Artwork is original coloured RGBA with antialiased edges and an opaque badge plate, replacing the
+  monochrome symbols. See `docs/status-2026-10-25-r3.md` for what was observed and what was not.
 
 ### Settings and monitor selection
 

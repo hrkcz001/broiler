@@ -262,10 +262,14 @@ impl Drop for Flyout {
     }
 }
 
-/// Index 0 of the image list: nothing to show. Index 1: the current-profile marker.
-const IMAGE_BLANK: i32 = 0;
-const IMAGE_CURRENT: i32 = 1;
-const IMAGES_FIXED: usize = 2;
+/// The current-profile marker is image 0 of the image list; profile icons follow it.
+///
+/// A row without the marker asks for `I_IMAGENONE` rather than for a blank image: an all-transparent
+/// bitmap loses its alpha channel on the way into an image list and arrives as an opaque black square,
+/// which is a defect the shell will happily draw.
+const IMAGE_CURRENT: i32 = 0;
+const IMAGE_NONE: i32 = -2;
+const IMAGES_FIXED: usize = 1;
 
 unsafe extern "system" fn flyout_proc(
     window: HWND,
@@ -453,18 +457,32 @@ fn marker_bitmap(size: u32) -> crate::tray::Bitmap {
     };
     let centre = size as f32 / 2.0;
     let radius = size as f32 * 0.28;
+    // Four by four samples per pixel: a dot this small is all edge, and a hard edge at 16 pixels reads
+    // as a square rather than a dot.
+    const SAMPLES: i32 = 4;
     for y in 0..size as i32 {
         for x in 0..size as i32 {
-            let dx = x as f32 + 0.5 - centre;
-            let dy = y as f32 + 0.5 - centre;
-            if dx * dx + dy * dy <= radius * radius {
-                let offset = ((y as u32 * size + x as u32) * 4) as usize;
-                // BGRA: the accent blue #2F6FEB, fully opaque.
-                bitmap.pixels[offset] = 0xEB;
-                bitmap.pixels[offset + 1] = 0x6F;
-                bitmap.pixels[offset + 2] = 0x2F;
-                bitmap.pixels[offset + 3] = 255;
+            let mut covered = 0;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let dx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - centre;
+                    let dy = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - centre;
+                    if dx * dx + dy * dy <= radius * radius {
+                        covered += 1;
+                    }
+                }
             }
+            if covered == 0 {
+                continue;
+            }
+            let alpha = (covered * 255 / (SAMPLES * SAMPLES)) as u8;
+            let offset = ((y as u32 * size + x as u32) * 4) as usize;
+            // BGRA, premultiplied by the coverage so the edge fades into whatever is behind it.
+            let mix = |channel: u8| (channel as u32 * alpha as u32 / 255) as u8;
+            bitmap.pixels[offset] = mix(0xEB);
+            bitmap.pixels[offset + 1] = mix(0x6F);
+            bitmap.pixels[offset + 2] = mix(0x2F);
+            bitmap.pixels[offset + 3] = alpha;
         }
     }
     bitmap
@@ -578,11 +596,7 @@ impl Flyout {
                 return None;
             }
             flyout.images = images;
-            for bitmap in [crate::tray::Bitmap {
-                width: size,
-                height: size,
-                pixels: vec![0; (size * size * 4) as usize],
-            }, marker_bitmap(size)] {
+            for bitmap in [marker_bitmap(size)] {
                 if let Some((colour, _)) = dib(&bitmap) {
                     ImageList_Add(images as isize, colour, std::ptr::null_mut());
                     DeleteObject(colour as *mut c_void);
@@ -631,7 +645,7 @@ impl Flyout {
                 row.iImage = if item.state == State::Current {
                     IMAGE_CURRENT
                 } else {
-                    IMAGE_BLANK
+                    IMAGE_NONE
                 };
                 row.lParam = index as isize;
                 SendMessageW(list, LVM_INSERTITEMW, 0, &row as *const LVITEMW as isize);
@@ -734,7 +748,7 @@ impl Flyout {
             row.iImage = if state == State::Current {
                 IMAGE_CURRENT
             } else {
-                IMAGE_BLANK
+                IMAGE_NONE
             };
             SendMessageW(self.list, LVM_SETITEMW, 0, &row as *const LVITEMW as isize);
             std::mem::forget(marker);
@@ -783,6 +797,31 @@ impl Flyout {
 
     pub fn is_open(&self) -> bool {
         !self.window.is_null() && unsafe { IsWindow(self.window) != 0 }
+    }
+
+    /// Close the popup because of a key that reached one of its children.
+    ///
+    /// Returns true when the key was addressed to this popup, so the caller knows the message was
+    /// consumed. The check walks up from the message's window with `GetAncestor`, which is what makes
+    /// the focused list view and the status line both count as part of the popup.
+    pub fn dismiss_from(&self, target: HWND) -> bool {
+        if self.window.is_null() || target.is_null() {
+            return false;
+        }
+        let belongs = unsafe {
+            target == self.window
+                || windows_sys::Win32::UI::WindowsAndMessaging::GetAncestor(
+                    target,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GA_ROOT,
+                ) == self.window
+        };
+        if !belongs {
+            return false;
+        }
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(self.window, 0x0010, 0, 0);
+        }
+        true
     }
 }
 
@@ -956,5 +995,24 @@ mod tests {
         // And it is the accent colour, so it does not depend on a system colour that High Contrast
         // would replace with something invisible.
         assert_eq!(&marker.pixels[centre..centre + 3], &[0xEB, 0x6F, 0x2F]);
+    }
+
+    #[test]
+    fn the_marker_edge_is_antialiased_instead_of_a_hard_square() {
+        // At tray and row sizes a dot is almost entirely edge. Without coverage blending the marker
+        // reads as a solid square rather than a dot, which is a defect a screenshot shows and a
+        // geometry test does not.
+        let marker = marker_bitmap(16);
+        let partial = (0..16 * 16)
+            .map(|index| marker.pixels[index * 4 + 3])
+            .filter(|alpha| *alpha > 0 && *alpha < 255)
+            .count();
+        assert!(partial >= 8, "only {partial} antialiased pixels");
+        // The dot stays centred and does not grow to fill the cell it is drawn in.
+        let opaque = (0..16 * 16)
+            .map(|index| marker.pixels[index * 4 + 3])
+            .filter(|alpha| *alpha == 255)
+            .count();
+        assert!(opaque < 16 * 16 / 2, "{opaque} opaque pixels is not a dot");
     }
 }

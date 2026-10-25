@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: design stage. No application implementation, downloadable binaries, or installable Scoop package exist yet.** Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
+**Status: early implementation. Both executables build and answer `--version`, and nothing else works yet: no monitor discovery, no configuration, no tray, no hardware access.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
 
 Research and architecture by **Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 
@@ -244,7 +244,16 @@ No broiler hardware-control test has been run yet. The development machine's MSI
 
 ## Build and implementation
 
-No Cargo project exists yet. Implementation follows the ordered gates in [the architecture](docs/architecture.md): read-only topology and DDC discovery, test-driven typed configuration, bounded backend, CLI, native UI, release and Scoop verification. Do not replace these instructions with invented successful test results.
+A Cargo project with two binaries exists. Rust on the development host is installed without rustup, so cargo cannot find the MSVC linker on its own; build through the wrapper that calls `vcvars64.bat` first:
+
+```bat
+build.bat --release
+build.bat test
+```
+
+From an MSYS bash shell, invoke it as `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat --release`. Artifacts are `target\release\broiler.exe` and `target\release\broiler-tray.exe`. The tray executable is a GUI-subsystem binary with a Per-Monitor V2 manifest and an `asInvoker` execution level; the manifest and the version resource are compiled from `res\*.rc` by `rc.exe` during the build.
+
+Implementation follows the ordered gates in [the architecture](docs/architecture.md): read-only topology and DDC discovery, test-driven typed configuration, bounded backend, CLI, native UI, release and Scoop verification. Gate evidence lives in [docs/tested-devices.md](docs/tested-devices.md). Do not replace these instructions with invented successful test results.
 
 ## License
 

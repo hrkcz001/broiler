@@ -1,0 +1,22 @@
+//! broiler: a native Windows DDC/CI monitor controller.
+//!
+//! Two executables share this crate:
+//!
+//! * `broiler.exe` — console CLI.
+//! * `broiler-tray.exe` — GUI-subsystem user-session process that owns the tray,
+//!   the native windows and the coordinator. Its `--internal-ddc-worker` mode is the
+//!   isolated process that performs the blocking Dxva2 calls.
+//!
+//! No async runtime, no service, no elevation, no WebView. Hardware writes exist only
+//! behind the single coordinator and its child worker.
+
+pub mod cli;
+pub mod logging;
+pub mod output;
+pub mod paths;
+
+/// Product name as used in user-visible strings.
+pub const PRODUCT_NAME: &str = "broiler";
+
+/// Version of this build, from `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

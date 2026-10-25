@@ -1,0 +1,35 @@
+[package]
+name = "broiler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Native Windows DDC/CI monitor controller"
+license = "Apache-2.0"
+authors = ["hrkcz001"]
+default-run = "broiler"
+
+[lib]
+name = "broiler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "broiler"
+path = "src/bin/broiler.rs"
+
+[[bin]]
+name = "broiler-tray"
+path = "src/bin/broiler-tray.rs"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

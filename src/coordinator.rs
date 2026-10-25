@@ -320,6 +320,36 @@ impl<T: Transport> Coordinator<T> {
             .map_err(|error| Failure::new("io_error", error.render()))
     }
 
+    /// The transport back, so a test can inspect what the coordinator did to it.
+    #[cfg(test)]
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
+    /// Enumerate the present monitors and apply the documented startup decision.
+    ///
+    /// The resident loop and the CLI both need this answer before anything is written, so it is one
+    /// method over `lifecycle::decide` rather than a reimplementation per entry point. An empty
+    /// recorded selection is not a confirmation: only an explicit `monitors select --none` is, and
+    /// that path clears `settings.monitor_ids` together with storing the remembered choice, so it is
+    /// reported here through the same settings the decision reads.
+    pub fn startup_outcome(&mut self) -> Result<crate::lifecycle::StartupOutcome, Failure> {
+        let monitors: Vec<String> = self
+            .transport
+            .monitors()
+            .map_err(transport_failure)?
+            .into_iter()
+            .map(|monitor| monitor.id)
+            .collect();
+        let state = crate::lifecycle::StartupState {
+            monitors: &monitors,
+            registry: Ok(&self.registry),
+            settings: &self.settings,
+            selection_confirmed_empty: false,
+        };
+        Ok(crate::lifecycle::decide(&state))
+    }
+
     /// Which monitors a profile command targets. Broadcasts are never implicit.
     fn resolve_targets(&mut self, params: &Value) -> Result<Vec<String>, Failure> {
         if params
@@ -805,6 +835,7 @@ impl<T: Transport> Coordinator<T> {
                 self.apply_everywhere(&next, &[monitor])
             }
             "startup.status" => {
+                let outcome = self.startup_outcome()?;
                 let monitors: Vec<String> = self
                     .transport
                     .monitors()
@@ -812,15 +843,9 @@ impl<T: Transport> Coordinator<T> {
                     .into_iter()
                     .map(|monitor| monitor.id)
                     .collect();
-                let state = crate::lifecycle::StartupState {
-                    monitors: &monitors,
-                    registry: Ok(&self.registry),
-                    settings: &self.settings,
-                    selection_confirmed_empty: false,
-                };
-                let outcome = crate::lifecycle::decide(&state);
                 Ok(json!({
                     "outcome": outcome.as_str(),
+                    "targets": outcome.targets(),
                     "monitors": monitors,
                     "profiles": self.registry.profiles().iter().map(|profile| profile.id.clone()).collect::<Vec<String>>(),
                     "selection": self.settings.monitor_ids,

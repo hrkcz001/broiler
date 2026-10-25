@@ -254,6 +254,16 @@ fn handle_start(args: &[String], storage: &StorageContext) -> i32 {
         output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
         return EXIT_USAGE;
     }
+    // `start` is also the logon entry point, so it follows the same lifecycle: nothing to control
+    // exits silently, one profile applies once and exits, and only a multi-profile setup stays
+    // resident. Without this the tray became resident even when it had nothing to apply.
+    match crate::runtime::startup_step_for_storage(storage) {
+        crate::runtime::StartupStep::Serve => {}
+        crate::runtime::StartupStep::ApplyOnce { .. } => {
+            unreachable!("the startup step applies before it returns")
+        }
+        crate::runtime::StartupStep::Exit(code) => return code,
+    }
     match crate::runtime::start_resident(storage) {
         Ok(()) => {
             output::line("coordinator started");
@@ -586,7 +596,7 @@ fn handle_profile(args: &[String], storage: &StorageContext) -> i32 {
 }
 
 /// Print an apply result and map its status to an exit code.
-fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
+pub(crate) fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
     let status = result
         .get("status")
         .and_then(serde_json::Value::as_str)

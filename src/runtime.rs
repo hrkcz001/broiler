@@ -13,6 +13,7 @@ use crate::config::settings::{self, Settings};
 use crate::coordinator::Coordinator;
 use crate::daemon::Daemon;
 use crate::instance::InstanceLock;
+use crate::lifecycle::StartupOutcome;
 use crate::ipc::{Failure, Request, Response, PROTOCOL_VERSION};
 use crate::pipe::{self, Client, Endpoint};
 use crate::transport::Transport;
@@ -143,6 +144,151 @@ pub fn pending_import_message(storage: &StorageContext) -> Option<String> {
     ))
 }
 
+/// What normal launch does after the startup decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupStep {
+    /// Apply the one valid profile to these targets once, then exit; no tray, no residence.
+    ApplyOnce {
+        profile: String,
+        targets: Vec<String>,
+    },
+    /// Report the outcome and exit with this code without touching hardware.
+    Exit(i32),
+    /// Stay resident and serve the pipe.
+    Serve,
+}
+
+/// Map a startup outcome to an action. Pure, so every branch is testable without a monitor.
+pub fn plan_startup(outcome: &StartupOutcome) -> StartupStep {
+    match outcome {
+        // Nothing to control: no dialog, no tray, no error.
+        StartupOutcome::ExitNoMonitors => StartupStep::Exit(0),
+        // A confirmed or cancelled empty selection is a decision, not a failure.
+        StartupOutcome::ExitEmptySelection => StartupStep::Exit(0),
+        StartupOutcome::ExitInvalidProfiles { .. } => StartupStep::Exit(2),
+        // This build has no checkbox dialog. Guessing a target would write to a monitor the user
+        // never chose, so the launch stops and says which command records the choice.
+        StartupOutcome::ShowSelection { .. } => StartupStep::Exit(2),
+        StartupOutcome::SetupWindow => StartupStep::Exit(2),
+        StartupOutcome::OneShot { targets, profile } => StartupStep::ApplyOnce {
+            profile: profile.clone(),
+            targets: targets.clone(),
+        },
+        StartupOutcome::Resident { .. } => StartupStep::Serve,
+    }
+}
+
+/// The message a launch prints for an outcome that stops it. `None` means exit silently.
+pub fn startup_message(
+    outcome: &StartupOutcome,
+    storage: &StorageContext,
+) -> Option<String> {
+    match outcome {
+        StartupOutcome::ExitNoMonitors => None,
+        StartupOutcome::ExitEmptySelection => None,
+        StartupOutcome::ExitInvalidProfiles { diagnostics } => Some(format!(
+            "{diagnostics} profile file(s) failed validation, so nothing was applied; run `{} \
+             profiles validate`",
+            PRODUCT_NAME
+        )),
+        StartupOutcome::ShowSelection { reason, .. } => Some(format!(
+            "a monitor selection is required ({}) and this build has no selection dialog. Record one \
+             with `{} monitors select --monitor <id>` or `{} monitors select --none`; nothing was \
+             changed",
+            reason.as_str(),
+            PRODUCT_NAME,
+            PRODUCT_NAME
+        )),
+        StartupOutcome::SetupWindow => Some(format!(
+            "there is no profile in {}, so there is nothing to apply. Put a profile there or run \
+             `{} profiles open`",
+            storage.profiles_dir().display(),
+            PRODUCT_NAME
+        )),
+        StartupOutcome::OneShot { .. } | StartupOutcome::Resident { .. } => None,
+    }
+}
+
+/// Decide what this launch should do and, for a one-shot outcome, apply it exactly once.
+///
+/// Hardware is only touched by the `ApplyOnce` branch, and that branch writes solely through the
+/// tested planner inside the coordinator.
+pub fn startup_step<C: crate::transport::Transport>(
+    coordinator: &mut Coordinator<C>,
+    storage: &StorageContext,
+) -> StartupStep {
+    let outcome = match coordinator.startup_outcome() {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log_error!("startup decision failed: {}", error.message);
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
+            return StartupStep::Exit(6);
+        }
+    };
+    log_info!("startup outcome: {}", outcome.as_str());
+
+    let step = plan_startup(&outcome);
+    if let Some(message) = startup_message(&outcome, storage) {
+        log_info!("{message}");
+        output::error_line(&format!("{}: {message}", PRODUCT_NAME));
+    }
+    match &step {
+        StartupStep::ApplyOnce { profile, targets } => {
+            log_info!(
+                "applying profile {profile} to {} target(s) and exiting",
+                targets.len()
+            );
+            let result = coordinator.handle(
+                "profile.apply",
+                &serde_json::json!({"id": profile, "monitor_ids": targets}),
+            );
+            match result {
+                Ok(result) => return StartupStep::Exit(crate::cli::report_apply(&result, false)),
+                Err(error) => {
+                    log_error!("profile {} was not applied: {}", profile, error.message);
+                    output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
+                    return StartupStep::Exit(6);
+                }
+            }
+        }
+        StartupStep::Exit(_) | StartupStep::Serve => {}
+    }
+    step
+}
+
+/// A coordinator over a transient worker, for the decision paths that must work without a resident
+/// process. The error carries the exit code the caller should use.
+fn transient_coordinator(
+    storage: &StorageContext,
+) -> Result<Coordinator<TransientTransport>, (i32, String)> {
+    let settings = settings::load(&storage.settings_file())
+        .map_err(|error| (2, error.render()))?;
+    let registry = ProfileRegistry::load_dir(&storage.profiles_dir())
+        .map_err(|error| (2, error.render()))?;
+    let transport = TransientTransport::new().map_err(|reason| (6, reason))?;
+    Ok(
+        Coordinator::new(transport, settings, registry, storage.settings_file())
+            .with_profiles_dir(storage.profiles_dir())
+            .with_storage(storage.clone()),
+    )
+}
+
+/// Run the startup decision for the CLI `start` command, which is also the logon entry point.
+///
+/// It builds a coordinator over a transient worker so the decision, and a one-shot application, do
+/// not require a resident process. Nothing is spawned here.
+pub fn startup_step_for_storage(storage: &StorageContext) -> StartupStep {
+    let mut coordinator = match transient_coordinator(storage) {
+        Ok(coordinator) => coordinator,
+        Err((code, message)) => {
+            log_error!("{message}");
+            output::error_line(&format!("{}: {message}", PRODUCT_NAME));
+            return StartupStep::Exit(code);
+        }
+    };
+    startup_step(&mut coordinator, storage)
+}
+
 /// Run the resident coordinator until it is asked to stop. Returns the process exit code.
 pub fn run_resident(storage: StorageContext) -> i32 {
     let endpoint: Endpoint = match pipe::local_endpoint() {
@@ -216,6 +362,15 @@ pub fn run_resident(storage: StorageContext) -> i32 {
     )
     .with_profiles_dir(storage.profiles_dir())
     .with_storage(storage.clone());
+    // Normal launch follows the documented lifecycle: no monitor means exit silently, one profile
+    // means apply once and exit, and only a real multi-profile setup stays resident. Without this
+    // the tray would become resident at logon with nothing to control and never apply anything.
+    let mut coordinator_state = coordinator_state;
+    if let StartupStep::Exit(code) = startup_step(&mut coordinator_state, &storage) {
+        log_info!("startup finished with exit code {code}");
+        return code;
+    }
+
     let coordinator = Arc::new(Mutex::new(coordinator_state));
 
     log_info!(
@@ -356,6 +511,167 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("scratch");
         (StorageContext::for_test(&base.join("data")), base)
+    }
+
+    fn profile_text(id: &str, order: i64) -> String {
+        format!(
+            "schema_version = 1\nid = \"{id}\"\nname = \"{id}\"\nicon = \"day\"\norder = {order}\n\n[monitor]\nbrightness = 40\n"
+        )
+    }
+
+    fn registry(ids: &[&str]) -> ProfileRegistry {
+        let profiles = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                crate::config::profile::parse(
+                    &profile_text(id, index as i64 * 10),
+                    std::path::Path::new("test.toml"),
+                )
+                .expect("profile")
+            })
+            .collect();
+        ProfileRegistry::new(profiles).expect("registry")
+    }
+
+    /// One launch decision with a fake transport. `name` keeps parallel tests off one directory.
+    fn launch(
+        name: &str,
+        transport: crate::transport::FakeTransport,
+        profiles: &[&str],
+    ) -> (StartupStep, crate::transport::FakeTransport) {
+        let (storage, base) = isolated(name);
+        let mut coordinator = Coordinator::new(
+            transport,
+            Settings::default(),
+            registry(profiles),
+            storage.settings_file(),
+        )
+        .with_profiles_dir(storage.profiles_dir())
+        .with_storage(storage.clone());
+        let step = startup_step(&mut coordinator, &storage);
+        let transport = coordinator.into_transport();
+        let _ = std::fs::remove_dir_all(base);
+        (step, transport)
+    }
+
+    #[test]
+    fn a_launch_with_no_monitor_exits_silently_and_writes_nothing() {
+        let (step, transport) = launch(
+            "no-monitor",
+            crate::transport::FakeTransport::new(),
+            &["day", "night"],
+        );
+        assert_eq!(step, StartupStep::Exit(0));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn a_single_profile_is_applied_once_instead_of_becoming_resident() {
+        let (step, transport) = launch(
+            "one-shot",
+            crate::transport::FakeTransport::with_monitor("mon-a", "Panel")
+                .with_value("mon-a", "brightness", 10),
+            &["day"],
+        );
+        assert_eq!(step, StartupStep::Exit(0));
+        assert_eq!(
+            transport.writes,
+            vec![(String::from("mon-a"), String::from("brightness"), 40)]
+        );
+    }
+
+    #[test]
+    fn a_single_profile_that_the_monitor_refuses_does_not_report_success() {
+        let (step, transport) = launch(
+            "refused",
+            crate::transport::FakeTransport::with_monitor("mon-a", "Panel")
+                .without_control("mon-a", "brightness"),
+            &["day"],
+        );
+        assert_eq!(step, StartupStep::Exit(5));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn several_profiles_stay_resident_without_writing_anything() {
+        let (step, transport) = launch(
+            "resident",
+            crate::transport::FakeTransport::with_monitor("mon-a", "Panel"),
+            &["day", "night"],
+        );
+        assert_eq!(step, StartupStep::Serve);
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn several_monitors_without_a_remembered_selection_refuse_to_guess() {
+        let (step, transport) = launch(
+            "two-monitors",
+            crate::transport::FakeTransport::with_monitor("mon-a", "Panel")
+                .add_monitor("mon-b", "Second"),
+            &["day"],
+        );
+        assert_eq!(step, StartupStep::Exit(2));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn no_profile_never_invents_one() {
+        let (step, transport) = launch(
+            "no-profile",
+            crate::transport::FakeTransport::with_monitor("mon-a", "Panel"),
+            &[],
+        );
+        assert_eq!(step, StartupStep::Exit(2));
+        assert!(transport.writes.is_empty());
+    }
+
+    #[test]
+    fn every_outcome_maps_to_one_action() {
+        use crate::lifecycle::{SelectionReason, StartupOutcome};
+        let (storage, base) = isolated("mapping");
+        let cases = [
+            (StartupOutcome::ExitNoMonitors, StartupStep::Exit(0)),
+            (StartupOutcome::ExitEmptySelection, StartupStep::Exit(0)),
+            (
+                StartupOutcome::ExitInvalidProfiles { diagnostics: 2 },
+                StartupStep::Exit(2),
+            ),
+            (
+                StartupOutcome::ShowSelection {
+                    reason: SelectionReason::MultipleMonitorsNoChoice,
+                    remember: true,
+                },
+                StartupStep::Exit(2),
+            ),
+            (StartupOutcome::SetupWindow, StartupStep::Exit(2)),
+            (
+                StartupOutcome::OneShot {
+                    targets: vec![String::from("mon-a")],
+                    profile: String::from("day"),
+                },
+                StartupStep::ApplyOnce {
+                    profile: String::from("day"),
+                    targets: vec![String::from("mon-a")],
+                },
+            ),
+            (
+                StartupOutcome::Resident {
+                    targets: vec![String::from("mon-a")],
+                    profiles: 2,
+                },
+                StartupStep::Serve,
+            ),
+        ];
+        for (outcome, expected) in &cases {
+            assert_eq!(plan_startup(outcome), *expected, "{outcome:?}");
+        }
+        // Only outcomes that stop the launch carry a message; the silent ones stay silent.
+        assert!(startup_message(&StartupOutcome::ExitNoMonitors, &storage).is_none());
+        assert!(startup_message(&StartupOutcome::ExitEmptySelection, &storage).is_none());
+        assert!(startup_message(&StartupOutcome::SetupWindow, &storage).is_some());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

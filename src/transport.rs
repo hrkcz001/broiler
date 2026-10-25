@@ -227,6 +227,14 @@ pub struct FakeTransport {
 }
 
 impl FakeTransport {
+    /// No monitors at all: the launch-the-lifecycle tests need this as much as the single-monitor one.
+    pub fn new() -> FakeTransport {
+        FakeTransport {
+            maximum: 100,
+            ..FakeTransport::default()
+        }
+    }
+
     pub fn with_monitor(id: &str, name: &str) -> FakeTransport {
         FakeTransport {
             monitors: vec![MonitorSummary {

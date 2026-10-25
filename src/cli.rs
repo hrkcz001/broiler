@@ -574,6 +574,10 @@ fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("not_applied");
+    let cause = result
+        .get("cause")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
 
     if json_output {
         emit_json(result);
@@ -613,6 +617,7 @@ fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
                     .unwrap_or("");
                 let detail = field
                     .get("reason")
+                    .or_else(|| field.get("state"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
                 output::line(&format!("  {control:<20} {field_status} {detail}"));
@@ -623,7 +628,13 @@ fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
     match status {
         "applied" => EXIT_OK,
         "partial" => EXIT_PARTIAL,
-        _ => EXIT_TRANSPORT,
+        // A result that applied nothing still carries a typed cause: an unsupported or unwritable
+        // control is exit 5, an outcome-unknown or broken path is exit 6, a bad value is exit 2.
+        _ => match cause {
+            "unsupported" | "not_implemented" | "blocked_by_mode" => EXIT_UNSUPPORTED,
+            "invalid_value" => EXIT_USAGE,
+            _ => EXIT_TRANSPORT,
+        },
     }
 }
 
@@ -1541,5 +1552,36 @@ mod tests {
         assert_eq!(EXIT_UNSUPPORTED, 5);
         assert_eq!(EXIT_TRANSPORT, 6);
         assert_eq!(EXIT_PARTIAL, 7);
+    }
+
+    #[test]
+    fn a_failed_apply_maps_its_typed_cause_to_an_exit_code() {
+        let result = |status: &str, cause: &str| {
+            json!({"profile": "day", "status": status, "cause": cause, "monitors": []})
+        };
+        assert_eq!(report_apply(&result("applied", ""), true), EXIT_OK);
+        assert_eq!(report_apply(&result("partial", "timeout"), true), EXIT_PARTIAL);
+        assert_eq!(
+            report_apply(&result("not_applied", "unsupported"), true),
+            EXIT_UNSUPPORTED
+        );
+        assert_eq!(
+            report_apply(&result("not_applied", "not_implemented"), true),
+            EXIT_UNSUPPORTED
+        );
+        assert_eq!(
+            report_apply(&result("not_applied", "invalid_value"), true),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            report_apply(&result("not_applied", "timeout"), true),
+            EXIT_TRANSPORT
+        );
+        assert_eq!(
+            report_apply(&result("not_applied", "verification_failed"), true),
+            EXIT_TRANSPORT
+        );
+        // An undocumented cause must still not look like success.
+        assert_eq!(report_apply(&result("not_applied", ""), true), EXIT_TRANSPORT);
     }
 }

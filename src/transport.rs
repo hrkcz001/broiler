@@ -220,6 +220,10 @@ pub struct FakeTransport {
     pub fail_next_write: Option<TransportError>,
     /// Report a different value than the one written.
     pub observe_offset: i64,
+    /// Controls a monitor positively does not offer; reads and writes report `unsupported`.
+    pub absent: Vec<(String, String)>,
+    /// Writes that fail once with the given error, in registration order.
+    pub failing_writes: Vec<(String, String, TransportError)>,
 }
 
 impl FakeTransport {
@@ -239,6 +243,36 @@ impl FakeTransport {
     pub fn with_value(mut self, monitor: &str, control: &str, value: u64) -> FakeTransport {
         self.values
             .insert((monitor.to_string(), control.to_string()), value);
+        self
+    }
+
+    /// Add a second or third monitor with a deterministic identity.
+    pub fn add_monitor(mut self, id: &str, name: &str) -> FakeTransport {
+        self.monitors.push(MonitorSummary {
+            id: id.to_string(),
+            friendly_name: name.to_string(),
+            connector: String::from("hdmi"),
+            primary: false,
+        });
+        self
+    }
+
+    /// Record that a monitor positively does not offer a control.
+    pub fn without_control(mut self, monitor: &str, control: &str) -> FakeTransport {
+        self.absent
+            .push((monitor.to_string(), control.to_string()));
+        self
+    }
+
+    /// Fail the first write of this control on this monitor with the given error.
+    pub fn fail_write(
+        mut self,
+        monitor: &str,
+        control: &str,
+        error: TransportError,
+    ) -> FakeTransport {
+        self.failing_writes
+            .push((monitor.to_string(), control.to_string(), error));
         self
     }
 
@@ -272,6 +306,16 @@ impl Transport for FakeTransport {
                 "monitor {monitor} is not present"
             )));
         }
+        if self
+            .absent
+            .iter()
+            .any(|(entry, field)| entry == monitor && field == control)
+        {
+            self.leave();
+            return Err(TransportError::Unsupported(format!(
+                "{control} is not offered by {monitor}"
+            )));
+        }
         let current = self
             .values
             .get(&(monitor.to_string(), control.to_string()))
@@ -295,6 +339,15 @@ impl Transport for FakeTransport {
     ) -> Result<WriteOutcome, TransportError> {
         self.enter();
         if let Some(error) = self.fail_next_write.take() {
+            self.leave();
+            return Err(error);
+        }
+        if let Some(index) = self
+            .failing_writes
+            .iter()
+            .position(|(entry, field, _)| entry == monitor && field == control)
+        {
+            let (_, _, error) = self.failing_writes.remove(index);
             self.leave();
             return Err(error);
         }

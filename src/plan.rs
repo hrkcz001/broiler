@@ -487,15 +487,12 @@ fn plan_color_temperature(
     }
 }
 
-/// Build the plan for one profile against one display.
+/// Refuse a profile that asks for two white-point mechanisms at once.
 ///
-/// Order follows the coordinator contract: white point first (temperature or a user preset), then
-/// the gains that depend on it, then contrast, brightness, volume and mute.
-pub fn plan(
-    profile: &Profile,
-    metadata: &DeviceMetadata,
-    policy: UnsupportedPolicy,
-) -> Result<ApplyPlan, PlanError> {
+/// This is a property of the profile, not of a display, so it is checked once per apply before any
+/// monitor is planned. The schema rejects these combinations too; the check exists for values built
+/// in code and for a future schema version.
+pub fn check_conflicts(profile: &Profile) -> Result<(), PlanError> {
     let monitor = &profile.monitor;
     if monitor.color_temperature.is_some() && monitor.color_preset.is_some() {
         return Err(PlanError::Conflict(String::from(
@@ -514,7 +511,21 @@ pub fn plan(
             )));
         }
     }
+    Ok(())
+}
 
+/// Build the plan for one profile against one display.
+///
+/// Order follows the coordinator contract: white point first (temperature or a user preset), then
+/// the gains that depend on it, then contrast, brightness, volume and mute.
+pub fn plan(
+    profile: &Profile,
+    metadata: &DeviceMetadata,
+    policy: UnsupportedPolicy,
+) -> Result<ApplyPlan, PlanError> {
+    check_conflicts(profile)?;
+
+    let monitor = &profile.monitor;
     let mut plan = ApplyPlan::default();
 
     if let Some(temperature) = monitor.color_temperature.as_ref() {

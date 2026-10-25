@@ -526,10 +526,15 @@ impl Settings {
                 apply,
             });
 
+            // Deliberately unowned. An owned window inherits its owner's taskbar behaviour, and the
+            // owner here is the tray's hidden tool window: the dialog then has no taskbar button, and
+            // it is raised whenever the owner is brought forward, which is what a right click on the
+            // icon does. A settings window is a normal window the user can find on the taskbar.
+            let _ = owner;
             let window = CreateDialogIndirectParamW(
                 GetModuleHandleW(std::ptr::null()),
                 template_words.as_ptr() as *const DLGTEMPLATE,
-                owner,
+                std::ptr::null_mut(),
                 Some(settings_proc),
                 &mut *state as *mut Settings as isize,
             );

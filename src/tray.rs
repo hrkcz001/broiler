@@ -1053,9 +1053,15 @@ impl Tray {
         if let Some(open) = self.settings.as_ref() {
             if open.is_open() {
                 // Bring the existing window forward instead of stacking a second one.
+                let window = open.window_id() as windows_sys::Win32::Foundation::HWND;
                 unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(open.window_id()
-                        as windows_sys::Win32::Foundation::HWND)
+                    if windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(window) != 0 {
+                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                            window,
+                            windows_sys::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+                        );
+                    }
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(window)
                 };
                 return;
             }

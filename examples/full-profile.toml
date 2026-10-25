@@ -1,0 +1,18 @@
+# Reference only. Do not copy this file into profiles unchanged.
+schema_version = 1
+id = "coding-reference"
+name = "Coding"
+icon = "coding"
+order = 30
+
+[monitor]
+brightness = 35
+contrast = 70
+color_preset = "user1"
+volume = 20
+mute = false
+
+[monitor.rgb_gain]
+red = 100
+green = 95
+blue = 85

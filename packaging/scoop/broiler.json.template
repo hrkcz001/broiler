@@ -1,0 +1,27 @@
+{
+    "version": "$version",
+    "description": "Lightweight DDC/CI brightness and contrast control for external monitors.",
+    "homepage": "https://github.com/hrkcz001/broiler",
+    "license": "Apache-2.0",
+    "notes": [
+        "Start with Windows is off by default; enable it from the tray Settings window or with:",
+        "    broiler settings set startup.launch_at_login true",
+        "Profiles and settings live in %APPDATA%\\broiler and are not removed by Scoop."
+    ],
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/hrkcz001/broiler/releases/download/v$version/broiler-$version-windows-x64.zip",
+            "hash": "$sha256"
+        }
+    },
+    "bin": "broiler.exe",
+    "shortcuts": [["broiler-tray.exe", "broiler"]],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/hrkcz001/broiler/releases/download/v$version/broiler-$version-windows-x64.zip"
+            }
+        }
+    }
+}

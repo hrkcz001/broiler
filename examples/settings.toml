@@ -1,0 +1,19 @@
+schema_version = 1
+
+[startup]
+launch_at_login = false
+
+[tray]
+left_click = "flyout"
+badges = "when_multiple"
+
+[selection]
+remember = false
+monitor_ids = []
+
+[profiles]
+startup = "preserve"
+unsupported = "skip"
+
+[logging]
+level = "warn"

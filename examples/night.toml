@@ -1,0 +1,8 @@
+schema_version = 1
+id = "night"
+name = "Night"
+icon = "night"
+order = 20
+
+[monitor]
+brightness = 15

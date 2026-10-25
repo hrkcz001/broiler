@@ -518,6 +518,8 @@ pub fn run_resident(storage: StorageContext) -> i32 {
             choose: tray_choose,
             glyph: tray_glyph,
             failure: tray_failure,
+            settings_snapshot: tray_settings_snapshot,
+            settings_apply: tray_settings_apply,
         },
     );
 
@@ -988,16 +990,132 @@ fn tray_failure(user: *mut std::ffi::c_void) -> Option<String> {
     host.last_failure.lock().ok().and_then(|guard| guard.clone())
 }
 
+/// What the settings window shows: what the coordinator holds now, not what a file said at startup.
+fn tray_settings_snapshot(user: *mut std::ffi::c_void) -> crate::win::settings::Snapshot {
+    let fallback = crate::win::settings::Snapshot {
+        left_click: crate::config::settings::LeftClick::Cycle,
+        monitors: 0,
+        profiles: 0,
+        start_at_logon: false,
+    };
+    let Some(host) = (unsafe { host(user) }) else {
+        return fallback;
+    };
+    let Ok(mut guard) = host.coordinator.lock() else {
+        return fallback;
+    };
+    let monitors = guard.resident_targets().len();
+    let profiles = guard
+        .handle("profiles.list", &serde_json::Value::Null)
+        .ok()
+        .and_then(|result| result.get("profiles").cloned())
+        .and_then(|value| value.as_array().map(Vec::len))
+        .unwrap_or(0);
+    crate::win::settings::Snapshot {
+        left_click: guard.settings().left_click,
+        monitors,
+        profiles,
+        start_at_logon: false,
+    }
+}
+
+/// Perform one action from the settings window. The return value says whether it took effect.
+fn tray_settings_apply(
+    user: *mut std::ffi::c_void,
+    action: crate::win::settings::Action,
+) -> bool {
+    use crate::win::settings::Action;
+    let Some(host) = (unsafe { host(user) }) else {
+        return false;
+    };
+    match action {
+        Action::LeftClick(value) => {
+            let text = match value {
+                crate::config::settings::LeftClick::Cycle => "cycle",
+                crate::config::settings::LeftClick::Flyout => "flyout",
+            };
+            let result = match host.coordinator.lock() {
+                Ok(mut guard) => guard.handle(
+                    "settings.set",
+                    &serde_json::json!({"key": "tray.left_click", "value": text}),
+                ),
+                Err(_) => return false,
+            };
+            match result {
+                Ok(_) => {
+                    log_info!("tray.left_click is now {text}");
+                    true
+                }
+                Err(error) => {
+                    log_error!("tray.left_click was not saved: {}", error.message);
+                    false
+                }
+            }
+        }
+        Action::SelectMonitors => {
+            // The dialog is modal and owns its own loop; it belongs on the UI thread, which is where
+            // this callback runs.
+            let entries = match host.coordinator.lock() {
+                Ok(mut guard) => crate::win::ui::entries_for(&guard.monitors().unwrap_or_default()),
+                Err(_) => return false,
+            };
+            let answer = crate::win::ui::select_monitors(
+                "broiler: select monitors",
+                "Control these monitors. A display that cannot be controlled is listed and disabled.",
+                &entries,
+                false,
+            );
+            if let crate::win::ui::Answer::Confirmed { ids, remember } = answer {
+                let written = match host.coordinator.lock() {
+                    Ok(mut guard) => guard.handle(
+                        "monitors.select",
+                        &serde_json::json!({"monitor_ids": ids, "remember": remember}),
+                    ),
+                    Err(_) => return false,
+                };
+                if let Err(error) = written {
+                    log_error!("the selection was not saved: {}", error.message);
+                    return false;
+                }
+                if host.tray_window.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            host.tray_window.load(std::sync::atomic::Ordering::Relaxed)
+                                as windows_sys::Win32::Foundation::HWND,
+                            crate::tray::SETTINGS_REFRESH,
+                            0,
+                            0,
+                        );
+                    }
+                }
+                true
+            } else {
+                // Cancelling changes nothing and is not a failure of the window.
+                true
+            }
+        }
+        Action::OpenProfiles => crate::win::ui::open_directory(&host.storage.profiles_dir()).is_ok(),
+        Action::Close => true,
+    }
+}
+
 fn tray_settings(user: *mut std::ffi::c_void) {
     let Some(host) = (unsafe { host(user) }) else {
         return;
     };
-    let text = format!(
-        "The settings window belongs to a later build. Until then the same settings are available \
-         from the command line, and the profiles live in:\n\n{}",
-        host.storage.profiles_dir().display()
-    );
-    message_box("broiler: settings", &text);
+    let window = host.tray_window.load(std::sync::atomic::Ordering::Relaxed);
+    if window == 0 {
+        log_error!("the settings window was requested before the tray window existed");
+        return;
+    }
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            window as windows_sys::Win32::Foundation::HWND,
+            crate::tray::SETTINGS_OPEN,
+            0,
+            0,
+        );
+    }
 }
 
 fn tray_exit(user: *mut std::ffi::c_void) {
@@ -1012,20 +1130,6 @@ fn tray_exit(user: *mut std::ffi::c_void) {
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
 }
 
-/// A modal message box, used where this build has no window of its own yet.
-fn message_box(title: &str, text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-    let title = crate::win::wide::to_wide(title);
-    let text = crate::win::wide::to_wide(text);
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
 
 /// Start the resident coordinator as a detached process and wait until it answers.
 ///

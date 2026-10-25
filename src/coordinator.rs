@@ -765,6 +765,23 @@ impl<T: Transport> Coordinator<T> {
                 };
                 self.set(&monitor, control, typed)
             }
+            "ui.settings" => {
+                if self.ui_window == 0 {
+                    return Err(Failure::new(
+                        "ui_unavailable",
+                        "this process has no user interface to show its settings",
+                    ));
+                }
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        self.ui_window as windows_sys::Win32::Foundation::HWND,
+                        crate::tray::SETTINGS_OPEN,
+                        0,
+                        0,
+                    );
+                }
+                Ok(json!({"opened": true}))
+            }
             "ui.flyout" => {
                 // The window belongs to the UI thread; a request from the pipe can only ask for it.
                 // The slot index is the position in the resident target list, which is the same list

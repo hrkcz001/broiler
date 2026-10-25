@@ -46,6 +46,12 @@ const NIN_KEYSELECT: u32 = 0x0401;
 const MENU_SETTINGS: usize = 1;
 const MENU_EXIT: usize = 2;
 
+/// Tray to itself: show the settings window for the current state.
+pub const SETTINGS_OPEN: u32 = WM_APP + 42;
+
+/// Tray to itself: re-read the state and update the open settings window.
+pub const SETTINGS_REFRESH: u32 = WM_APP + 43;
+
 /// Timer id for the one-shot version-4 retry.
 const VERSION_RETRY_TIMER: usize = 1;
 const WM_TIMER: u32 = 0x0113;
@@ -387,6 +393,10 @@ pub struct Callbacks {
     pub glyph: fn(*mut c_void, usize) -> Option<String>,
     /// Why the last apply failed, for the row that reports it.
     pub failure: fn(*mut c_void) -> Option<String>,
+    /// The values the settings window shows when it opens.
+    pub settings_snapshot: fn(*mut c_void) -> crate::win::settings::Snapshot,
+    /// Perform one settings action. False means the change was refused and must not be shown.
+    pub settings_apply: fn(*mut c_void, crate::win::settings::Action) -> bool,
 }
 
 /// One installed icon.
@@ -424,6 +434,8 @@ pub struct Tray {
     version_four: bool,
     /// Monitor id per slot, used by the log lines so a failure names the monitor.
     monitors: Vec<String>,
+    /// The settings window, while it is open.
+    settings: Option<Box<crate::win::settings::Settings>>,
     /// The one reusable flyout. Clicking another icon closes this and opens a new one for that
     /// monitor, which is what "a single reusable flyout" means in practice.
     flyout: Option<Box<crate::win::flyout::Flyout>>,
@@ -499,6 +511,14 @@ unsafe extern "system" fn tray_proc(
             tray.dispatch(event, uid);
             0
         }
+        SETTINGS_OPEN => {
+            tray.open_settings();
+            0
+        }
+        SETTINGS_REFRESH => {
+            tray.refresh_settings();
+            0
+        }
         crate::win::flyout::OPEN => {
             // A request to show the flyout for the monitor at this slot, from a left click or from
             // the command line.
@@ -541,6 +561,7 @@ impl Tray {
             installed: false,
             version_four: true,
             monitors: specs.iter().map(|spec| spec.monitor.clone()).collect(),
+            settings: None,
             flyout: None,
         });
         unsafe {
@@ -812,6 +833,48 @@ impl Tray {
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    /// Show the settings window, replacing one that is already open.
+    ///
+    /// Modeless, so the instance keeps serving while it is open; the window reports every action back
+    /// through the callbacks and never writes a setting itself.
+    pub fn open_settings(&mut self) {
+        if let Some(open) = self.settings.as_ref() {
+            if open.is_open() {
+                // Bring the existing window forward instead of stacking a second one.
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(open.window_id()
+                        as windows_sys::Win32::Foundation::HWND)
+                };
+                return;
+            }
+        }
+        let snapshot = (self.callbacks.settings_snapshot)(self.callbacks.user);
+        self.settings = crate::win::settings::Settings::open(
+            self.window,
+            &snapshot,
+            self.callbacks.user,
+            self.callbacks.settings_snapshot,
+            self.callbacks.settings_apply,
+        );
+        if self.settings.is_none() {
+            crate::log_error!("the settings window could not be created");
+        }
+    }
+
+    /// Update the open settings window from the current state.
+    pub fn refresh_settings(&mut self) {
+        let Some(window) = self.settings.as_mut() else {
+            return;
+        };
+        if !window.is_open() {
+            self.settings = None;
+            return;
+        }
+        let snapshot = (self.callbacks.settings_snapshot)(self.callbacks.user);
+        window.set_left_click(snapshot.left_click);
+        window.set_summary(snapshot.monitors, snapshot.profiles);
     }
 
     /// Show the profile flyout for the monitor at `slot`.

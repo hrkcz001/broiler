@@ -62,6 +62,7 @@ fn help_text() -> String {
          \x20 monitors list [--json] | monitors capabilities --monitor <id> [--json]\n\
          \x20 monitors select --monitor <id> [--remember] | --none | --dialog\n\
          \x20 flyout [--monitor <id>]             open the profile flyout of the running instance\n\
+         \x20 settings window                     open the settings window of the running instance\n\
          \x20 monitors validate-value <parameter> <value> --vcp <code> --monitor <id> --confirm-write\n\
          \x20 get <parameter> --monitor <id> | set <parameter> <value> --monitor <id> [--wait]\n\
          \n\
@@ -469,6 +470,20 @@ fn handle_profiles(args: &[String], storage: &StorageContext) -> i32 {
 }
 
 fn handle_settings(args: &[String], storage: &StorageContext) -> i32 {
+    // `settings window` opens the running instance's settings window; every other form is a key.
+    if args.first().map(String::as_str) == Some("window") {
+        if args.len() > 1 {
+            return usage_error(&format!("settings window: unexpected argument: {}", args[1]));
+        }
+        return match crate::runtime::request(storage, "ui.settings", serde_json::Value::Null) {
+            Ok(_) => {
+                output::line("settings window requested");
+                EXIT_OK
+            }
+            Err(error) => report_client_error(&error),
+        };
+    }
+
     let Some(subcommand) = args.first() else {
         return usage_error("settings: expected 'get', 'set' or 'open'");
     };

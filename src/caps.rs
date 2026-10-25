@@ -35,6 +35,11 @@ pub struct Capabilities {
     pub commands: Vec<u8>,
     /// Codes listed in `vcp(...)`, including ones with a value list.
     pub vcp_codes: Vec<u8>,
+    /// Values a code advertises, for entries written as `14(05 06 08 0B)`.
+    ///
+    /// This is the device's own statement about what a control accepts, so validating a native value
+    /// against it is checking the hardware rather than guessing from a standard table.
+    pub vcp_values: Vec<(u8, Vec<u8>)>,
     /// Whether the monitor reported any MCCS version at all.
     pub version_reported: bool,
 }
@@ -131,6 +136,16 @@ fn push_code(run: &str, collected: &mut Vec<u8>) {
     }
 }
 
+impl Capabilities {
+    /// The values this display says one code accepts, if it listed any.
+    pub fn values_for(&self, code: u8) -> Option<&[u8]> {
+        self.vcp_values
+            .iter()
+            .find(|(listed, _)| *listed == code)
+            .map(|(_, values)| values.as_slice())
+    }
+}
+
 /// Extract VCP codes from a `cmds(...)` or `vcp(...)` body.
 ///
 /// Monitors disagree on separators: some write `01 02 03`, others concatenate the pairs into
@@ -176,6 +191,60 @@ fn codes(value: &str) -> Vec<u8> {
     collected
 }
 
+/// Extract the value lists a `vcp(...)` body advertises, as `(code, values)`.
+///
+/// `14(0506080B)` means the code `0x14` accepts 5, 6, 8 and 11 on this display; the inner list uses
+/// the same separator rules as the outer one, including the separator-free form this monitor writes.
+fn value_lists(value: &str) -> Vec<(u8, Vec<u8>)> {
+    let mut lists = Vec::new();
+    let mut run = String::new();
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => {
+                // The two hex digits immediately before the parenthesis name the code.
+                let code = if run.len() >= 2 {
+                    u8::from_str_radix(&run[run.len() - 2..], 16).ok()
+                } else {
+                    None
+                };
+                run.clear();
+                let mut depth = 1usize;
+                let mut inner = String::new();
+                index += 1;
+                while index < bytes.len() && depth > 0 {
+                    match bytes[index] {
+                        b'(' => {
+                            depth += 1;
+                            inner.push('(');
+                        }
+                        b')' => {
+                            depth -= 1;
+                            if depth > 0 {
+                                inner.push(')');
+                            }
+                        }
+                        other => inner.push(other as char),
+                    }
+                    index += 1;
+                }
+                if let Some(code) = code {
+                    let values = codes(&inner);
+                    if !values.is_empty() {
+                        lists.push((code, values));
+                    }
+                }
+                continue;
+            }
+            byte if byte.is_ascii_hexdigit() => run.push(byte as char),
+            _ => run.clear(),
+        }
+        index += 1;
+    }
+    lists
+}
+
 /// Parse a raw capabilities reply.
 pub fn parse(raw: &CapabilitiesRaw) -> Capabilities {
     let pairs = top_level_pairs(raw.text.as_bytes());
@@ -195,7 +264,10 @@ pub fn parse(raw: &CapabilitiesRaw) -> Capabilities {
                 parsed.mccs_version = Some(value);
             }
             "cmds" => parsed.commands = codes(&value),
-            "vcp" => parsed.vcp_codes = codes(&value),
+            "vcp" => {
+                parsed.vcp_codes = codes(&value);
+                parsed.vcp_values = value_lists(&value);
+            }
             _ => {}
         }
     }
@@ -205,6 +277,32 @@ pub fn parse(raw: &CapabilitiesRaw) -> Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_list_is_read_from_the_codes_own_parentheses() {
+        // Exactly the string this machine's panel reports: 0x14 accepts 5, 6, 8 and 11, written with
+        // no separators, and the other codes carry no list at all.
+        let text = "prot(monitor)type(lcd)model(MAG275R)cmds(010203070C4EF3E3)vcp(020405080B0C101214(0506080B)16181A6C6E70ACAEB6C0C6C8C9CACC(0102030405060708090A0C0D0F18192325)D6(0104)DF)mswhql(1)mccs_ver(2.1)";
+        let raw = CapabilitiesRaw {
+            text: String::from(text),
+            declared_length: text.len() as u32,
+        };
+        let parsed = parse(&raw);
+        assert_eq!(parsed.values_for(0x14), Some([5u8, 6, 8, 11].as_slice()));
+        // A list belongs to the code written immediately before its parenthesis. In this string that
+        // is `CACC(0102...)`, so the long list is 0xCC's and 0x0C has none.
+        assert_eq!(
+            parsed.values_for(0xCC).map(|values| values.len()),
+            Some(17),
+            "0xCC carries a seventeen-value list on this panel"
+        );
+        assert_eq!(parsed.values_for(0x0C), None);
+        assert_eq!(parsed.values_for(0x10), None);
+        // The codes themselves are still complete: a nested list must not swallow its neighbours.
+        for code in [0x10u8, 0x12, 0x14, 0x18, 0x1A] {
+            assert!(parsed.vcp_codes.contains(&code), "{code:#04X}");
+        }
+    }
 
     fn raw(text: &str) -> CapabilitiesRaw {
         CapabilitiesRaw {

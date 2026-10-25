@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Both executables build and answer `--version`, and nothing else works yet: no monitor discovery, no configuration, no tray, no hardware access.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
+**Status: early implementation. Both executables build, `broiler monitors list --json` and `broiler monitors capabilities --monitor <id> --json` return real read-only data, and nothing else works yet: no configuration, no profiles, no tray, no write of any kind.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
 
 Research and architecture by **Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 
@@ -240,7 +240,7 @@ When known-working values are missing from a capabilities string, the implementa
 - Monitor power-off, input switching, factory reset, EEPROM-save, vendor-specific writes and automatic restore-on-exit are outside the v1 API.
 - A matching readback does not prove calibrated luminance or a visible/audible effect. Physical test results stay separate from fake-backend CI.
 
-No broiler hardware-control test has been run yet. The development machine's MSI MAG275R is an initial candidate, not a support certification. The owner reports existing monitor-side temperature control; its actual VCP mapping still has to be read and validated.
+No broiler hardware-control test has been run: the project has never written to a monitor. Read-only discovery on the development machine's MSI MAG275R returns brightness, contrast and capability data, and the built-in BOE0852 panel is excluded from control. That is an initial candidate, not a support certification. The owner reports existing monitor-side temperature control; its actual VCP mapping still has to be read and validated. Evidence and exact commands: [docs/tested-devices.md](docs/tested-devices.md).
 
 ## Build and implementation
 

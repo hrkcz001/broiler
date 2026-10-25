@@ -5,7 +5,11 @@
 //! because it is part of the user-facing contract, and reports that it is not implemented
 //! in this build instead of pretending to succeed.
 
+use serde::Serialize;
+
+use crate::discovery::{self, DiscoveryFailure};
 use crate::logging::{self, Level};
+use crate::model::{CapabilitiesReport, ControlEvidence, MonitorListReport, Reading};
 use crate::{log_info, output, paths, PRODUCT_NAME, VERSION};
 
 /// Command completed, or an idempotent stop, or a normal start with no monitors.
@@ -36,7 +40,6 @@ const PLANNED_COMMANDS: &[&str] = &[
     "stop",
     "status",
     "reload",
-    "monitors",
     "profiles",
     "profile",
     "get",
@@ -119,11 +122,261 @@ fn dispatch_console(args: &[String]) -> i32 {
             output::line(&help_text());
             EXIT_OK
         }
+        "monitors" => handle_monitors(&args[1..]),
         other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
         other => {
             output::error_line(&format!("{}: unknown command: {}", PRODUCT_NAME, other));
             EXIT_USAGE
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// monitors
+// ---------------------------------------------------------------------------
+
+fn usage_error(message: &str) -> i32 {
+    output::error_line(&format!("{}: {}", PRODUCT_NAME, message));
+    EXIT_USAGE
+}
+
+fn emit_json<T: Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => output::line(&text),
+        Err(error) => output::error_line(&format!(
+            "{}: cannot encode the report as JSON: {}",
+            PRODUCT_NAME, error
+        )),
+    }
+}
+
+fn discovery_exit_code(failure: &DiscoveryFailure) -> i32 {
+    match failure {
+        DiscoveryFailure::Topology(_) => EXIT_TRANSPORT,
+        DiscoveryFailure::UnknownMonitor { .. } | DiscoveryFailure::AmbiguousMonitor { .. } => {
+            EXIT_TARGET
+        }
+    }
+}
+
+fn reading_summary(reading: &Reading) -> String {
+    match reading {
+        Reading::Readable {
+            backend,
+            current,
+            maximum,
+            minimum,
+            ..
+        } => {
+            let min = minimum
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("?"));
+            let max = maximum
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| String::from("?"));
+            format!("{current} (min {min}, max {max}, {backend})")
+        }
+        Reading::Timeout { waited_ms, .. } => format!("timeout after {waited_ms} ms"),
+        Reading::TransportError { message, .. } => format!("transport error: {message}"),
+        Reading::Unavailable { message } => format!("unavailable: {message}"),
+        Reading::Ambiguous { count, .. } => {
+            format!("ambiguous: {count} physical monitors on one handle")
+        }
+        Reading::NotRequested => String::from("not read"),
+    }
+}
+
+fn print_monitor_list(report: &MonitorListReport) {
+    output::line(&format!(
+        "backend {}, observed {}, {} ms",
+        report.backend, report.observed_at, report.elapsed_ms
+    ));
+    if report.monitors.is_empty() {
+        output::line("no controllable external monitors");
+    }
+    for monitor in &report.monitors {
+        let role = if monitor.primary { "primary" } else { "extended" };
+        let control = if monitor.controllable {
+            "controllable"
+        } else {
+            "not controllable"
+        };
+        output::line(&format!(
+            "{}  {}  {}  {}  {}  {}",
+            monitor.display_index,
+            monitor.id,
+            monitor.friendly_name,
+            monitor.connector,
+            role,
+            control
+        ));
+        if let Some(probe) = monitor.probe.as_ref() {
+            output::line(&format!(
+                "   brightness {}   contrast {}   ({} ms)",
+                reading_summary(&probe.brightness),
+                reading_summary(&probe.contrast),
+                probe.elapsed_ms
+            ));
+        }
+        output::line(&format!(
+            "   identity {}  device {}",
+            match monitor.identity_confidence {
+                crate::model::IdentityConfidence::EdidSerial => "edid_serial",
+                crate::model::IdentityConfidence::ConnectionBound => "connection_bound",
+                crate::model::IdentityConfidence::Ambiguous => "ambiguous",
+            },
+            monitor.device_name
+        ));
+    }
+    for excluded in &report.excluded {
+        output::line(&format!(
+            "excluded  {}  {}  {}  ({})",
+            excluded.friendly_name, excluded.connector, excluded.reason, excluded.detail
+        ));
+    }
+    for note in &report.notes {
+        output::line(&format!("note: {note}"));
+    }
+}
+
+fn print_control_evidence(control: &ControlEvidence) {
+    let advertised = match control.advertised {
+        Some(true) => "advertised",
+        Some(false) => "not advertised",
+        None => "no capability data",
+    };
+    output::line(&format!(
+        "  {:<20} {}  {:<18} {}",
+        control.name,
+        control.vcp_code,
+        advertised,
+        reading_summary(&control.reading)
+    ));
+}
+
+fn print_capabilities(report: &CapabilitiesReport) {
+    output::line(&format!(
+        "monitor   {}  ({})",
+        report.monitor.friendly_name, report.monitor.id
+    ));
+    output::line(&format!(
+        "connector {}  device {}  index {}",
+        report.monitor.connector, report.monitor.device_name, report.monitor.display_index
+    ));
+    output::line(&format!("observed  {}  backend {}", report.observed_at, report.backend));
+
+    let section = &report.capabilities;
+    let declared = section
+        .declared_length
+        .map(|value| format!("{value} chars"))
+        .unwrap_or_else(|| String::from("unknown length"));
+    let version = section
+        .parsed
+        .as_ref()
+        .and_then(|parsed| parsed.mccs_version.clone())
+        .unwrap_or_else(|| String::from("not reported"));
+    output::line(&format!(
+        "capabilities {}  {}  mccs {}",
+        section.state, declared, version
+    ));
+    if let Some(message) = section.message.as_ref() {
+        output::line(&format!("  {message}"));
+    }
+    if let Some(parsed) = section.parsed.as_ref() {
+        let commands: Vec<String> = parsed
+            .commands
+            .iter()
+            .map(|code| format!("{code:02X}"))
+            .collect();
+        output::line(&format!("  cmds {}", commands.join(" ")));
+    }
+
+    output::line("controls");
+    for control in &report.controls {
+        print_control_evidence(control);
+    }
+    for note in &report.notes {
+        output::line(&format!("note: {note}"));
+    }
+}
+
+fn monitors_list(args: &[String]) -> i32 {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => return usage_error(&format!("monitors list: unexpected argument: {other}")),
+        }
+    }
+
+    match discovery::list() {
+        Ok(report) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_monitor_list(&report);
+            }
+            EXIT_OK
+        }
+        Err(failure) => {
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, failure.message()));
+            discovery_exit_code(&failure)
+        }
+    }
+}
+
+fn monitors_capabilities(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut monitor: Option<String> = None;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => monitor = Some(value.clone()),
+                    None => return usage_error("monitors capabilities: --monitor requires an identifier"),
+                }
+            }
+            other => {
+                return usage_error(&format!(
+                    "monitors capabilities: unexpected argument: {other}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(monitor) = monitor else {
+        return usage_error(
+            "monitors capabilities: --monitor <id> is required; run 'broiler monitors list --json' first",
+        );
+    };
+
+    match discovery::capabilities(&monitor) {
+        Ok(report) => {
+            if json {
+                emit_json(&report);
+            } else {
+                print_capabilities(&report);
+            }
+            EXIT_OK
+        }
+        Err(failure) => {
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, failure.message()));
+            discovery_exit_code(&failure)
+        }
+    }
+}
+
+fn handle_monitors(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("list") => monitors_list(&args[1..]),
+        Some("capabilities") => monitors_capabilities(&args[1..]),
+        Some(other) => usage_error(&format!("monitors: unknown subcommand: {other}")),
+        None => usage_error("monitors: expected 'list' or 'capabilities'"),
     }
 }
 
@@ -199,8 +452,30 @@ mod tests {
 
     #[test]
     fn planned_commands_report_not_implemented_rather_than_success() {
-        assert_eq!(dispatch_console(&argv(&["monitors", "list"])), EXIT_USAGE);
-        assert_eq!(dispatch_console(&argv(&["set", "brightness", "42"])), EXIT_USAGE);
+        // These stay unimplemented, so the test never touches hardware.
+        assert_eq!(dispatch_console(&argv(&["profiles", "list"])), EXIT_USAGE);
+        assert_eq!(
+            dispatch_console(&argv(&["set", "brightness", "42"])),
+            EXIT_USAGE
+        );
+    }
+
+    #[test]
+    fn monitors_subcommands_reject_bad_arguments_without_touching_hardware() {
+        assert_eq!(dispatch_console(&argv(&["monitors"])), EXIT_USAGE);
+        assert_eq!(dispatch_console(&argv(&["monitors", "frobnicate"])), EXIT_USAGE);
+        assert_eq!(
+            dispatch_console(&argv(&["monitors", "capabilities"])),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            dispatch_console(&argv(&["monitors", "capabilities", "--monitor"])),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            dispatch_console(&argv(&["monitors", "list", "--bogus"])),
+            EXIT_USAGE
+        );
     }
 
     #[test]

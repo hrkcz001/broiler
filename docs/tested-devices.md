@@ -45,15 +45,55 @@ Notes and limits:
 - `broiler-tray.exe --internal-ddc-worker` exits 2 with a "not implemented" message. The isolated
   worker belongs to G4.
 
+## G2 — read-only discovery
+
+Evidenced on 2026-10-25 on the development machine. Read-only: the build contains no write call.
+
+| Check | Command | Observed |
+|---|---|---|
+| Monitor list, human | `target/release/broiler.exe monitors list` | one controllable monitor, `mon-227062c49310910f`, MSI MAG275R, hdmi, primary, brightness 0, contrast 50 |
+| Monitor list, JSON | `target/release/broiler.exe monitors list --json` | exit 0, valid JSON, `elapsed_ms` 250-262, `excluded` contains BOE0852 |
+| Internal panel exclusion | same command | `excluded: [{"friendly_name": "BOE0852", "connector": "internal", "reason": "internal_panel", "detail": "built-in panel is present but not part of the active desktop; output technology is internal"}]` |
+| Identity | `monitors list --json` | `identity_confidence: "edid_serial"`, `edid_serial: "601"`, `product_code: "0x3CB5"`, EDID read from `SYSTEM\CurrentControlSet\Enum\DISPLAY\MSI3CB5\5&16ba635d&0&UID4352\Device Parameters\EDID` |
+| Identity stability across runs | two successive `monitors list --json` | identical id `mon-227062c49310910f` |
+| Capabilities, human | `broiler monitors capabilities --monitor mon-227062c49310910f` | exit 0, 238 characters, `mccs_ver(2.1)`, `cmds 01 02 03 07 0C 4E F3 E3` |
+| Capabilities, JSON | same with `--json` | exit 0, raw string recorded below, brightness and contrast `advertised: true` from the `vcp(...)` list |
+| Unknown identifier | `monitors capabilities --monitor mon-0000000000000000` | exit 4, message lists the available identifier |
+| Unit tests | `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat test` | 42 passed, 0 failed |
+| No write path | `grep -rn "SetVCPFeature\|SetMonitorBrightness\|SetMonitorContrast\|SetMonitorColor\|SetMonitorRedGreenOrBlue" src/` | no matches |
+
+Raw capabilities reply from the MSI MAG275R, unchanged:
+
+```text
+(prot(monitor)type(lcd)model(MAG275R)cmds(010203070C4EF3E3)vcp(020405080B0C101214(0506080B)16181A6C6E70ACAEB6C0C6C8C9CACC(0102030405060708090A0C0D0F18192325)D6(0104)DF60(11120F)628D(0102)FF)mswhql(1)mccs_ver(2.1)asset_eep(32)mpu_ver(01))
+```
+
+Observations that matter for later gates:
+
+- The reply uses hexadecimal pairs with no separator. A whitespace-only parser finds nothing; the
+  parser in `src/caps.rs` splits separator-free runs into two-digit codes and keeps a golden test
+  built from this exact reply.
+- `0x10` and `0x12` are absent from `cmds(...)` but present in `vcp(...)`, and both read back
+  successfully. This is the documented case where the capabilities string is advisory and must not
+  gate a read.
+- The internal panel `BOE0852` was present on the machine but not part of the active desktop during
+  this run, so the active-path join never returned it. The excluded report is produced from a
+  separate read-only all-paths query that never probes or controls the panel. Exclusion of a built-in
+  panel that *is* part of the active desktop was not exercised on hardware; the classifier that
+  decides it is unit-tested for `INTERNAL`, `LVDS`, embedded DisplayPort and embedded UDI.
+- `physical_monitor` description is `Generic PnP Monitor`; the friendly name comes from the target
+  device name, which Windows reports as coming from the EDID.
+- `display_index` is assigned per session from left to right. Persistence is not implemented.
+
 ## Hardware evidence
 
-No DDC/CI read or write has been performed by this project. No monitor model, firmware, cable or
-path has been validated. Every control remains unverified on real hardware.
+Only reads have been performed. No write of any kind has been made by this project.
 
 | Date | Monitor | Operation | Result |
 |---|---|---|---|
-| — | — | — | nothing performed yet |
+| 2026-10-25 | MSI MAG275R (HDMI, `\\.\DISPLAY4`) | `GetMonitorBrightness`, `GetMonitorContrast`, VCP read `0x10`/`0x12`, capabilities string | brightness 0 (min 0, max 100), contrast 50 (min 0, max 100), VCP `0x10` current 0 max 100, VCP `0x12` current 50 max 100, code type `set_parameter`, capabilities 238 chars MCCS 2.1 |
+| 2026-10-25 | BOE0852 (internal panel) | all-paths topology query, EDID registry read | detected, classified built-in, excluded from control, never probed |
 
 ## Gates not yet evidenced
 
-G2 through G12 have no evidence of any kind. They are not implemented.
+G3 through G12 have no evidence of any kind. They are not implemented.

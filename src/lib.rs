@@ -10,10 +10,15 @@
 //! No async runtime, no service, no elevation, no WebView. Hardware writes exist only
 //! behind the single coordinator and its child worker.
 
+pub mod caps;
 pub mod cli;
+pub mod clock;
+pub mod discovery;
 pub mod logging;
+pub mod model;
 pub mod output;
 pub mod paths;
+pub mod win;
 
 /// Product name as used in user-visible strings.
 pub const PRODUCT_NAME: &str = "broiler";

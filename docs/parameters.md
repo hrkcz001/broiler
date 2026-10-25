@@ -1,6 +1,6 @@
 # Parameters, units, and native values
 
-Reference for the required v1 control surface. Data locations are specified in [the storage contract](storage.md). Source rationale and the numbered Microsoft/ddcutil source list are in [the architecture](architecture.md). Implementation status: nothing in this document is implemented yet. Every claim about a specific display's behavior is either marked as standard intent or left explicitly unverified.
+Reference for the required v1 control surface. Data locations are specified in [the storage contract](storage.md). Source rationale and the numbered Microsoft/ddcutil source list are in [the architecture](architecture.md). Implementation status: brightness and contrast have production read/write paths; parsing/planning for other fields is not proof of production backend support. The current repair work order is `docs/handoff-v2-2026-10-25.md`. Every claim about a specific display's behavior is either marked as standard intent or left explicitly unverified.
 
 ## Value model
 

@@ -1,6 +1,10 @@
 # broiler: research, architecture, and implementation plan
 
-Status: proposed design, not an implementation. No Rust source, Cargo project, runtime manifest, workflow, release, or hardware writes have been produced at this stage. Configuration and CLI examples below describe the intended contract.
+Status: design document, amended 2026-10-25 against the running implementation. The repository now contains Rust source, two binaries, a resident coordinator and a native tray, flyout and settings window; see `docs/status-2026-10-25-*.md` for gate evidence and `docs/handoff-v2-2026-10-25.md` for the work that remains. Sections marked **Amended 2026-10-25** supersede earlier text; where this document and the implementation disagree, the amendment wins and the code is the thing to change.
+
+## Approved UX amendment, 2026-10-25
+
+`docs/ux-contract-2026-10-25.md` supersedes the older monochrome artwork, process-local-only current-profile state and unconditional single-monitor-name rules below. The owner approved read-only exact profile matching under preserve; colored icons, native themed windows, live settings and the monitor-name preference are required. Read `docs/handoff-v2-2026-10-25.md` before further implementation. Older paragraphs are historical rationale where they conflict with this amendment.
 
 ## 1. Decision summary
 

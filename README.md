@@ -14,6 +14,10 @@ A normal launch, including at logon, follows the documented lifecycle: with no c
 
 Research and architecture by **Hermes Agent** (Nous Research) at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), [the storage contract](docs/storage.md), and [the next worker handoff](docs/next-worker-handoff.md).
 
+## Review status, 2026-10-25
+
+The tray and windows exist but have not passed interactive acceptance. Known defects include live Cycle changes, stale icon/tooltip updates and window styling. Next work is [the repair handoff](docs/handoff-v2-2026-10-25.md), not a claim of a finished release. The approved [UX contract](docs/ux-contract-2026-10-25.md) requires colored icons, read-only profile matching under preserve and `tray.always_show_monitor_name = false`; these amendments are not implemented yet. Existing config examples remain valid; do not add the new key to the current strict-parser build until supported.
+
 ## What it controls
 
 External HDMI and DisplayPort monitors over DDC/CI: brightness, contrast, color temperature, color presets, RGB gains, monitor-speaker volume and audio-only mute where supported. Color temperature, including native hexadecimal preset values, is required v1 functionality, not a future feature. Support remains device- and mode-dependent.

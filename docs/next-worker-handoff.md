@@ -1,5 +1,7 @@
 # Next implementation worker handoff
 
+Superseded after the second worker review. Active work order: `handoff-v2-2026-10-25.md`, with `ux-contract-2026-10-25.md` and `storage.md`. This file remains the earlier validation record; do not restart its already implemented gates blindly.
+
 ## 1. Mission and actual starting point
 
 Requirement update after initial validation: Scoop installation must use `persist: data`, not AppData-only storage. Read `docs/storage.md` immediately after this handoff; it overrides old storage/path and no-persist instructions. The current executable has NOT been migrated by this planning change.

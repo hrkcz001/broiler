@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::caps::{self, Capabilities};
 use crate::clock;
 use crate::model::{
@@ -409,6 +411,41 @@ pub fn list() -> Result<MonitorListReport, DiscoveryFailure> {
         excluded,
         notes,
     })
+}
+
+/// A routing handle for one discovered monitor.
+///
+/// This is what the isolated worker keeps: the opaque identifier plus the `HMONITOR` it currently
+/// resolves to. The handle is routing data and is re-resolved if the topology changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TargetHandle {
+    pub id: String,
+    pub friendly_name: String,
+    pub hmonitor: isize,
+    pub builtin: bool,
+    pub connector: String,
+}
+
+/// Enumerate monitor identifiers with their current handles, without any DDC traffic.
+pub fn target_handles() -> Result<Vec<TargetHandle>, DiscoveryFailure> {
+    let candidates = scan()?;
+    Ok(candidates
+        .iter()
+        .map(|candidate| TargetHandle {
+            id: candidate.id.clone(),
+            friendly_name: if candidate.target.friendly_name.is_empty() {
+                candidate
+                    .edid_name
+                    .clone()
+                    .unwrap_or_else(|| candidate.target.device_name.clone())
+            } else {
+                candidate.target.friendly_name.clone()
+            },
+            hmonitor: candidate.target.hmonitor,
+            builtin: candidate.builtin,
+            connector: candidate.target.output_technology_name.clone(),
+        })
+        .collect())
 }
 
 fn find_candidate(candidates: &[Candidate], requested: &str) -> Result<usize, DiscoveryFailure> {

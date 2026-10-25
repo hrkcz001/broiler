@@ -16,7 +16,8 @@ use windows_sys::Win32::Devices::Display::{
     CapabilitiesRequestAndCapabilitiesReply, DestroyPhysicalMonitors,
     GetCapabilitiesStringLength, GetMonitorBrightness, GetMonitorContrast,
     GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
-    GetVCPFeatureAndVCPFeatureReply, PHYSICAL_MONITOR, MC_MOMENTARY, MC_SET_PARAMETER,
+    GetVCPFeatureAndVCPFeatureReply, SetMonitorBrightness, SetMonitorContrast, SetVCPFeature,
+    PHYSICAL_MONITOR, MC_MOMENTARY, MC_SET_PARAMETER,
 };
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::Graphics::Gdi::HMONITOR;
@@ -325,6 +326,123 @@ fn probe_blocking(hmonitor: HMONITOR, read_capabilities_string: bool) -> Result<
         capabilities,
         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
     })
+}
+
+/// Run `action` against the single physical monitor behind `hmonitor`.
+///
+/// The physical-monitor array is created and destroyed inside the call, so a hung driver abandons
+/// nothing but the calling thread. An ambiguous handle (more than one physical monitor) is refused
+/// rather than guessed at.
+pub(crate) fn with_physical_monitor<T>(
+    hmonitor: isize,
+    action: impl FnOnce(HANDLE) -> T,
+) -> Result<T, DdcError> {
+    if hmonitor == 0 {
+        return Err(DdcError::NoPhysicalMonitor);
+    }
+    let monitors = open_physical_monitors(hmonitor as HMONITOR)?;
+    if monitors.monitors.len() != 1 {
+        return Err(DdcError::Ambiguous {
+            count: monitors.monitors.len() as u32,
+        });
+    }
+    Ok(action(monitors.first()))
+}
+
+/// Write through the high-level brightness or contrast setter.
+pub(crate) fn set_high_level(handle: HANDLE, contrast: bool, value: u32) -> Result<(), DdcError> {
+    let (ok, call) = unsafe {
+        if contrast {
+            (
+                SetMonitorContrast(handle, value),
+                "SetMonitorContrast",
+            )
+        } else {
+            (
+                SetMonitorBrightness(handle, value),
+                "SetMonitorBrightness",
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(DdcError::Api {
+            call,
+            win32_error: unsafe { GetLastError() },
+        });
+    }
+    Ok(())
+}
+
+/// Write an allowlisted VCP code.
+///
+/// Only the codes in this module's control registry reach here; there is no caller-supplied code
+/// path from configuration or the CLI.
+pub(crate) fn set_vcp(handle: HANDLE, code: u8, value: u32) -> Result<(), DdcError> {
+    if code != VCP_BRIGHTNESS && code != VCP_CONTRAST {
+        return Err(DdcError::Api {
+            call: "SetVCPFeature",
+            win32_error: 87, // ERROR_INVALID_PARAMETER
+        });
+    }
+    let ok = unsafe { SetVCPFeature(handle, code, value) };
+    if ok == 0 {
+        return Err(DdcError::Api {
+            call: "SetVCPFeature",
+            win32_error: unsafe { GetLastError() },
+        });
+    }
+    Ok(())
+}
+
+/// One reading of an allowlisted control, with the range the device reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ControlReading {
+    /// Reported minimum, present only from the high-level getter. Never assumed to be zero.
+    pub minimum: Option<u32>,
+    pub current: u32,
+    pub maximum: u32,
+    pub backend: &'static str,
+}
+
+/// Read one allowlisted control through the high-level getter, falling back to VCP.
+pub(crate) fn read_control(handle: HANDLE, contrast: bool) -> Result<ControlReading, DdcError> {
+    match read_high_level(handle, contrast) {
+        Ok(reading) => Ok(ControlReading {
+            minimum: Some(reading.minimum),
+            current: reading.current,
+            maximum: reading.maximum,
+            backend: "dxva2-high-level",
+        }),
+        Err(high_level_error) => {
+            let code = if contrast { VCP_CONTRAST } else { VCP_BRIGHTNESS };
+            match read_vcp(handle, code) {
+                // The low-level getter reports no minimum: it is left absent rather than invented.
+                Ok(reading) => Ok(ControlReading {
+                    minimum: None,
+                    current: reading.current,
+                    maximum: reading.maximum,
+                    backend: "dxva2-vcp",
+                }),
+                Err(_) => Err(high_level_error),
+            }
+        }
+    }
+}
+
+/// Write one allowlisted control, preferring the high-level setter.
+pub(crate) fn write_control(
+    handle: HANDLE,
+    contrast: bool,
+    value: u32,
+) -> Result<&'static str, DdcError> {
+    if set_high_level(handle, contrast, value).is_ok() {
+        return Ok("dxva2-high-level");
+    }
+    // A high-level failure is not retried at the low level when the outcome is uncertain: only a
+    // definite refusal falls through, and the caller verifies by readback either way.
+    let code = if contrast { VCP_CONTRAST } else { VCP_BRIGHTNESS };
+    set_vcp(handle, code, value)?;
+    Ok("dxva2-vcp")
 }
 
 /// Probe one monitor handle with a wall-clock bound.

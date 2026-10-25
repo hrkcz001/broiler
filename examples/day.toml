@@ -6,3 +6,4 @@ order = 10
 
 [monitor]
 brightness = 65
+contrast = 80

@@ -7,6 +7,7 @@
 
 pub mod ddc;
 pub mod edid;
+pub mod process;
 pub mod registry;
 pub mod topology;
 pub mod wide;

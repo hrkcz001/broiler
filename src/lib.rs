@@ -16,13 +16,16 @@ pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod discovery;
+pub mod ipc;
 pub mod lifecycle;
 pub mod logging;
 pub mod model;
 pub mod output;
 pub mod paths;
 pub mod plan;
+pub mod supervisor;
 pub mod win;
+pub mod worker;
 
 /// Product name as used in user-visible strings.
 pub const PRODUCT_NAME: &str = "broiler";

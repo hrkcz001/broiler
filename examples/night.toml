@@ -6,3 +6,4 @@ order = 20
 
 [monitor]
 brightness = 15
+contrast = 50

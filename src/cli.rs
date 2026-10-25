@@ -5,11 +5,16 @@
 //! because it is part of the user-facing contract, and reports that it is not implemented
 //! in this build instead of pretending to succeed.
 
-use serde::Serialize;
+use std::path::PathBuf;
 
+use serde::Serialize;
+use serde_json::json;
+
+use crate::config::value::percent_to_native;
 use crate::discovery::{self, DiscoveryFailure};
 use crate::logging::{self, Level};
 use crate::model::{CapabilitiesReport, ControlEvidence, MonitorListReport, Reading};
+use crate::supervisor::{Supervisor, SupervisorError, WorkerCommand};
 use crate::{log_info, output, paths, PRODUCT_NAME, VERSION};
 
 /// Command completed, or an idempotent stop, or a normal start with no monitors.
@@ -42,8 +47,6 @@ const PLANNED_COMMANDS: &[&str] = &[
     "reload",
     "profiles",
     "profile",
-    "get",
-    "set",
     "settings",
     "startup",
     "repository",
@@ -123,11 +126,282 @@ fn dispatch_console(args: &[String]) -> i32 {
             EXIT_OK
         }
         "monitors" => handle_monitors(&args[1..]),
+        "get" => handle_get(&args[1..]),
+        "set" => handle_set(&args[1..]),
         other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
         other => {
             output::error_line(&format!("{}: unknown command: {}", PRODUCT_NAME, other));
             EXIT_USAGE
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get / set, routed through the isolated DDC worker
+// ---------------------------------------------------------------------------
+
+/// Controls reachable from the command line without a profile.
+fn control_from_name(name: &str) -> Option<&'static str> {
+    match name {
+        "brightness" => Some("brightness"),
+        "contrast" => Some("contrast"),
+        _ => None,
+    }
+}
+
+fn tray_executable() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the current executable: {error}"))?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| String::from("the current executable has no parent directory"))?;
+    Ok(directory.join("broiler-tray.exe"))
+}
+
+fn open_supervisor() -> Result<Supervisor, String> {
+    let tray = tray_executable()?;
+    if !tray.exists() {
+        return Err(format!(
+            "the DDC worker executable is missing next to this binary: {}",
+            tray.display()
+        ));
+    }
+    Ok(Supervisor::new(WorkerCommand::internal(tray)))
+}
+
+fn supervisor_exit_code(error: &SupervisorError) -> i32 {
+    match error {
+        SupervisorError::Device(failure) => match failure.kind.as_str() {
+            "unknown_monitor" | "ambiguous" => EXIT_TARGET,
+            "unsupported" => EXIT_UNSUPPORTED,
+            _ => EXIT_TRANSPORT,
+        },
+        _ => EXIT_TRANSPORT,
+    }
+}
+
+fn report_supervisor_error(error: &SupervisorError) -> i32 {
+    output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message()));
+    supervisor_exit_code(error)
+}
+
+fn parse_number(text: &str) -> Option<u64> {
+    let trimmed = text.trim();
+    match trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => trimmed.parse::<u64>().ok(),
+    }
+}
+
+fn handle_get(args: &[String]) -> i32 {
+    let mut control: Option<&'static str> = None;
+    let mut monitor: Option<String> = None;
+    let mut json_output = false;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json_output = true,
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => monitor = Some(value.clone()),
+                    None => return usage_error("get: --monitor requires an identifier"),
+                }
+            }
+            other if control.is_none() => match control_from_name(other) {
+                Some(name) => control = Some(name),
+                None => {
+                    return usage_error(&format!(
+                        "get: `{other}` is not a readable control; brightness and contrast exist"
+                    ))
+                }
+            },
+            other => return usage_error(&format!("get: unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+
+    let Some(control) = control else {
+        return usage_error("get: a control name is required, for example `broiler get brightness --monitor <id>`");
+    };
+    let Some(monitor) = monitor else {
+        return usage_error("get: --monitor <id> is required; run 'broiler monitors list --json' first");
+    };
+
+    let mut supervisor = match open_supervisor() {
+        Ok(supervisor) => supervisor,
+        Err(reason) => return usage_error(&reason),
+    };
+
+    match supervisor.request("read", json!({"monitor": monitor, "control": control})) {
+        Ok(result) => {
+            if json_output {
+                emit_json(&json!({
+                    "monitor": monitor,
+                    "control": control,
+                    "value": result.get("value"),
+                    "minimum": result.get("minimum"),
+                    "maximum": result.get("maximum"),
+                    "backend": result.get("backend"),
+                }));
+            } else {
+                let value = result.get("value").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let minimum = result
+                    .get("minimum")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("?"));
+                let maximum = result
+                    .get("maximum")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("?"));
+                let backend = result
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                output::line(&format!(
+                    "{control} {value} (min {minimum}, max {maximum}, {backend})"
+                ));
+            }
+            EXIT_OK
+        }
+        Err(error) => report_supervisor_error(&error),
+    }
+}
+
+fn handle_set(args: &[String]) -> i32 {
+    let mut control: Option<&'static str> = None;
+    let mut raw_value: Option<String> = None;
+    let mut monitor: Option<String> = None;
+    let mut raw = false;
+    let mut wait = false;
+    let mut json_output = false;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--raw" => raw = true,
+            "--wait" => wait = true,
+            "--json" => json_output = true,
+            "--monitor" => {
+                index += 1;
+                match args.get(index) {
+                    Some(value) => monitor = Some(value.clone()),
+                    None => return usage_error("set: --monitor requires an identifier"),
+                }
+            }
+            other if control.is_none() => match control_from_name(other) {
+                Some(name) => control = Some(name),
+                None => {
+                    return usage_error(&format!(
+                        "set: `{other}` is not a writable control; brightness and contrast exist"
+                    ))
+                }
+            },
+            other if raw_value.is_none() => raw_value = Some(other.to_string()),
+            other => return usage_error(&format!("set: unexpected argument: {other}")),
+        }
+        index += 1;
+    }
+
+    let Some(control) = control else {
+        return usage_error("set: a control name is required, for example `broiler set brightness 42 --monitor <id>`");
+    };
+    let Some(value_text) = raw_value else {
+        return usage_error("set: a value is required");
+    };
+    let Some(monitor) = monitor else {
+        return usage_error("set: --monitor <id> is required; multi-monitor broadcasts are not implicit");
+    };
+    let Some(value) = parse_number(&value_text) else {
+        return usage_error(&format!("set: `{value_text}` is not a number"));
+    };
+
+    let mut supervisor = match open_supervisor() {
+        Ok(supervisor) => supervisor,
+        Err(reason) => return usage_error(&reason),
+    };
+
+    // Read first: a percentage needs the device's own range, and the range must not be assumed.
+    let reading = match supervisor.request("read", json!({"monitor": monitor, "control": control})) {
+        Ok(result) => result,
+        Err(error) => return report_supervisor_error(&error),
+    };
+    let minimum = reading.get("minimum").and_then(serde_json::Value::as_u64);
+    let maximum = reading.get("maximum").and_then(serde_json::Value::as_u64).unwrap_or(0);
+
+    let target = if raw {
+        if let Some(maximum) = reading.get("maximum").and_then(serde_json::Value::as_u64) {
+            let minimum = minimum.unwrap_or(0);
+            if value < minimum || value > maximum {
+                return usage_error(&format!(
+                    "set: native value {value} is outside the reported range {minimum}..={maximum}; nothing was written"
+                ));
+            }
+        }
+        value
+    } else {
+        if value > 100 {
+            return usage_error(&format!(
+                "set: {value} is not a percentage; percentages range 0..=100, use --raw for a native value"
+            ));
+        }
+        match minimum {
+            Some(minimum) => percent_to_native(value as u32, minimum, maximum),
+            None => {
+                return usage_error(
+                    "set: the display reported no minimum for this control, so a percentage cannot be mapped; use --raw",
+                )
+            }
+        }
+    };
+
+    match supervisor.request(
+        "write",
+        json!({"monitor": monitor, "control": control, "value": target}),
+    ) {
+        Ok(result) => {
+            let observed = result
+                .get("observed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let backend = result
+                .get("write_backend")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+
+            if json_output {
+                emit_json(&json!({
+                    "monitor": monitor,
+                    "control": control,
+                    "requested": value,
+                    "unit": if raw { "native" } else { "percent" },
+                    "native_target": target,
+                    "observed": observed,
+                    "verified": observed == target,
+                    "backend": backend,
+                    "waited": wait,
+                }));
+            }
+
+            if observed == target {
+                if !json_output {
+                    output::line(&format!(
+                        "{control} set to {target} and verified by readback ({backend})"
+                    ));
+                }
+                EXIT_OK
+            } else {
+                output::error_line(&format!(
+                    "{}: {control} readback mismatch: wrote {target}, device reports {observed}",
+                    PRODUCT_NAME
+                ));
+                EXIT_TRANSPORT
+            }
+        }
+        Err(error) => report_supervisor_error(&error),
     }
 }
 

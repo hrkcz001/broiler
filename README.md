@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Both executables build, `broiler monitors list --json` and `broiler monitors capabilities --monitor <id> --json` return real read-only data, and the profile/settings/value model is implemented and unit-tested but not yet wired to commands. Nothing else works yet: no profile loading from the CLI, no tray, no write of any kind.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
+**Status: early implementation. Working today: both executables, `monitors list`/`monitors capabilities` (read-only), and `get`/`set brightness|contrast` with readback verification through the isolated DDC worker. The profile and settings model is implemented and unit-tested but not yet wired to commands. Missing: profiles from the CLI, selection dialog, tray, settings window, remaining controls.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
 
 Research and architecture by **Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 
@@ -106,6 +106,7 @@ order = 10
 
 [monitor]
 brightness = 65
+contrast = 80
 ```
 
 Save as `profiles/night.toml`:
@@ -119,9 +120,10 @@ order = 20
 
 [monitor]
 brightness = 15
+contrast = 50
 ```
 
-Those numbers are examples, not a calibration recommendation. Omitted parameters stay untouched. IDs are unique lowercase ASCII slugs; `name` is the visible label; sort order is `order`, then ID; renaming a file does not change its ID. Unknown keys, duplicate IDs, unsupported schema versions, empty profiles and invalid units are errors.
+Those numbers are examples, not a calibration recommendation. Contrast belongs to a profile the same way brightness does: it is written only when the file names it, and a display that reports it unavailable in the current picture or HDR mode reports `blocked_by_mode` instead of skipping silently. Omitted parameters stay untouched. IDs are unique lowercase ASCII slugs; `name` is the visible label; sort order is `order`, then ID; renaming a file does not change its ID. Unknown keys, duplicate IDs, unsupported schema versions, empty profiles and invalid units are errors.
 
 ### Percentages, native integers and hexadecimal choices
 

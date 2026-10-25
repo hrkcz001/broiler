@@ -128,15 +128,53 @@ Limits recorded honestly:
 - Planning uses device metadata supplied by tests. Real per-control metadata for the MSI is still
   unread beyond brightness, contrast and the capabilities string.
 
+## G4 — bounded backend, brightness only
+
+Evidenced on 2026-10-25. This is the first gate with real hardware writes.
+
+| Check | Command | Observed |
+|---|---|---|
+| Unit and integration tests | `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat test` | 155 passed, 0 failed |
+| Verified brightness write | `broiler set brightness 5 --monitor mon-227062c49310910f --wait --json` | exit 0, `{"native_target": 5, "observed": 5, "verified": true, "backend": "dxva2-high-level"}` |
+| Independent readback | `broiler get brightness --monitor mon-227062c49310910f` in a fresh process | `brightness 5 (min 0, max 100, dxva2-high-level)` |
+| Baseline restored | `broiler set brightness 0 ...` then `broiler get brightness ...` | `set to 0 and verified by readback`, readback `0` |
+| Verified contrast write | `broiler set contrast 51 ...` then `get contrast` | verified, `contrast 51`; restored to `50` and verified |
+| Unknown monitor | `broiler get brightness --monitor mon-0000000000000000` | exit 4, `unknown_monitor` |
+| Percentage above 100 | `broiler set brightness 200 ...` | exit 2, nothing written |
+| Native value out of range | `broiler set brightness 0x200 --raw ...` | exit 2, `outside the reported range 0..=100; nothing was written` |
+| Unlisted control | `broiler get sharpness ...` | exit 2, only brightness and contrast exist |
+| Implicit broadcast refused | `broiler set brightness 10` (no `--monitor`) | exit 2 |
+| No worker left behind | `Get-Process broiler-tray` before and after each operation | 0 processes before and after |
+| Hung worker contained and reaped | test `supervisor::tests::a_hung_worker_is_contained_and_reaped` | a silent child that never answers is killed after the operation bound; `Termination { confirmed: true }`; supervisor not quarantined |
+| Circuit breaker | test `supervisor::tests::a_dead_worker_is_reported_and_the_circuit_breaker_opens` | after three consecutive failures the backend refuses further traffic with `Quarantined` |
+| Frame limits | `src/ipc.rs` tests | oversized, truncated, length-mismatched and malformed frames are rejected, never panicked on |
+
+Honest limits:
+
+- "No UI thread blocks" cannot be tested because no UI exists yet: both binaries are console-driven at
+  this point. What is evidenced is that the calling process performs no Dxva2 call at all — every read
+  and write goes through `broiler-tray.exe --internal-ddc-worker` over inherited pipes, and the parent
+  only waits on that pipe with a deadline.
+- The 100 ms inter-transaction gap, retry policy and verification are exercised against the fake
+  backend and a scripted clock; on hardware each CLI invocation performs one write and one readback, so
+  the gap between two transactions has not been observed yet.
+- Only `0x10` and `0x12` have a write path. Every other control is refused by the worker's control
+  allowlist, which is tested (`control_names_are_an_allowlist`).
+- The competing-automation condition was checked: no Twinkle Tray or other DDC automation process was
+  running during these writes (`Get-Process` filtered for monitor-control tools and `NVDisplay.Container`
+  only).
+
 ## Hardware evidence
 
-Only reads have been performed. No write of any kind has been made by this project.
+Every write below was a deliberate, minimal, reversible test adjustment with a recorded baseline that was restored and verified. There is no automatic restore-on-exit behaviour in the product.
 
 | Date | Monitor | Operation | Result |
 |---|---|---|---|
 | 2026-10-25 | MSI MAG275R (HDMI, `\\.\DISPLAY4`) | `GetMonitorBrightness`, `GetMonitorContrast`, VCP read `0x10`/`0x12`, capabilities string | brightness 0 (min 0, max 100), contrast 50 (min 0, max 100), VCP `0x10` current 0 max 100, VCP `0x12` current 50 max 100, code type `set_parameter`, capabilities 238 chars MCCS 2.1 |
 | 2026-10-25 | BOE0852 (internal panel) | all-paths topology query, EDID registry read | detected, classified built-in, excluded from control, never probed |
+| 2026-10-25 | MSI MAG275R | `set brightness 5` (baseline 0) | write accepted, readback 5, verified inside the worker and by a fresh process, baseline restored to 0 and verified |
+| 2026-10-25 | MSI MAG275R | `set contrast 51` (baseline 50) | write accepted, readback 51, restored to 50 and verified |
 
 ## Gates not yet evidenced
 
-G4 through G12 have no evidence of any kind. They are not implemented.
+G5 through G12 have no evidence of any kind. They are not implemented.

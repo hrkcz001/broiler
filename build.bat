@@ -25,6 +25,9 @@ if errorlevel 1 (
 
 if /i "%~1"=="test" (
     cargo test %2 %3 %4 %5
+) else if /i "%~1"=="clean" (
+    rem Also needed after moving the working tree: cached fingerprints carry the old paths.
+    cargo clean
 ) else (
     cargo build %*
 )

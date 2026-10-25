@@ -365,6 +365,68 @@ impl Client {
     }
 }
 
+/// Render the DACL of a live pipe instance as SDDL.
+///
+/// This is the check that can actually be made on a single-session machine: it shows which principal
+/// the kernel holds in the pipe's access control list. It proves the DACL is scoped and that no
+/// `Everyone` or anonymous entry exists; it does not simulate a second logon session.
+pub fn dacl_sddl(connection: &ServerConnection) -> io::Result<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            connection.handle.raw(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("GetSecurityInfo failed with Win32 error {status}"),
+        ));
+    }
+
+    let mut text: *mut u16 = std::ptr::null_mut();
+    let mut length: u32 = 0;
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            &mut length,
+        )
+    };
+    if ok == 0 {
+        unsafe { LocalFree(descriptor as *mut c_void) };
+        return Err(last_error("ConvertSecurityDescriptorToStringSecurityDescriptorW"));
+    }
+
+    let mut end = 0usize;
+    unsafe {
+        while *text.add(end) != 0 {
+            end += 1;
+        }
+    }
+    let sddl = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, end)) };
+    unsafe {
+        LocalFree(text as *mut c_void);
+        LocalFree(descriptor as *mut c_void);
+    }
+    Ok(sddl)
+}
+
 /// True when a coordinator already owns this endpoint.
 pub fn server_exists(endpoint_name: &str) -> bool {
     matches!(Client::connect(endpoint_name, Instant::now() + std::time::Duration::from_millis(50)), Ok(_))
@@ -383,6 +445,29 @@ mod tests {
         assert!(first.name.starts_with("\\\\.\\pipe\\broiler.v1."));
         // The token is a hash, not the SID itself.
         assert_eq!(first.name.rsplit('.').next().map(str::len), Some(16));
+    }
+
+    #[test]
+    fn the_pipe_dacl_names_only_the_logon_sid() {
+        let endpoint = local_endpoint().expect("endpoint");
+        let unique = format!("{}.sddl{}", endpoint.name, std::process::id());
+        let server = ServerConnection::create(&endpoint.with_name(&unique), true).expect("server");
+
+        let sddl = dacl_sddl(&server).expect("sddl");
+        // Exactly one access-allowed ACE, and it names the logon SID rather than a group.
+        assert_eq!(
+            sddl.matches("(A;;").count(),
+            1,
+            "expected exactly one ACE: {sddl}"
+        );
+        assert!(sddl.contains("S-1-5-5-"), "expected a logon SID ACE: {sddl}");
+        // No Everyone (WD), Anonymous (AN), Authenticated Users (AU) or Users (BU) grant.
+        for trustee in [";WD;", ";AN;", ";AU;", ";BU;", ";OW;"] {
+            assert!(!sddl.contains(trustee), "{trustee} must not appear: {sddl}");
+        }
+        // Not a null DACL: a null DACL renders as "D:NO_ACCESS_CONTROL".
+        assert!(!sddl.contains("NO_ACCESS_CONTROL"), "null DACL: {sddl}");
+        println!("pipe DACL: {sddl}");
     }
 
     #[test]

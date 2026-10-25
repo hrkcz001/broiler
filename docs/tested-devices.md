@@ -180,6 +180,7 @@ claimed beyond what the commands printed.
 | Single instance | test `instance::tests::the_second_acquisition_reports_an_existing_owner` | second acquisition reports an existing owner; `broiler start` printed `already running` |
 | Endpoint naming | test `pipe::tests::the_endpoint_name_is_stable_and_scoped_to_the_logon_sid` | name is `\\.\pipe\broiler.v1.<16 hex>`, derived from a hash of the logon SID |
 | First-instance flag | test `pipe::tests::first_instance_flag_detects_an_existing_server` | a second first-instance creation fails |
+| Pipe DACL, read back from the kernel | test `pipe::tests::the_pipe_dacl_names_only_the_logon_sid` (`--nocapture`) | `D:(A;;0x12019f;;;S-1-5-5-0-1517454)` — exactly one ACE, one logon-session SID, no `WD`/`AN`/`AU`/`BU`, not a null DACL |
 | Start and status | `broiler start`, `broiler status --json` | `coordinator started`; JSON reported `running: true`, one monitor, zero profiles, settings path |
 | Read through the coordinator | `broiler get brightness --monitor mon-227062c49310910f` | `brightness 0 (min 0, max 100, dxva2-high-level)` from the resident process |
 | Two concurrent CLI clients | two `broiler get` invocations started together | both exit 0 with correct values from the one coordinator |
@@ -208,9 +209,12 @@ Not evidenced, and therefore not claimed:
   physical monitor on one HDMI port, so selection, apply-to-all-selected and identity ambiguity across
   two real displays were never observed. They are covered by fake transports with two and three
   monitors in the lifecycle and coordinator tests, and are marked untested on hardware.
-- **A wrong-session client.** No second terminal session fixture exists here, so the logon-SID
-  boundary has not been tested from another session. The DACL construction and the endpoint scoping
-  are code-level only; treat this as untested rather than verified.
+- **A wrong-session client.** The kernel-side DACL has been read back and contains exactly one ACE for
+  this logon session's SID, with no `Everyone`, `Anonymous`, `Authenticated Users` or `Users` entry
+  (see the SDDL row above). What remains untested is a positive attempt from a *different* Windows
+  logon session: this machine has one interactive logon, so no such client can be created without a
+  second account or a second session. Treat the cross-session rejection as untested; the scoping it
+  relies on is verified.
 - **`--refresh`** is accepted and ignored; status is a snapshot taken when the coordinator started,
   so observation age is not yet reported.
 - **`startup.launch_at_login` records intent only.** The Run key is not written yet, so the setting

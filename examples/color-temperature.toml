@@ -1,0 +1,20 @@
+# Reference only. Keep exactly one color_temperature form in a real profile.
+schema_version = 1
+id = "warm-reference"
+name = "Warm"
+icon = "dusk"
+order = 40
+
+[monitor]
+brightness = 30
+
+# 1. Kelvin intent: uses the supported temperature setting, never an RGB approximation.
+color_temperature = "6500k"
+# color_temperature = { kelvin = 6500 }
+
+# 2. Exact discrete preset: VCP 0x14, native value 0x05 (standard simple label 6500 K).
+# color_temperature = { vcp = 0x14, raw = 0x05 }
+
+# 3. Exact native temperature request: VCP 0x0C, raw value from YOUR monitor.
+#    0x23 is illustrative and is not a verified value for any specific display.
+# color_temperature = { vcp = 0x0C, raw = 0x23 }

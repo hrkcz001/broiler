@@ -1,4 +1,5 @@
 # Reference only. Do not copy this file into profiles unchanged.
+# Color temperature is absent on purpose: it cannot coexist with a preset or RGB gains.
 schema_version = 1
 id = "coding-reference"
 name = "Coding"

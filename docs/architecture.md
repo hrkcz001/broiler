@@ -10,8 +10,8 @@ Status: proposed design, not an implementation. No Rust source, Cargo project, r
 - Use direct Win32 bindings through `windows-sys`, with narrow safe wrappers and RAII for handles. Use Dxva2 monitor configuration APIs, preferring high-level controls where available and limiting low-level VCP operations to explicit needs, not a custom I2C driver or GPU-vendor API.
 - Keep a single command coordinator and a single active DDC executor. Isolate potentially blocking DDC calls in an on-demand child process using the tray executable's internal worker mode.
 - Use local named pipes for CLI-to-daemon IPC, with explicit logon-SID ACLs and remote clients rejected. Do not use TCP or HTTP.
-- Support brightness and contrast as the baseline control set. Expose RGB gains, color presets, volume, and audio-only mute conditionally. Never equate a standardized VCP code with a universally reliable implementation.
-- Do not implement automatic startup profile writes, background DDC polling, animation, vendor hacks, arbitrary raw VCP writes, input switching, power-off, or factory resets in v1.
+- Support brightness and contrast as the baseline control set. Color temperature is required in v1, with discrete hexadecimal preset values and native temperature-request values, not just percentage sliders. Expose RGB gains, color presets, volume, and audio-only mute conditionally. Never equate a standardized VCP code with a universally reliable implementation.
+- Do not implement automatic startup profile writes in the multi-profile path, background DDC polling, animation, vendor hacks, arbitrary raw VCP writes, input switching, power-off, or factory resets in v1.
 
 ## 2. Evidence and reliability boundary
 
@@ -124,8 +124,8 @@ order = 30
 
 [monitor]
 brightness = 35
-contrast = 70
-color_preset = "user1"
+contrast = { percent = 70 }
+color_preset = 0x0B # Native user1 preset, subject to device validation
 volume = 20
 mute = false
 
@@ -143,10 +143,10 @@ Schema rules:
 2. IDs are immutable lowercase ASCII slugs, unique across the directory; filenames may change independently. `name` is a nonempty display label; `icon` must be a known built-in name; `order` defaults to 100.
 3. Sort by `order`, then ID. Cycle uses exactly this order. Profile state is per monitor, never one global current index.
 4. All controls are optional, but a profile must contain at least one control. Omitted controls are untouched; no guessed default writes.
-5. Brightness, contrast, RGB gains, and volume use integer percentages 0 through 100, not raw MCCS values. Normalize against the validated native range, round once, and retain the effective native target. Volume requires a version-correct continuous subrange and excludes any reserved encodings. If that range cannot be established, volume is unsupported.
-6. RGB gain channels may be independently omitted. If gains and `color_preset` coexist, only `user1`, `user2`, or `user3` presets are permitted. An explicit non-user preset plus gains is a validation error, not an ordering trick. Gains alone require the current mode to support user adjustment; do not silently switch picture modes.
-7. Named color presets: `srgb`, `native`, `4000k`, `5000k`, `6500k`, `7500k`, `8200k`, `9300k`, `10000k`, `11500k`, `user1`, `user2`, `user3`. These are requested standard meanings, not guarantees of color accuracy. Accept only a known mapping for the reported MCCS version and a value supported by that device.
-8. Do not expose a fake universal `color_temperature = 4500` converted into RGB percentages. That would be neither calibrated temperature control nor equivalent to MCCS temperature commands.
+5. Use typed values, not a universal 0..100 representation. Brightness, contrast, RGB gains, and volume accept a bare integer percentage 0..100, an explicit `{ percent = 35 }`, or an explicit `{ raw = 0x80 }` native value. Exactly one unit key is allowed. TOML hexadecimal integers are integers, so a bare `brightness = 0x40` means 64 percent, not native value 64; native values always require the `raw` tag. Raw continuous values must fit the validated device range and permitted subrange; never normalize, clamp, or reinterpret them as percentages. Volume excludes reserved values in both modes. If its safe subrange cannot be established, volume is unsupported. Hexadecimal is presentation syntax, not a distinct runtime integer type. Preserve syntax during comment-preserving edits where practical and print both decimal/hex in diagnostics.
+6. RGB gain channels may be independently omitted. If gains and `color_preset` coexist, only a validated user preset is permitted: names `user1`/`user2`/`user3`, or a raw value with established equivalent semantics. An explicit non-user or semantically unknown preset plus gains is a validation error, not an ordering trick. Gains alone require the current mode to support user adjustment; do not silently switch picture modes. `color_temperature` cannot coexist with `color_preset` or RGB gains in one profile; these are alternative white-point mechanisms, not ordered duplicate writes.
+7. `color_preset` accepts a named string, a bare native integer such as `0x05`, or `{ raw = 0x05 }`; never percentages. Named color presets: `srgb`, `native`, `4000k`, `5000k`, `6500k`, `7500k`, `8200k`, `9300k`, `10000k`, `11500k`, `user1`, `user2`, `user3`. These are requested standard meanings, not guarantees of color accuracy. Accept only a known mapping for the reported MCCS version and a value supported by that device.
+8. `color_temperature` is an optional profile field whose implementation is required in v1. Accept `"6500k"` or `{ kelvin = 6500 }` for a supported actual temperature setting; `{ vcp = 0x14, raw = 0x05 }` for an exact discrete color/temperature preset code; and `{ vcp = 0x0C, raw = 0x23 }` for an exact native temperature-request value. The last numeric example is illustrative, not a claimed encoding for this monitor. Require exactly one of these forms; reject bare integers, percentages, and ambiguous mixed unit tables. Never synthesize temperature through RGB ratios, gamma ramps, or a dimming overlay. See the temperature section below for backend choice, support evidence, and validation.
 9. Unknown keys, duplicate IDs, out-of-range values, unknown icon names, empty profiles, and conflicting modes are errors with file/line/column diagnostics.
 10. At startup parse every `profiles/*.toml` file before applying anything. Invalid files abort profile activation rather than reducing a multi-profile folder to one valid profile and unexpectedly applying it. Reload is transactional: keep the last good registry if any new file fails.
 11. Ignore unrelated extensions and temporary editor files. No scripts, includes, environment interpolation, or executable hooks in profiles.
@@ -160,7 +160,8 @@ The control codes and version distinctions below are drawn from the ddcutil MCCS
 |---|---|---|
 | `brightness` | `0x10` | Baseline; targeted read probe even if capabilities omit it. Validate native maximum before write. |
 | `contrast` | `0x12` | Baseline but optional; may be unavailable in particular picture/HDR modes. Never adjust by default. |
-| `color_preset` | `0x14` | Conditional; version-aware noncontinuous mapping and confirmed device values. |
+| `color_temperature` | High-level temperature, `0x14`, or `0x0C` | Required v1 feature; Kelvin, discrete hex preset, or native request forms. Query actual device support. |
+| `color_preset` | `0x14` | Conditional; named or native decimal/hex value; version-aware noncontinuous mapping and confirmed device values. |
 | `rgb_gain.red` | `0x16` | Conditional; current or explicitly selected user color mode must permit gains. |
 | `rgb_gain.green` | `0x18` | Same policy. |
 | `rgb_gain.blue` | `0x1A` | Same policy. |
@@ -169,15 +170,29 @@ The control codes and version distinctions below are drawn from the ddcutil MCCS
 
 Mute deserves special caution. The feature is named Audio mute/Screen blank; MCCS 2.2 introduces complex screen-blanking semantics. The old simple values are 1 for mute and 2 for unmute, not a universal 0/1 convention.[5] In v1, allow `mute` only for a confirmed audio-only encoding and validated device/version combination. Otherwise report unsupported; never guess, write 0, or risk screen blanking. The same caution applies when the version report is missing or contradictory.
 
+Temperature request `0x0C` is required v1 scope; increment `0x0B` is read-only.
+
 Standardized but deliberately excluded from the ordinary v1 profile schema:
 
-- `0x0C` color-temperature request and `0x0B` increment: version-/device-dependent scaling and limited validation; do not claim arbitrary Kelvin support.
+
 - `0x87` sharpness: classification differs across MCCS versions; lower practical value than the core controls and not a universally continuous slider.[5]
 - `0x60` input source and `0xD6` power mode: can remove the control channel or visible image; out of scope for routine safe profile switching.[5]
 - Factory reset, restore defaults, DDC disable, save-current-settings/EEPROM writes, geometry, orientation, overdrive, dynamic contrast, HDR toggles, gamma tables, vendor-specific codes, and arbitrary numeric `set-vcp` writes: excluded.
 - `0xDC` application/display mode is not the meaning of the profile name or icon. A `gaming` icon does not switch an unknown firmware game mode.[5]
 
 Conditional features are part of the common config schema but not automatically enabled for every display. Status distinguishes `advertised`, `readable`, `write_verified`, `unsupported`, `blocked_by_mode`, `unverified`, and `unavailable`; evidence can overlap and must not be compressed into a misleading single supported boolean.
+
+### Color temperature: required v1 support
+
+The user already uses monitor-side temperature control. This is a requirement and user-reported working behavior, not proof of the VCP code or values used on the MSI. Read the actual settings and capabilities; do not infer encoding from an OSD label.
+
+- **Kelvin intent**: `color_temperature = "6500k"` or `{ kelvin = 6500 }`. Prefer `Get/SetMonitorColorTemperature` when the requested value is supported. Win32 `MC_COLOR_TEMPERATURE` enum ordinals are NOT native VCP preset values.[24][25] When high-level support is absent, choose a validated matching `0x14` preset or a validated `0x0C` request mapping before any write. Never fall back after an uncertain write or silently round to another temperature.
+- **Exact discrete preset**: `color_temperature = { vcp = 0x14, raw = 0x05 }`. This selects native value `0x05` of VCP `0x14`, not VCP code `0x05`, five percent, or a Win32 enum ordinal. The simple standard mapping labels it 6500 K; verify the model/version meaning.[5] `color_preset = 0x05` is the alternative general-preset spelling; the two fields cannot coexist.
+- **Exact temperature request**: `color_temperature = { vcp = 0x0C, raw = 0x23 }`. The value is an illustrative native request, not a claim about this monitor, 35 percent, or necessarily 6500 K. `0x0B` supplies read-only increment metadata.[5] A Kelvin conversion such as `3000 + request * increment` must be validated against the actual device/version baseline, increment, range and resolution before use. Unknown conversion does not prohibit a validated explicit native request: report native units without inventing Kelvin.
+
+Required `broiler monitors capabilities --monitor <id> --json` diagnostics: known temperatures, native discrete values in decimal and hex, labels where known, current native value, min/max or discrete set as appropriate, increment metadata, evidence provenance, identity/path context and chosen backend. Do not invent finite preset sets for a continuous request. Advertised, observed and user/model-validated evidence remain distinct. A missing capabilities entry is not proof of unsupported control. Provide an explicit supervised known-value validation path (`broiler monitors validate-value color-temperature 0x05 --vcp 0x14 --monitor <id> --confirm-write`) that performs one selected allowlisted write/readback, records observed evidence and prompts for actual visual confirmation before marking it user-validated. No enumeration of values, force flag, arbitrary VCP write, or inferred Kelvin labels. Confirmation failure or unavailable interaction must leave validation incomplete. Existing positive range/discrete/mode contradictions fail closed; incomplete capability data can be supplemented by this explicit known-value test, not an automatic probe. Temperature changes may modify gains, which must be re-read.[24]
+
+Raw values do not bypass range checks or permit arbitrary VCP access. Only the named control registry and temperature VCP selectors `0x14`/`0x0C` are writable. Never synthesize temperature with RGB ratios, gamma ramps or software overlays. Required implementation tests cover exact integer forwarding above 100, hex/decimal equality, backend enum separation, conflicting white-point controls, range/allowed-set validation, and conversion representability.
 
 ### Execution rules
 
@@ -186,9 +201,9 @@ Conditional features are part of the common config schema but not automatically 
 - Build an apply plan first. For `unsupported = fail`, preflight every requested control on every explicit target before the first write. This catches missing support but cannot make a multi-monitor hardware operation atomic.
 - For `skip`, skip only positively unsupported controls and return their names. Unknown transport failures stop that monitor's operation. If nothing can be applied, report `not_applied`, not success.
 - Serialize DDC globally at first; no overlapping monitor transactions and no concurrent CLI writer. Start with 100 ms minimum between completed transactions, one bounded retry for transient reads; no automatic replay of a timed-out or outcome-unknown write, and an initial 2 s worker-operation watchdog. These are proposed conservative defaults to tune against real measurements, not protocol guarantees.
-- Order: explicitly requested user preset, settle/re-read relevant ranges, gains, contrast, brightness, volume, mute. Re-read after a preset because it may reset dependent values. Stop on a dependency failure; never write gains assuming a failed user-mode change succeeded.
+- Order: explicitly requested color-temperature operation OR user preset, settle/re-read relevant ranges and dependent color state, gains when permitted, contrast, brightness, volume, mute. Re-read after a preset because it may reset dependent values. Stop on a dependency failure; never write gains assuming a failed user-mode change succeeded.
 - Coalesce queued writes for the same monitor/field and rapid cycle requests to their latest intended target; do not enqueue an unbounded number of profile applications. Retain one in-flight transaction plus bounded pending intent.
-- Read back after settling. Keep commanded percentage, native target, observed native value, timestamp, and verification status separate. Match rounded native values, not an unrepresentable requested percentage. Any further tolerance must be backed by observed model behavior, never silently widened.
+- Read back after settling. Keep the requested typed value and unit, effective native target and VCP/backend, observed native value, timestamp, and verification status separate. Kelvin and discrete settings are not labelled percentages. Match rounded native values, not an unrepresentable requested percentage. Any further tolerance must be backed by observed model behavior, never silently widened.
 - Report success only for verified applied fields. A partial operation is `partial`; a readback mismatch is not a successful profile. Preserve the last fully applied profile ID separately from any pending/partial intent.
 - No rollback on every error: rollback creates additional writes and cannot restore a locked firmware. Record what changed and leave a clear partial result.
 - Never periodically save to monitor nonvolatile memory, spam retries, fight another control program, or restore an old snapshot on exit. Settings remain as last commanded.
@@ -349,7 +364,7 @@ Use a per-logon local mutex and explicit security descriptors. Endpoint naming i
 
 Wire format: 32-bit little-endian payload length followed by UTF-8 JSON, maximum 64 KiB per frame initially. `protocol_version`, `request_id`, `method`, and typed `params` are required. Each connection is bounded; normal CLI uses one request per connection. Large monitor diagnostics use explicit truncation/pagination rather than unlimited allocation.
 
-Methods: `ping`, `status`, `monitors.list`, `monitors.refresh`, `monitors.select`, `profiles.list`, `profiles.reload`, `profiles.validate`, `profiles.apply`, `profile.next`, `parameters.get`, `parameters.set`, `settings.get`, `settings.update`, `startup.status`, `ui.settings`, `ui.monitors`, `ui.flyout`, `paths.profiles`, `open.profiles`, `open.repository`, `shutdown`, and `operations.get`.
+Methods: `ping`, `status`, `monitors.list`, `monitors.refresh`, `monitors.select`, `profiles.list`, `profiles.reload`, `profiles.validate`, `profiles.apply`, `profile.next`, `parameters.get`, `parameters.set`, `monitors.capabilities`, `monitors.validate_value`, `settings.get`, `settings.update`, `startup.status`, `ui.settings`, `ui.monitors`, `ui.flyout`, `paths.profiles`, `open.profiles`, `open.repository`, `shutdown`, and `operations.get`.
 
 Commands return either a completed result or `accepted` with an operation ID; `--wait` waits using bounded polling of `operations.get`. Return per-monitor/per-control outcomes, skipped fields, verification, and typed errors such as `unsupported`, `invalid_config`, `ambiguous_monitor`, `transport_error`, `timeout`, `busy`, `partial`, and `protocol_mismatch`. A pipe connection timeout does not imply a DDC operation was rolled back. Operation IDs plus a bounded recent-ID cache prevent accidental retrying of an already accepted request. No strict exactly-once guarantee across a daemon crash is claimed.
 
@@ -371,9 +386,17 @@ broiler profiles validate
 broiler profile apply night --monitor <id> [--wait]
 broiler profile apply night --all-selected [--wait]
 broiler profile next --monitor <id>
+broiler monitors capabilities --monitor <id> [--json]
+broiler monitors validate-value color-temperature 0x05 --vcp 0x14 --monitor <id> --confirm-write
 broiler get brightness --monitor <id>
+broiler get color-temperature --monitor <id>
 broiler set brightness 42 --monitor <id> [--wait]
 broiler set rgb-gain 100,95,85 --monitor <id> [--wait]
+broiler set brightness 0x80 --raw --monitor <id> [--wait]
+broiler set color-preset 0x05 --monitor <id> [--wait]
+broiler set color-temperature 6500 --kelvin --monitor <id> [--wait]
+broiler set color-temperature 0x05 --vcp 0x14 --raw --monitor <id> [--wait]
+broiler set color-temperature 0x23 --vcp 0x0C --raw --monitor <id> [--wait]
 broiler settings get [key] [--json]
 broiler settings set tray.left_click cycle
 broiler settings set profiles.unsupported fail
@@ -405,7 +428,7 @@ Proposed targets: idle daemon private bytes below 15 MiB, no periodic DDC traffi
 Automated tests:
 
 - TOML syntax and schema, unknown keys, profile conflicts, duplicate IDs, deterministic sort, comment-preserving settings writes.
-- Percentage/native mapping, zero/bogus maxima, volume reserved ranges, noncontinuous preset maps, version-dependent mute, unsupported policy, missing RGB dependencies.
+- Typed percent/raw/Kelvin/discrete parsing, decimal/hex equivalence, raw values above 100, explicit VCP routing, temperature/preset/gain conflicts, unsupported discrete values, correct Kelvin backend and increment mapping, no fake RGB-temperature fallback, percentage/native mapping, zero/bogus maxima, volume reserved ranges, noncontinuous preset maps, version-dependent mute, unsupported policy, missing RGB dependencies.
 - Every lifecycle branch: 0/1/many monitors and profiles, invalid profile abort, empty selection, saved missing monitors, reload transitions, hotplug grace.
 - Fake backend fault injection: delayed/hung calls, partial writes, mismatch, disconnect mid-profile, no rollback assumptions, worker crash, operation deduplication.
 - IPC framing limits, malformed JSON, idle clients, version mismatch, concurrent clients, shutdown, ACL/session/remote rejection, server-name collision.
@@ -424,15 +447,15 @@ GitHub-hosted CI cannot validate physical DDC behavior. Label fake-backend tests
 
 ## 12. Implementation sequence and gates
 
-1. **Publish design-only foundation.** Public repo `hrkcz001/broiler`, Apache-2.0 license, NOTICE `Copyright hrkcz001 2026`, README crediting Hermes Agent as design author, this architecture, and sample configs. No pretend release or runnable install instructions. Gate: sample TOML parses and source citations resolve.
+1. **Publish design-only foundation.** Public repo `hrkcz001/broiler`, Apache-2.0 license, NOTICE `Copyright hrkcz001 2026`, README crediting Hermes Agent as design author, this architecture, and sample configs. No pretend release; document future install commands with an explicit unavailable-until-release warning. Gate: sample TOML parses and source citations resolve.
 2. **Read-only topology/DDC spike.** Establish x86-64 MSVC build, raw Windows topology-to-physical-handle mapping, friendly names/EDID identity, allowlisted reads, capabilities evidence, blocking behavior, worker bootstrap. No write tests until monitor/target identity is unambiguous. Gate: stable selection survives reconnect or explicitly reports ambiguity.
 3. **Domain/config tests first.** Implement typed settings/control registry, profile validation and sorting, normalization, fake backend, lifecycle state machine, partial results, and transactional reload. Gate: tests cover all startup branches before enabling hardware writes.
 4. **Bounded DDC backend.** RAII, worker/job supervision, private channel, sequential executor, operation deadlines, coalescing, circuit breaker, reads/range validation, then brightness-only writes/readback on a deliberate target. Gate: verified brightness operation, no UI involvement, and successful hung-worker recovery tests. Conditional controls remain disabled until individually validated.
 5. **Secure coordinator/CLI.** Single instance, explicit ACL local pipes, framing, typed errors, public commands, detached GUI bootstrap, transient headless operations, status snapshots. Gate: concurrent clients share one executor; negative security and timeout tests pass.
-6. **Required startup UX.** Selection dialog, remembered identities and zero/one/many-profile behavior; settings remain reachable without normal residency. Gate: full lifecycle table with fake backend plus manual single-monitor one-shot test.
+6. **Required startup UX.** Selection dialog, remembered identities and zero/one/many-profile behavior; settings remain reachable without normal residency. Gate: full lifecycle table with fake backend plus manual single-monitor one-shot test, including the selection dialog at interactive launch AND logon whenever more than one monitor is available without a remembered choice.
 7. **Tray and icon pipeline.** One icon per target, named monochrome assets, badges, per-monitor state, cycle mode, native Settings/Exit menu, shell restart recovery. Gate: mixed DPI, overflow and multi-monitor identity checks pass without leaked GDI handles.
 8. **Flyout and settings.** Modeless profile list, correct monitor title, keyboard/Narrator behavior, focus/position handling, pending/partial/error states; all requested settings/actions and exact CLI parity. Gate: no settings control in flyout and no DDC blocking on UI thread.
-9. **Optional control validation.** Contrast, presets/gains, speaker volume, audio-only mute in that order. Gate each device/version combination independently; document unsupported cases. Do not widen support just because a code appears in capabilities.
+9. **Remaining control validation.** Required color temperature (including exact hex preset and native request paths), contrast, presets/gains, speaker volume, audio-only mute. Temperature must not be deferred out of v1 or replaced by RGB approximation. Gate each device/version combination independently; document unsupported cases. Do not widen support just because a code appears in capabilities.
 10. **Lifecycle and diagnostics hardening.** Wake/hotplug, worker faults, saved-selection ambiguity, invalid reloads, external changes, concurrent app behavior, log caps/privacy, performance measurement. Gate: measured resource report and actual device matrix.
 11. **CI and release.** Windows formatting/lint/tests/build, schema/icon checks, locked dependencies, MSVC x64 release ZIP with both EXEs, LICENSE/NOTICE and examples; SHA256SUMS, release notes, and GitHub assets. Pin workflow actions to reviewed revisions. Gate: download the uploaded archive and verify hashes and CLI smoke tests; do not claim code signing without a signing identity.
 12. **Scoop publication.** Add the verified release manifest to the existing bucket, wait for its real CI, install from it, exercise CLI/GUI/autostart and upgrade/uninstall. Gate: successful actual Scoop installation and no configuration loss. Publish only then.
@@ -473,6 +496,8 @@ The repository license is Apache-2.0; copyright holder is exactly `hrkcz001 2026
 - A stable monitor identity is conditional on usable identity evidence, not guaranteed by a hash.
 - A silent zero-monitor exit means the app cannot later detect hotplug without being restarted.
 - A worker watchdog protects application responsiveness, not arbitrary monitor firmware.
+- Color temperature and explicit native decimal/hex values are required v1 scope, not optional future enhancements.
+- The multi-monitor selection dialog appears at logon too; there is no silent select-all exception.
 - No published Scoop package exists until an actual binary release, checksum, bucket CI run, and install test exist.
 
 Sources:
@@ -497,3 +522,5 @@ Sources:
 [21] https://learn.microsoft.com/en-us/windows/win32/monitor/about-monitor-configuration
 [22] https://learn.microsoft.com/en-us/windows/win32/monitor/using-the-high-level-monitor-configuration-functions
 [23] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
+[24] https://learn.microsoft.com/en-us/windows/win32/api/highlevelmonitorconfigurationapi/nf-highlevelmonitorconfigurationapi-setmonitorcolortemperature
+[25] https://learn.microsoft.com/en-us/windows/win32/api/highlevelmonitorconfigurationapi/ne-highlevelmonitorconfigurationapi-mc_color_temperature

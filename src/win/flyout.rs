@@ -11,20 +11,23 @@
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, GetStockObject, MonitorFromPoint, DEFAULT_GUI_FONT, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    DeleteObject, DrawFocusRect, DrawTextW, Ellipse, FillRect, GetMonitorInfoW, GetStockObject,
+    GetSysColor, GetSysColorBrush, MonitorFromPoint, SelectObject, SetBkMode, SetTextColor,
+    COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+    DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, TRANSPARENT,
 };
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, GetWindowLongPtrW, IsWindow,
-    LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, HMENU, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_SHOW, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU,
+    IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::win::wide::to_wide;
@@ -61,6 +64,8 @@ pub enum State {
 pub struct Item {
     pub id: String,
     pub name: String,
+    /// The profile's icon name, drawn to the left of the name.
+    pub icon: String,
     pub state: State,
 }
 
@@ -80,8 +85,10 @@ pub fn title_text(index: usize, name: &str) -> String {
 /// One row's caption. The state is spelled out because a radio button alone cannot say "failed".
 pub fn item_text(name: &str, state: &State) -> String {
     match state {
-        State::Current => format!("{name} (current)"),
-        State::Normal => name.to_string(),
+        // The marker to the left of the name says which profile is current; the caption does not
+        // repeat it. A state that is not "nothing special" is still spelled out, because a dot cannot
+        // express "this is being written right now" or why it failed.
+        State::Current | State::Normal => name.to_string(),
         State::Pending => format!("{name} (applying\u{2026})"),
         State::Failed(reason) => format!("{name} (failed: {reason})"),
     }
@@ -122,7 +129,12 @@ struct Metrics {
     title_height: i32,
     row_height: i32,
     gap: i32,
+    /// Icon and marker size in pixels.
+    icon: i32,
 }
+
+/// `BS_OWNERDRAW`: the row is drawn by `WM_DRAWITEM`.
+const BS_OWNERDRAW: u32 = 0x0000000B;
 
 impl Metrics {
     fn new(dpi: u32) -> Metrics {
@@ -131,8 +143,11 @@ impl Metrics {
             width: scale(260),
             margin: scale(12),
             title_height: scale(30),
-            row_height: scale(30),
+            // Rows are taller than the icon, so a 20 px glyph sits in a 34 px row instead of looking
+            // lost: the notification area's own 16 px icon is the wrong reference for a menu.
+            row_height: scale(34),
             gap: scale(4),
+            icon: scale(20),
         }
     }
 
@@ -154,6 +169,8 @@ pub struct Flyout {
     window: HWND,
     rows: Vec<HWND>,
     items: Vec<Item>,
+    /// Icon size in pixels, scaled for the DPI the popup opened at.
+    icon_size: i32,
     /// Index into the owner's monitor list, echoed back with every choice.
     target: usize,
     user: *mut c_void,
@@ -211,6 +228,17 @@ unsafe extern "system" fn flyout_proc(
                 DestroyWindow(window);
             }
             0
+        }
+        0x002B => {
+            // WM_DRAWITEM: one row, drawn as marker + profile icon + name.
+            let item = &*(lparam as *const DRAWITEMSTRUCT);
+            if item.CtlType == 4 {
+                let index = (item.CtlID as i32 - FIRST_ITEM_ID).max(0) as usize;
+                if let Some(drawn) = flyout.items.get(index) {
+                    draw_row(flyout, drawn, item);
+                }
+            }
+            1
         }
         0x0111 => {
             let control = (wparam & 0xFFFF) as i32;
@@ -312,6 +340,7 @@ impl Flyout {
                 window: std::ptr::null_mut(),
                 rows: Vec::new(),
                 items: content.items.clone(),
+                icon_size: metrics.icon, // placeholder until the geometry is known
                 target,
                 user,
                 choose,
@@ -351,14 +380,15 @@ impl Flyout {
             );
 
             for (index, item) in content.items.iter().enumerate() {
-                // Plain push buttons, not radio buttons: an auto-radio selects itself when it takes
-                // focus, which applied a profile the moment the popup opened. The current profile is
-                // stated in the caption, and only a click or Enter activates a row.
+                // Owner-drawn push buttons: a button gives click, focus, Enter and Space for free,
+                // while the drawing puts the profile icon and the current marker where they belong.
+                // Radio buttons are not an option: an auto-radio that takes focus sends BN_CLICKED on
+                // this build, which applied a profile with no user action.
                 let control = add_control(
                     window,
                     "BUTTON",
                     &item_text(&item.name, &item.state),
-                    WS_TABSTOP | 0u32, // BS_PUSHBUTTON is zero
+                    WS_TABSTOP | BS_OWNERDRAW,
                     metrics.margin,
                     metrics.row_top(index),
                     width - 2 * metrics.margin,
@@ -458,6 +488,107 @@ unsafe fn work_area(monitor: HMONITOR) -> Option<RECT> {
     Some(info.rcWork)
 }
 
+/// Draw one row: a filled marker when this profile is current, the profile icon, then the name.
+///
+/// Everything is painted on a stock background brush, so the row follows the system colours and the
+/// selected state the button already tracks.
+unsafe fn draw_row(flyout: &Flyout, item: &Item, draw: &DRAWITEMSTRUCT) {
+    let rect = draw.rcItem;
+    let selected = draw.itemState & ODS_SELECTED != 0;
+    let disabled = draw.itemState & ODS_DISABLED != 0;
+    let background = if selected {
+        COLOR_HIGHLIGHT
+    } else {
+        COLOR_WINDOW
+    };
+    let foreground = if disabled {
+        COLOR_GRAYTEXT
+    } else if selected {
+        COLOR_HIGHLIGHTTEXT
+    } else {
+        COLOR_WINDOWTEXT
+    };
+
+    FillRect(draw.hDC, &rect, GetSysColorBrush(background));
+
+    let size = flyout.icon_size;
+    let mark = (size / 2).max(3);
+    let padding = (size / 2).max(4);
+    let middle = rect.top + (rect.bottom - rect.top) / 2;
+    let mark_centre = rect.left + padding + mark / 2;
+
+    if item.state == State::Current {
+        let brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(
+            GetSysColor(foreground),
+        );
+        if !brush.is_null() {
+            let previous = SelectObject(draw.hDC, brush as *mut c_void);
+            Ellipse(
+                draw.hDC,
+                mark_centre - mark / 2,
+                middle - mark / 2,
+                mark_centre + mark / 2 + 1,
+                middle + mark / 2 + 1,
+            );
+            SelectObject(draw.hDC, previous);
+            DeleteObject(brush as *mut c_void);
+        }
+    }
+
+    // The profile icon, pixel by pixel: the glyph already exists as a rendered bitmap, and at 16 to
+    // 32 pixels this is cheaper than managing a mask.
+    let icon_left = rect.left + padding + mark + padding;
+    let icon_top = middle - size / 2;
+    let glyph = crate::tray::render(
+        crate::tray::Glyph::from_name(&item.icon),
+        None,
+        size as u32,
+    );
+    let colour: COLORREF = GetSysColor(foreground);
+    for y in 0..glyph.height as i32 {
+        for x in 0..glyph.width as i32 {
+            let index = ((y as u32 * glyph.width + x as u32) * 4) as usize;
+            if glyph.pixels.get(index + 3).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            windows_sys::Win32::Graphics::Gdi::SetPixelV(
+                draw.hDC,
+                icon_left + x,
+                icon_top + y,
+                colour,
+            );
+        }
+    }
+
+    // The text follows the icon closely; a gap as wide as the icon reads as two columns.
+    let text_left = icon_left + size + size / 3;
+    let mut text = to_wide(&item_text(&item.name, &item.state));
+    SetBkMode(draw.hDC, TRANSPARENT as i32);
+    SetTextColor(draw.hDC, colour);
+    let mut text_rect = RECT {
+        left: text_left,
+        top: rect.top,
+        right: rect.right - padding,
+        bottom: rect.bottom,
+    };
+    DrawTextW(
+        draw.hDC,
+        text.as_mut_ptr(),
+        -1,
+        &mut text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    if draw.itemState & ODS_FOCUS != 0 {
+        let mut focus = rect;
+        focus.left += 1;
+        focus.top += 1;
+        focus.right -= 1;
+        focus.bottom -= 1;
+        DrawFocusRect(draw.hDC, &focus);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,7 +608,8 @@ mod tests {
     #[test]
     fn a_row_says_what_is_true_about_it() {
         assert_eq!(item_text("Night", &State::Normal), "Night");
-        assert_eq!(item_text("Night", &State::Current), "Night (current)");
+        // The marker to the left of the name carries "current"; the caption does not repeat it.
+        assert_eq!(item_text("Night", &State::Current), "Night");
         assert_eq!(item_text("Night", &State::Pending), "Night (applying\u{2026})");
         assert_eq!(
             item_text("Night", &State::Failed(String::from("busy"))),

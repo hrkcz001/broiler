@@ -226,21 +226,35 @@ pub fn render(glyph: Glyph, badge: Option<u32>, size: u32) -> Bitmap {
     let mut bitmap = Bitmap::new(size);
     let unit = (size as f32) / 16.0;
     let centre = (size as f32) / 2.0;
-    // A badge needs room, so the glyph shrinks into the upper-left three quarters.
+    // A badge needs room, so the glyph shrinks into the upper-left three quarters. Without a badge
+    // the glyph fills the canvas: at 16 px every pixel of the small icon counts, and an art that
+    // covers two thirds of a 16 px square reads as a speck in the notification area.
     let scale = if badge.is_some() { 0.72 } else { 1.0 };
-    let radius = centre * 0.42 * scale;
+    let radius = centre * 0.86 * scale;
     let cx = centre - if badge.is_some() { unit * 1.5 } else { 0.0 };
     for y in 0..size as i32 {
         for x in 0..size as i32 {
             let fx = x as f32 + 0.5 - cx;
             let fy = y as f32 + 0.5 - centre;
             let inside = match glyph {
-                Glyph::Day => fx * fx + fy * fy <= radius * radius,
-                // A crescent: the disk minus a disk shifted up and right.
+                // A sun: a solid disk and eight rays, so it is not mistaken for a plain dot at
+                // 16 px. The rays are short and thick on purpose; thin spokes disappear.
+                Glyph::Day => {
+                    let disk = fx * fx + fy * fy <= (radius * 0.66).powi(2);
+                    let distance = (fx * fx + fy * fy).sqrt();
+                    let angle = fy.atan2(fx);
+                    let spoke = (angle.to_degrees() / 45.0).round() as i32;
+                    let offset = angle.to_degrees() - spoke as f32 * 45.0;
+                    let near_spoke = offset.abs() < 22.0;
+                    let ring = distance >= radius * 0.80 && distance <= radius;
+                    disk || (ring && near_spoke)
+                }
+                // A crescent: the disk minus a disk shifted up and right. The cut is generous enough
+                // that the remaining body is a wide arc instead of a sliver.
                 Glyph::Night => {
                     let outer = fx * fx + fy * fy <= radius * radius;
-                    let cut = (fx - radius * 0.55).powi(2) + (fy + radius * 0.35).powi(2)
-                        <= radius * radius * 0.82;
+                    let cut = (fx - radius * 0.38).powi(2) + (fy + radius * 0.22).powi(2)
+                        <= (radius * 0.74).powi(2);
                     outer && !cut
                 }
                 Glyph::Dawn | Glyph::Dusk => {
@@ -491,6 +505,12 @@ unsafe extern "system" fn tray_proc(
             tray.readd_all();
             0
         }
+        0x02E0 => {
+            // WM_DPICHANGED: the taskbar moved to a display with another scale, so every icon is
+            // rendered again at the size the shell now asks for. A stretched bitmap is not acceptable.
+            tray.rebuild_for_dpi();
+            0
+        }
         WM_TIMER => {
             // The one-shot retry for the version-4 behaviour, see `schedule_version_retry`.
             if wparam == VERSION_RETRY_TIMER {
@@ -552,7 +572,22 @@ impl Tray {
     /// the honest signal that there is no notification area to talk to.
     pub fn install(specs: &[IconSpec], callbacks: Callbacks) -> Option<Box<Tray>> {
         crate::win::ui::init_dpi();
-        let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+        // The shell sizes a notification-area icon for the taskbar's DPI, not for the display this
+        // process happens to start on. `GetSystemMetrics` answers for the system DPI, which is the same
+        // value on a single-DPI machine and wrong on a scaled one.
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() }.max(96);
+        let size = unsafe {
+            let scaled = windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(
+                SM_CXSMICON,
+                dpi,
+            );
+            if scaled > 0 {
+                scaled
+            } else {
+                GetSystemMetrics(SM_CXSMICON)
+            }
+        }
+        .max(16);
         let mut tray = Box::new(Tray {
             window: std::ptr::null_mut(),
             slots: Vec::new(),
@@ -833,6 +868,39 @@ impl Tray {
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    /// Re-render every icon at the size the shell asks for at the current DPI.
+    pub fn rebuild_for_dpi(&mut self) {
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() }.max(96);
+        let size = unsafe {
+            let scaled = windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+            if scaled > 0 {
+                scaled
+            } else {
+                GetSystemMetrics(SM_CXSMICON)
+            }
+        }
+        .max(16);
+        if self.slots.first().map(|slot| slot.size) == Some(size) {
+            return;
+        }
+        for index in 0..self.slots.len() {
+            self.slots[index].size = size;
+            let glyph = self.slots[index].glyph;
+            let badge = self.slots[index].badge;
+            if let Some(icon) = render_icon(glyph, badge, size as u32) {
+                let mut data = self.data(index, NIF_ICON);
+                data.hIcon = icon as *mut c_void;
+                if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
+                    unsafe { DestroyIcon(self.slots[index].icon as *mut c_void) };
+                    self.slots[index].icon = icon;
+                } else {
+                    unsafe { DestroyIcon(icon as *mut c_void) };
+                }
+            }
+        }
+        crate::log_info!("icons re-rendered at {size} px for {dpi} DPI");
     }
 
     /// Show the settings window, replacing one that is already open.
@@ -1135,6 +1203,23 @@ mod tests {
                 assert!(icon.is_monochrome(), "{glyph:?} at {size} used colour");
             }
         }
+    }
+
+    #[test]
+    fn a_sun_and_a_crescent_fill_enough_of_a_sixteen_pixel_icon() {
+        // The notification area draws a 16 px icon at 16 px, so artwork that covers a third of the
+        // square reads as a speck. This is the measurement that keeps the shapes honest.
+        for glyph in [Glyph::Day, Glyph::Night] {
+            let bitmap = render(glyph, None, 16);
+            let painted = bitmap.painted();
+            assert!(
+                painted * 100 / (16 * 16) >= 30,
+                "{glyph:?} covers {painted} of 256 pixels"
+            );
+        }
+        // A badge costs room but must not erase the glyph.
+        let badged = render(Glyph::Day, Some(2), 16);
+        assert!(badged.painted() * 100 / (16 * 16) >= 15);
     }
 
     #[test]

@@ -792,9 +792,15 @@ fn tray_flyout_content(
             } else {
                 State::Normal
             };
+            let icon = profile
+                .get("icon")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&profile_id)
+                .to_string();
             Some(Item {
                 id: profile_id,
                 name: label,
+                icon,
                 state,
             })
         })

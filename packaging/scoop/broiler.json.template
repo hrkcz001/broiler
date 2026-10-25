@@ -6,7 +6,7 @@
     "notes": [
         "Start with Windows is off by default; enable it from the tray Settings window or with:",
         "    broiler settings set startup.launch_at_login true",
-        "Profiles and settings live in %APPDATA%\\broiler and are not removed by Scoop."
+        "Scoop retains persisted data; inspect paths with broiler paths --json. Migrate old AppData config explicitly."
     ],
     "architecture": {
         "64bit": {
@@ -15,6 +15,11 @@
         }
     },
     "bin": "broiler.exe",
+    "persist": "data",
+    "pre_install": [
+        "New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null",
+        "New-Item -ItemType File -Path (Join-Path $dir 'broiler.portable') -Force | Out-Null"
+    ],
     "shortcuts": [["broiler-tray.exe", "broiler"]],
     "checkver": "github",
     "autoupdate": {

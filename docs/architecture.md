@@ -10,6 +10,7 @@ Status: proposed design, not an implementation. No Rust source, Cargo project, r
 - Use direct Win32 bindings through `windows-sys`, with narrow safe wrappers and RAII for handles. Use Dxva2 monitor configuration APIs, preferring high-level controls where available and limiting low-level VCP operations to explicit needs, not a custom I2C driver or GPU-vendor API.
 - Keep a single command coordinator and a single active DDC executor. Isolate potentially blocking DDC calls in an on-demand child process using the tray executable's internal worker mode.
 - Use local named pipes for CLI-to-daemon IPC, with explicit logon-SID ACLs and remote clients rejected. Do not use TCP or HTTP.
+- Storage follows `docs/storage.md`: one unified data root chosen by an explicit `--config-dir`, an executable-adjacent portable marker for Scoop/portable installs, and AppData only for unmarked installs. Scoop `persist: data` is required; AppData-only storage is superseded.
 - Support brightness and contrast as the baseline control set. Color temperature is required in v1, with discrete hexadecimal preset values and native temperature-request values, not just percentage sliders. Expose RGB gains, color presets, volume, and audio-only mute conditionally. Never equate a standardized VCP code with a universally reliable implementation.
 - Do not implement automatic startup profile writes in the multi-profile path, background DDC polling, animation, vendor hacks, arbitrary raw VCP writes, input switching, power-off, or factory resets in v1.
 
@@ -58,9 +59,11 @@ Resolve the roaming and local AppData directories with known-folder APIs rather 
 %LOCALAPPDATA%\broiler\logs\broiler.log
 ```
 
+This AppData layout applies only to an unmarked install. The Scoop and portable layout, precedence rules and AppData migration are specified in `docs/storage.md`, which supersedes this section for packaged installations.
+
 Settings and profiles are user-maintained. State, capabilities, last commanded/observed values, and monitor alias mappings are application-owned. Cache writes must not rewrite profiles. Machine-local remembered selections in roaming settings remain harmless because unmatched monitor IDs are never rebound to unrelated monitors.
 
-Support an explicit `--config-dir PATH` for testing and alternate deployments. One coordinator per user/session remains the default: starting a second daemon with a different config root must report the existing root rather than run a competing writer. Portable mode can be added later deliberately; it must not silently change storage merely because an executable moved.
+Support an explicit `--config-dir PATH` for testing and alternate deployments. One coordinator per user/session remains the default: starting a second daemon with a different config root must report the existing root rather than run a competing writer. Portable/Scoop mode is now required per `docs/storage.md`, selected by the explicit marker rather than inferred from an executable move. Resolve and propagate one storage context to every process.
 
 ### Global settings example
 
@@ -473,7 +476,7 @@ Planned broiler manifest fields, not a publishable manifest yet:
 - `architecture.64bit.hash`: hash of the exact uploaded ZIP, never a placeholder promoted to the live bucket.
 - `bin`: `broiler.exe`; optionally a Start Menu shortcut to `broiler-tray.exe`.
 - `checkver`: `github`; matching `autoupdate` URL and released checksum metadata.
-- No `persist` entry by default because configuration lives in AppData, not in Scoop's version directory. Preserve it across upgrades/uninstall unless the user explicitly requests a purge.
+- Required `persist: data`, per `docs/storage.md`. Scoop links the application's `data` directory to persistent backing storage; ordinary nonportable installs retain AppData. Existing AppData migration is explicit, copy-only, conflict-safe and tested before UI work.
 - No admin hook, driver/service installation, automatic autostart enablement, or hardware profile application during install.
 - Before upgrade/uninstall, gracefully stop a running daemon so locked binaries do not break extraction. Validate hook behavior and decide whether to resume a previously running instance without violating the single-profile startup rule.
 - Startup registration must use Scoop's stable `current` path, not an expiring version path or an ambiguous shim. Record and test actual resolved paths.

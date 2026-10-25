@@ -1,6 +1,6 @@
 # Parameters, units, and native values
 
-Reference for the required v1 control surface. Source rationale and the numbered Microsoft/ddcutil source list are in [the architecture](architecture.md). Implementation status: nothing in this document is implemented yet. Every claim about a specific display's behavior is either marked as standard intent or left explicitly unverified.
+Reference for the required v1 control surface. Data locations are specified in [the storage contract](storage.md). Source rationale and the numbered Microsoft/ddcutil source list are in [the architecture](architecture.md). Implementation status: nothing in this document is implemented yet. Every claim about a specific display's behavior is either marked as standard intent or left explicitly unverified.
 
 ## Value model
 

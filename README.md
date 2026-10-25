@@ -2,13 +2,38 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Working today: both executables; a resident coordinator with a logon-SID-scoped pipe; `start`/`stop`/`status`/`reload`; `monitors list`, `capabilities`, `select`; `profiles list`/`validate`, `profile apply`, `profile next`; `get`/`set` for brightness and contrast with readback verification; `settings get`/`set`; `startup status`; `icons list`. Profiles in this build write only brightness and contrast; colour temperature and the remaining controls, the tray, the flyout and every window are not implemented yet.** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
+**Status: early implementation. Working today: both executables; a resident coordinator with a logon-SID-scoped pipe; `start`/`stop`/`status`/`reload`; `monitors list`, `capabilities`, `select`; `profiles list`/`validate`, `profile apply`, `profile next`; `get`/`set` for brightness and contrast with readback verification; `settings get`/`set`; `startup status`; `icons list`. Profiles in this build write only brightness and contrast; colour temperature and the remaining controls, the tray, the flyout and every window are not implemented yet.**
+
+Research and architecture by **Hermes Agent** (Nous Research) at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), [the storage contract](docs/storage.md), and [the next worker handoff](docs/next-worker-handoff.md).
 
 ## What it controls
 
 External HDMI and DisplayPort monitors over DDC/CI: brightness, contrast, color temperature, color presets, RGB gains, monitor-speaker volume and audio-only mute where supported. Color temperature, including native hexadecimal preset values, is required v1 functionality, not a future feature. Support remains device- and mode-dependent.
 
 Two executables: console `broiler.exe` and native GUI/tray `broiler-tray.exe`. No Electron, Node.js, WebView, Windows service, kernel driver, administrator installation or cloud account. Hardware commands are serialized through one user-session coordinator.
+
+## Where data lives
+
+Specified in [docs/storage.md](docs/storage.md), not implemented yet: the current build still writes `%APPDATA%\broiler` and `%LOCALAPPDATA%\broiler`.
+
+A Scoop or portable install gets a data directory beside the binaries, linked by Scoop to its persistent store, so profiles and settings survive every upgrade:
+
+```text
+<install>\data\settings.toml
+<install>\data\profiles\*.toml
+<install>\data\state.json
+<install>\data\logs\broiler.log
+```
+
+A normal unmarked installation keeps using AppData. Existing AppData data is carried over explicitly, never by a silent first-run import:
+
+```text
+broiler paths --json
+broiler data migrate --from-appdata --dry-run
+broiler data migrate --from-appdata
+```
+
+`--config-dir <absolute-path>` selects one unified data root, mainly for tests. Migration copies and validates; it never moves, never overwrites a conflict and never deletes the originals.
 
 ## Install through Scoop
 
@@ -52,6 +77,8 @@ With one profile, startup applies it and exits without a tray icon. Two or more 
 - Reload validates and replaces the registry without writing monitor parameters or unexpectedly exiting. The one-profile rule applies at startup.
 
 ## Configuration locations
+
+The following describes the current implementation and the fallback for an ordinary unmarked install. For the required Scoop/portable `data` layout and safe migration, see [Where data lives](#where-data-lives) and [the storage contract](docs/storage.md).
 
 ```text
 %APPDATA%\broiler\settings.toml
@@ -216,6 +243,8 @@ broiler set color-preset 0x05 --monitor <monitor-id> --wait
 broiler set color-temperature 6500 --kelvin --monitor <monitor-id> --wait
 broiler set color-temperature 0x05 --vcp 0x14 --raw --monitor <monitor-id> --wait
 broiler set color-temperature 0x23 --vcp 0x0C --raw --monitor <monitor-id> --wait
+broiler paths --json
+broiler data migrate --from-appdata --dry-run
 broiler settings get --json
 broiler settings set tray.left_click cycle
 broiler settings set startup.launch_at_login true

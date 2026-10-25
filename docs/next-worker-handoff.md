@@ -2,12 +2,14 @@
 
 ## 1. Mission and actual starting point
 
+Requirement update after initial validation: Scoop installation must use `persist: data`, not AppData-only storage. Read `docs/storage.md` immediately after this handoff; it overrides old storage/path and no-persist instructions. The current executable has NOT been migrated by this planning change.
+
 Continue broiler in `C:\Users\hrkcz001\dev\broiler`, public repository https://github.com/hrkcz001/broiler, branch main. Do not use the former `C:\Users\hrkcz001\broiler` location. Validation baseline: commit `8d3e60b`, independently checked on 2026-10-25. Re-read current HEAD and working tree before editing.
 
 Read in order:
 
 1. This file, including corrections to the reverse handoff.
-2. `docs/handoff-reverse.md`, sections 3, 4, 7, 9 and 11.
+2. `docs/storage.md`, then `docs/handoff-reverse.md`, sections 3, 4, 7, 9 and 11.
 3. `docs/architecture.md` and `docs/parameters.md` for the intended contract.
 4. `docs/tested-devices.md` for worker-reported evidence, not independent certification.
 5. The actual source. Tests passing is not proof the production path uses the tested planner.
@@ -92,6 +94,12 @@ Review transient CLI operations (`src/cli.rs` and `runtime::TransientTransport`)
 
 Gate: end-to-end fake-worker process tests demonstrate bounded concurrent clients, stop latency and no overlapping writers. Record unavailable second-session tests honestly.
 
+### P1: unified storage and migration before UI
+
+Implement the complete resolver/persistence contract in `docs/storage.md` before G6-G8, not only at final Scoop packaging. Centralize `src/paths.rs` into a shared storage context, with explicit-root precedence, marker-selected executable-adjacent `data` for Scoop/portable use and AppData fallback for ordinary installs. Add `broiler paths --json` and dry-run/idempotent AppData migration. Propagate the root through CLI-to-daemon bootstrap, autostart registration and worker launch; reject conflicting live roots without creating another writer. Keep migration and packaging free of profile writes.
+
+Gate: isolated resolver/child-root/conflict/migration tests pass, source AppData files remain untouched, and no selected root silently falls back on write failure. Actual Scoop linking/upgrade retention is still a later real install gate, not simulated evidence.
+
 ### P1: persistence, CLI and status
 
 - `settings.set` in `src/coordinator.rs:436-450` writes directly with `std::fs::write`; `persist_settings` exists but this branch does not use it. Use comment-preserving atomic save with errors propagated and stale-edit rules, not a superficial call substitution.
@@ -113,7 +121,7 @@ After the prerequisite repair gate above:
 4. G9: temperature first, then remaining controls. Extend named allowlists and metadata instead of adding arbitrary numeric VCP writes. Support Kelvin intent and explicit `{ vcp = 0x14, raw = N }` / `{ vcp = 0x0C, raw = N }`. The owner specifically uses 5 for night brightness 0 and 8 for day brightness 100. These are two chosen values; do not interpolate, infer other supported choices from endpoints, or create automatic brightness-temperature linking.
 5. G10: persist display indices, truthful verified profile state, topology/wake rediscovery, fault and resource measurements.
 6. G11: fmt/clippy/tests/release workflows. Check formatter/linter availability; report what was not run. Release requires actual assets and checksum verification.
-7. G12: real `bucket/broiler.json` in existing https://github.com/hrkcz001/scoop_bucket, real uploaded artifact hash, bucket CI and actual installation/upgrade/uninstall test. No placeholder publication.
+7. G12: required `persist: data` linking, custom Scoop-root support, real migration/upgrade/uninstall preservation tests, plus real `bucket/broiler.json` in existing https://github.com/hrkcz001/scoop_bucket, real uploaded artifact hash, bucket CI and actual installation/upgrade/uninstall test. No placeholder publication.
 
 Native raw values use one syntax whether validated against a range or a set. Do not introduce a separate user-facing discrete type or truncate all payloads to one byte. Win32 color-temperature enum ordinals are not VCP values. Native value does not authorize arbitrary code writes or dangerous controls.
 

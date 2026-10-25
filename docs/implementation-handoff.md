@@ -1,5 +1,7 @@
 # Implementation handoff
 
+> Superseded. The current handoff for the implementation worker is `docs/next-worker-handoff.md`. This file is kept for history; where they differ, the newer handoff and `docs/storage.md` win.
+
 Target worker: DeepSeek V4.1 Flash 1017. This is a handoff document, not a claim that a worker has been launched or that a particular provider model ID exists.
 
 Audience: the worker session that writes the Rust implementation. Read this first, then `docs/architecture.md` for reasoning and `docs/parameters.md` for the value model. `README.md` is the user-facing contract.

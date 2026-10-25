@@ -277,6 +277,17 @@ Use a hidden top-level owner window rather than only a message-only window when 
 
 Use `Shell_NotifyIconW` with one stable GUID per monitor identity and `NOTIFYICON_VERSION_4`. Call `NIM_SETVERSION` after every icon addition, including shell restart recovery.[6] Decode callback event from `LOWORD(lParam)` and icon ID from `HIWORD(lParam)`, and support keyboard activation as well as mouse activation.[17]
 
+> Follow-up, 2026-10-25. Keyboard activation in the sentence above means only this: Windows+B focuses
+> the notification area, the arrow keys move between icons, and Enter or Space activates the focused
+> one, at which point the shell sends the application `NIN_KEYSELECT`. Nothing reads or intercepts the
+> keyboard; there is no hook, no hotkey and no global input in the product.
+>
+> It was proposed here during the research phase and is **not part of the owner's requirements**, so
+> v1 does not claim it. The implementation maps the message to the same action as a left click and
+> does nothing else with it. On the machine this was built on, `NIM_SETVERSION` is refused, so
+> version-4 packing is not in effect and the shell never sends that message: the branch is inert, not
+> a feature. Resolving the refusal is not scheduled work.
+
 - Left activation: cycle this monitor only, or show its flyout according to settings.
 - Right activation: native `HMENU` with exactly `Settings` and `Exit`. Exit stops the whole broiler instance, not merely one icon.
 - Tooltip: monitor index/name, verified profile or Custom, observed brightness when known, and short operation/error state.

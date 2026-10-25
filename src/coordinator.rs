@@ -870,6 +870,23 @@ impl<T: Transport> Coordinator<T> {
                             "backend": outcome.backend,
                         }));
                     }
+                    Ok(outcome) if control == "color_temperature" && outcome.native_target != outcome.observed => {
+                        // VCP 0x14 on this panel accepts a preset without reporting which one it is in:
+                        // the write is acknowledged, the readback keeps its old value, and the colour
+                        // visibly changes. Claiming a failed write would be wrong, and claiming a
+                        // verified one would be a lie, so the field is recorded as sent but unverified
+                        // and the rest of the profile still runs.
+                        applied += 1;
+                        fields.push(json!({
+                            "control": control,
+                            "status": "applied_unverified",
+                            "requested": write.requested.to_string(),
+                            "native": outcome.native_target,
+                            "observed": outcome.observed,
+                            "backend": outcome.backend,
+                            "reason": "the display does not report which preset it is in; the write was sent",
+                        }));
+                    }
                     Ok(outcome) => {
                         // A readback mismatch is a verification failure, not success.
                         let failure = Failure::new(

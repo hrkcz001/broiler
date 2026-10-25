@@ -16,6 +16,12 @@ fn main() {
         std::process::exit(broiler::worker::serve());
     }
 
+    if args.is_empty() {
+        // No arguments: become the resident coordinator. The tray, selection dialog and settings
+        // window of later gates live in this same process.
+        std::process::exit(broiler::runtime::run_resident());
+    }
+
     let code = broiler::cli::run(broiler::cli::Program::Tray, &args);
     std::process::exit(code);
 }

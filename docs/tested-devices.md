@@ -164,6 +164,43 @@ Honest limits:
   running during these writes (`Get-Process` filtered for monitor-control tools and `NVDisplay.Container`
   only).
 
+## G5 — coordinator and CLI: partially evidenced
+
+The IPC core and the commands that exist today are evidenced; the gate as a whole is **not**
+satisfied, because several documented commands are still missing and one security check has no
+fixture. Nothing below is claimed beyond what the commands printed.
+
+| Check | Command | Observed |
+|---|---|---|
+| Test suite | `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat test` | 175 passed, 0 failed |
+| Two concurrent clients, one executor | test `daemon::tests::two_concurrent_clients_share_one_executor` | both clients answered on their own connection; the fake transport recorded peak concurrency 1 |
+| Malformed frame | test `daemon::tests::a_malformed_frame_gets_a_protocol_error_instead_of_a_panic` | typed `protocol_error` response, no panic |
+| Oversized frame | test `daemon::tests::an_oversized_frame_is_refused_without_allocating_it` | refused before allocating the payload |
+| Single instance | test `instance::tests::the_second_acquisition_reports_an_existing_owner` | second acquisition reports an existing owner; `broiler start` printed `already running` |
+| Endpoint naming | test `pipe::tests::the_endpoint_name_is_stable_and_scoped_to_the_logon_sid` | name is `\\.\pipe\broiler.v1.<16 hex>`, derived from a hash of the logon SID |
+| First-instance flag | test `pipe::tests::first_instance_flag_detects_an_existing_server` | a second first-instance creation fails |
+| Start and status | `broiler start`, `broiler status --json` | `coordinator started`; JSON reported `running: true`, one monitor, zero profiles, settings path |
+| Read through the coordinator | `broiler get brightness --monitor mon-227062c49310910f` | `brightness 0 (min 0, max 100, dxva2-high-level)` from the resident process |
+| Two concurrent CLI clients | two `broiler get` invocations started together | both exit 0 with correct values from the one coordinator |
+| Write through the coordinator | `broiler set brightness 2 --wait`, then `broiler get` | `set to 2 and verified by readback ... via the coordinator`, readback `2`; restored to `0` and verified |
+| Settings through the coordinator | `broiler settings get/set tray.left_click` | `"flyout"` → `cycle` → `flyout`, file written with `schema_version = 1` |
+| Stop and status | `broiler stop`, `broiler status --json` | `coordinator stopped`; status `{"running": false}`; zero `broiler-tray` processes left |
+| Exit codes | `broiler get brightness --monitor mon-0000000000000000` etc. | 4 for an absent target, 2 for a value outside the contract, 0 for idempotent stop |
+
+Not evidenced, and therefore not claimed:
+
+- **Command coverage is incomplete.** `reload`, `monitors select`, `monitors validate-value`,
+  `profile apply`, `profile next`, `startup status`, `icons list`, `flyout`, `settings open`,
+  `profiles open`, `repository open` are still reported as not implemented. The gate's requirement
+  that every documented command has an integration test against the fake backend is unmet.
+- **A wrong-session client.** No second terminal session fixture exists here, so the logon-SID
+  boundary has not been tested from another session. The DACL construction and the endpoint scoping
+  are code-level only; treat this as untested rather than verified.
+- **`--refresh`** is accepted and ignored; status is a snapshot taken when the coordinator started,
+  so observation age is not yet reported.
+- Settings writes are not yet atomic through the coordinator path (they are in the offline path),
+  and `broiler start` does not yet apply the single-profile one-shot rule.
+
 ## Hardware evidence
 
 Every write below was a deliberate, minimal, reversible test adjustment with a recorded baseline that was restored and verified. There is no automatic restore-on-exit behaviour in the product.
@@ -177,4 +214,4 @@ Every write below was a deliberate, minimal, reversible test adjustment with a r
 
 ## Gates not yet evidenced
 
-G5 through G12 have no evidence of any kind. They are not implemented.
+G6 through G12 have no evidence of any kind. They are not implemented. G5 is partially evidenced above and is not claimed as complete.

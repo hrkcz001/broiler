@@ -41,13 +41,8 @@ pub enum Program {
 
 /// Commands that belong to the v1 contract but are not implemented in this build.
 const PLANNED_COMMANDS: &[&str] = &[
-    "start",
-    "stop",
-    "status",
     "reload",
-    "profiles",
     "profile",
-    "settings",
     "startup",
     "repository",
     "icons",
@@ -126,6 +121,11 @@ fn dispatch_console(args: &[String]) -> i32 {
             EXIT_OK
         }
         "monitors" => handle_monitors(&args[1..]),
+        "start" => handle_start(&args[1..]),
+        "stop" => handle_stop(&args[1..]),
+        "status" => handle_status(&args[1..]),
+        "profiles" => handle_profiles(&args[1..]),
+        "settings" => handle_settings(&args[1..]),
         "get" => handle_get(&args[1..]),
         "set" => handle_set(&args[1..]),
         other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
@@ -133,6 +133,346 @@ fn dispatch_console(args: &[String]) -> i32 {
             output::error_line(&format!("{}: unknown command: {}", PRODUCT_NAME, other));
             EXIT_USAGE
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// coordinator lifecycle: start, stop, status
+// ---------------------------------------------------------------------------
+
+fn client_exit_code(error: &crate::runtime::ClientError) -> i32 {
+    use crate::runtime::ClientError;
+    match error {
+        ClientError::NotRunning => EXIT_DAEMON_UNAVAILABLE,
+        ClientError::Channel(_) => EXIT_TRANSPORT,
+        ClientError::Failure(failure) => match failure.kind.as_str() {
+            "invalid" | "invalid_config" => EXIT_USAGE,
+            "unsupported" => EXIT_UNSUPPORTED,
+            "unknown_monitor" | "ambiguous_monitor" => EXIT_TARGET,
+            "partial" => EXIT_PARTIAL,
+            _ => EXIT_TRANSPORT,
+        },
+    }
+}
+
+fn report_client_error(error: &crate::runtime::ClientError) -> i32 {
+    output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message()));
+    client_exit_code(error)
+}
+
+fn handle_status(args: &[String]) -> i32 {
+    let mut json_output = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json_output = true,
+            "--refresh" => {}
+            other => return usage_error(&format!("status: unexpected argument: {other}")),
+        }
+    }
+
+    match crate::runtime::request("status", json!(null)) {
+        Ok(result) => {
+            if json_output {
+                emit_json(&result);
+            } else {
+                let monitors = result
+                    .get("monitors")
+                    .and_then(|value| value.as_array())
+                    .map(|list| list.len())
+                    .unwrap_or(0);
+                let profiles = result.get("profiles").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                output::line(&format!(
+                    "running, {monitors} monitor(s), {profiles} profile(s)"
+                ));
+            }
+            EXIT_OK
+        }
+        Err(crate::runtime::ClientError::NotRunning) => {
+            if json_output {
+                emit_json(&json!({"running": false}));
+            } else {
+                output::line("not running");
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            // A coordinator that has answered `stop` is not a running coordinator any more.
+            if matches!(&error, crate::runtime::ClientError::Failure(failure) if failure.kind == "shutting_down") {
+                if json_output {
+                    emit_json(&json!({"running": false}));
+                } else {
+                    output::line("not running");
+                }
+                EXIT_OK
+            } else {
+                report_client_error(&error)
+            }
+        }
+    }
+}
+
+fn handle_stop(args: &[String]) -> i32 {
+    if let Some(argument) = args.first() {
+        return usage_error(&format!("stop: unexpected argument: {argument}"));
+    }
+    match crate::runtime::stop_resident() {
+        Ok(true) => {
+            output::line("coordinator stopped");
+            EXIT_OK
+        }
+        Ok(false) => {
+            output::line("not running");
+            EXIT_OK
+        }
+        Err(error) => report_client_error(&error),
+    }
+}
+
+fn handle_start(args: &[String]) -> i32 {
+    if let Some(argument) = args.first() {
+        return usage_error(&format!("start: unexpected argument: {argument}"));
+    }
+    if crate::runtime::is_running() {
+        output::line("already running");
+        return EXIT_OK;
+    }
+    match crate::runtime::start_resident() {
+        Ok(()) => {
+            output::line("coordinator started");
+            EXIT_OK
+        }
+        Err(reason) => {
+            output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
+            EXIT_TRANSPORT
+        }
+    }
+}
+
+/// Open a path with the shell's default handler.
+fn open_path(path: &std::path::Path) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .display()
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if result as isize <= 32 {
+        return Err(format!("cannot open {}", path.display()));
+    }
+    Ok(())
+}
+
+fn handle_profiles(args: &[String]) -> i32 {
+    let Some(subcommand) = args.first() else {
+        return usage_error("profiles: expected 'list', 'validate' or 'open'");
+    };
+
+    let directory = match paths::profiles_dir() {
+        Some(directory) => directory,
+        None => return usage_error("profiles: the roaming AppData directory is unavailable"),
+    };
+
+    match subcommand.as_str() {
+        "list" => {
+            let mut json_output = false;
+            for argument in &args[1..] {
+                match argument.as_str() {
+                    "--json" => json_output = true,
+                    other => return usage_error(&format!("profiles list: unexpected argument: {other}")),
+                }
+            }
+            match crate::config::ProfileRegistry::load_dir(&directory) {
+                Ok(registry) => {
+                    if json_output {
+                        emit_json(&json!({
+                            "directory": directory.display().to_string(),
+                            "profiles": registry.profiles().iter().map(|profile| json!({
+                                "id": profile.id,
+                                "name": profile.name,
+                                "icon": profile.icon,
+                                "order": profile.order,
+                                "controls": profile.requested_control_names(),
+                            })).collect::<Vec<serde_json::Value>>(),
+                        }));
+                    } else {
+                        output::line(&format!("{}", directory.display()));
+                        for profile in registry.profiles() {
+                            output::line(&format!(
+                                "{:<4} {:<12} {:<16} {}",
+                                profile.order,
+                                profile.id,
+                                profile.name,
+                                profile.requested_control_names().join(", ")
+                            ));
+                        }
+                    }
+                    EXIT_OK
+                }
+                Err(error) => {
+                    output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                    EXIT_USAGE
+                }
+            }
+        }
+        "validate" => match crate::config::ProfileRegistry::load_dir(&directory) {
+            Ok(registry) => {
+                output::line(&format!(
+                    "{} profile(s) valid in {}",
+                    registry.len(),
+                    directory.display()
+                ));
+                EXIT_OK
+            }
+            Err(error) => {
+                output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                EXIT_USAGE
+            }
+        },
+        "open" => match open_path(&directory) {
+            Ok(()) => EXIT_OK,
+            Err(reason) => usage_error(&reason),
+        },
+        other => usage_error(&format!("profiles: unknown subcommand: {other}")),
+    }
+}
+
+fn handle_settings(args: &[String]) -> i32 {
+    let Some(subcommand) = args.first() else {
+        return usage_error("settings: expected 'get', 'set' or 'open'");
+    };
+    let path = match paths::settings_file() {
+        Some(path) => path,
+        None => return usage_error("settings: the roaming AppData directory is unavailable"),
+    };
+
+    match subcommand.as_str() {
+        "get" => {
+            let mut key: Option<&str> = None;
+            let mut json_output = false;
+            for argument in &args[1..] {
+                match argument.as_str() {
+                    "--json" => json_output = true,
+                    other if key.is_none() => key = Some(other),
+                    other => return usage_error(&format!("settings get: unexpected argument: {other}")),
+                }
+            }
+            match crate::runtime::request(
+                "settings.get",
+                match key {
+                    Some(key) => json!({ "key": key }),
+                    None => json!(null),
+                },
+            ) {
+                Ok(result) => {
+                    emit_json(&result);
+                    EXIT_OK
+                }
+                Err(crate::runtime::ClientError::NotRunning) => {
+                    // No coordinator: read the file directly, with the same schema rules.
+                    match crate::config::settings::load(&path) {
+                        Ok(settings) => {
+                            let value = match key {
+                                Some(key) => {
+                                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                                    let _ = text;
+                                    settings_key_value(&settings, key)
+                                }
+                                None => serde_json::to_value(format!("{settings:?}")).ok(),
+                            };
+                            match value {
+                                Some(value) => {
+                                    if json_output || key.is_some() {
+                                        emit_json(&value);
+                                    } else {
+                                        output::line(&format!("{value}"));
+                                    }
+                                    EXIT_OK
+                                }
+                                None => usage_error(&format!("unknown settings key `{}`", key.unwrap_or(""))),
+                            }
+                        }
+                        Err(error) => {
+                            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                            EXIT_USAGE
+                        }
+                    }
+                }
+                Err(error) => report_client_error(&error),
+            }
+        }
+        "set" => {
+            let Some(key) = args.get(1) else {
+                return usage_error("settings set: a key is required");
+            };
+            let Some(value) = args.get(2) else {
+                return usage_error("settings set: a value is required");
+            };
+            match crate::runtime::request("settings.set", json!({"key": key, "value": value})) {
+                Ok(result) => {
+                    emit_json(&result);
+                    EXIT_OK
+                }
+                Err(crate::runtime::ClientError::NotRunning) => {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    match crate::config::settings::set_key(&path, &text, key, value) {
+                        Ok(updated) => {
+                            let parsed = match crate::config::settings::parse(&updated, &path) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                                    return EXIT_USAGE;
+                                }
+                            };
+                            if let Err(error) = crate::config::settings::save(&path, &parsed) {
+                                output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                                return EXIT_TRANSPORT;
+                            }
+                            output::line(&format!("{key} updated"));
+                            EXIT_OK
+                        }
+                        Err(error) => {
+                            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+                            EXIT_USAGE
+                        }
+                    }
+                }
+                Err(error) => report_client_error(&error),
+            }
+        }
+        "open" => match open_path(&path) {
+            Ok(()) => EXIT_OK,
+            Err(reason) => usage_error(&reason),
+        },
+        other => usage_error(&format!("settings: unknown subcommand: {other}")),
+    }
+}
+
+fn settings_key_value(
+    settings: &crate::config::Settings,
+    key: &str,
+) -> Option<serde_json::Value> {
+    match key {
+        "startup.launch_at_login" => Some(json!(settings.launch_at_login)),
+        "tray.left_click" => Some(json!(settings.left_click.as_str())),
+        "tray.badges" => Some(json!("when_multiple")),
+        "selection.remember" => Some(json!(settings.remember)),
+        "selection.monitor_ids" => Some(json!(settings.monitor_ids)),
+        "profiles.startup" => Some(json!("preserve")),
+        "profiles.unsupported" => Some(json!(settings.unsupported.as_str())),
+        "logging.level" => Some(json!(settings.log_level.as_str())),
+        _ => None,
     }
 }
 
@@ -229,6 +569,49 @@ fn handle_get(args: &[String]) -> i32 {
         return usage_error("get: --monitor <id> is required; run 'broiler monitors list --json' first");
     };
 
+    // A resident coordinator owns the hardware: route the read through it when it exists.
+    match crate::runtime::request(
+        "parameters.get",
+        json!({"monitor": monitor, "control": control}),
+    ) {
+        Ok(result) => {
+            let reading = result.get("reading").cloned().unwrap_or(serde_json::Value::Null);
+            if json_output {
+                emit_json(&json!({
+                    "monitor": monitor,
+                    "control": control,
+                    "value": reading.get("value"),
+                    "minimum": reading.get("minimum"),
+                    "maximum": reading.get("maximum"),
+                    "backend": reading.get("backend"),
+                }));
+            } else {
+                output::line(&format!(
+                    "{} {} (min {}, max {}, {})",
+                    control,
+                    reading.get("value").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    reading
+                        .get("minimum")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| String::from("?")),
+                    reading
+                        .get("maximum")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| String::from("?")),
+                    reading
+                        .get("backend")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                ));
+            }
+            return EXIT_OK;
+        }
+        Err(crate::runtime::ClientError::NotRunning) => {}
+        Err(error) => return report_client_error(&error),
+    }
+
     let mut supervisor = match open_supervisor() {
         Ok(supervisor) => supervisor,
         Err(reason) => return usage_error(&reason),
@@ -318,6 +701,45 @@ fn handle_set(args: &[String]) -> i32 {
     let Some(value) = parse_number(&value_text) else {
         return usage_error(&format!("set: `{value_text}` is not a number"));
     };
+
+    // A resident coordinator owns the hardware: route the write through it when it exists.
+    let unit = if raw { "native" } else { "percent" };
+    match crate::runtime::request(
+        "parameters.set",
+        json!({"monitor": monitor, "control": control, "value": value, "unit": unit}),
+    ) {
+        Ok(result) => {
+            let observed = result
+                .get("observed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX);
+            if json_output {
+                emit_json(&json!({
+                    "monitor": monitor,
+                    "control": control,
+                    "requested": value,
+                    "unit": unit,
+                    "native_target": result.get("native_target"),
+                    "observed": observed,
+                    "verified": result.get("verified"),
+                    "backend": result.get("backend"),
+                    "waited": wait,
+                    "via": "coordinator",
+                }));
+            } else {
+                output::line(&format!(
+                    "{control} set to {observed} and verified by readback ({}) via the coordinator",
+                    result
+                        .get("backend")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                ));
+            }
+            return EXIT_OK;
+        }
+        Err(crate::runtime::ClientError::NotRunning) => {}
+        Err(error) => return report_client_error(&error),
+    }
 
     let mut supervisor = match open_supervisor() {
         Ok(supervisor) => supervisor,
@@ -727,7 +1149,7 @@ mod tests {
     #[test]
     fn planned_commands_report_not_implemented_rather_than_success() {
         // These stay unimplemented, so the test never touches hardware.
-        assert_eq!(dispatch_console(&argv(&["profiles", "list"])), EXIT_USAGE);
+        assert_eq!(dispatch_console(&argv(&["reload"])), EXIT_USAGE);
         assert_eq!(
             dispatch_console(&argv(&["set", "brightness", "42"])),
             EXIT_USAGE

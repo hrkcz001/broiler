@@ -5,5 +5,5 @@ icon = "day"
 order = 10
 
 [monitor]
-brightness = 65
+brightness = 100
 contrast = 80

@@ -5,5 +5,5 @@ icon = "night"
 order = 20
 
 [monitor]
-brightness = 15
+brightness = 0
 contrast = 50

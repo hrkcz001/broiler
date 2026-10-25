@@ -2,9 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Working today: both executables, `monitors list`/`monitors capabilities` (read-only), and `get`/`set brightness|contrast` with readback verification through the isolated DDC worker. The profile and settings model is implemented and unit-tested but not yet wired to commands. Missing: profiles from the CLI, selection dialog, tray, settings window, remaining controls.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
-
-Research and architecture by **Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
+**Status: early implementation. Working today: both executables; `monitors list` and `monitors capabilities` (read-only); `get` and `set brightness|contrast` with readback verification through the isolated DDC worker; a resident coordinator with a logon-SID-scoped pipe and the `start`/`stop`/`status`/`settings` commands; and the validated profile, value and planning model. Missing: profile apply, monitor selection, colour temperature and the remaining controls, tray, flyout and settings window.**Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 
 ## What it controls
 
@@ -105,7 +103,7 @@ icon = "day"
 order = 10
 
 [monitor]
-brightness = 65
+brightness = 100
 contrast = 80
 ```
 
@@ -119,7 +117,7 @@ icon = "night"
 order = 20
 
 [monitor]
-brightness = 15
+brightness = 0
 contrast = 50
 ```
 

@@ -467,6 +467,12 @@ pub fn set_key(path: &Path, text: &str, key: &str, raw_value: &str) -> Result<St
         })?
     };
 
+    // A file that does not exist yet still needs the schema marker, or the result could not be
+    // validated when it is read back.
+    if !document.contains_key("schema_version") {
+        document["schema_version"] = value(SETTINGS_SCHEMA_VERSION as i64);
+    }
+
     let parsed_bool = || match raw_value {
         "true" => Ok(true),
         "false" => Ok(false),
@@ -656,6 +662,14 @@ mod tests {
         let updated = set_key(&path(), SHIPPED, "tray.left_click", "cycle").expect("update");
         assert!(updated.contains("left_click = \"cycle\""));
         assert!(updated.contains("level = \"warn\""));
+        let settings = parse(&updated, &path()).expect("parse");
+        assert_eq!(settings.left_click, LeftClick::Cycle);
+    }
+
+    #[test]
+    fn set_key_on_a_missing_file_writes_the_schema_marker() {
+        let updated = set_key(&path(), "", "tray.left_click", "cycle").expect("update");
+        assert!(updated.contains("schema_version = 1"), "{updated}");
         let settings = parse(&updated, &path()).expect("parse");
         assert_eq!(settings.left_click, LeftClick::Cycle);
     }

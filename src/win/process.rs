@@ -48,6 +48,11 @@ pub struct Handle(HANDLE);
 unsafe impl Send for Handle {}
 
 impl Handle {
+    /// Take ownership of a raw handle returned by a Win32 call.
+    pub fn from_raw(raw: HANDLE) -> Handle {
+        Handle(raw)
+    }
+
     /// Borrow the raw handle for a Win32 call.
     pub fn raw(&self) -> HANDLE {
         self.0
@@ -100,6 +105,18 @@ pub fn bytes_available(handle: HANDLE) -> io::Result<u32> {
         return Err(last_error("PeekNamedPipe"));
     }
     Ok(available)
+}
+
+/// Push buffered data to the other end of a pipe.
+///
+/// A pipe server that disconnects immediately after writing can discard data the client has not read
+/// yet, so every response is flushed before the instance is disconnected.
+pub fn flush(handle: HANDLE) -> io::Result<()> {
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(handle) };
+    if ok == 0 {
+        return Err(last_error("FlushFileBuffers"));
+    }
+    Ok(())
 }
 
 /// Read up to `buffer.len()` bytes that are already available.
@@ -252,6 +269,51 @@ impl Child {
         })
     }
 
+    /// Start a process with no inherited standard handles, for a detached daemon.
+    pub fn spawn_detached(program: &Path, args: &[String]) -> io::Result<Child> {
+        let mut command_line = String::new();
+        command_line.push('"');
+        command_line.push_str(&program.display().to_string());
+        command_line.push('"');
+        for argument in args {
+            command_line.push(' ');
+            command_line.push('"');
+            command_line.push_str(&argument.replace('"', "\\\""));
+            command_line.push('"');
+        }
+
+        let application = wide(program.as_os_str());
+        let mut command: Vec<u16> = command_line.encode_utf16().collect();
+        command.push(0);
+
+        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_NO_WINDOW,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &startup,
+                &mut info,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("CreateProcessW"));
+        }
+        Ok(Child {
+            process: Handle(info.hProcess),
+            _thread: Handle(info.hThread),
+            pid: info.dwProcessId,
+        })
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -318,7 +380,17 @@ pub fn read_frame_deadline(handle: HANDLE, deadline: Instant) -> io::Result<Opti
             ));
         }
 
-        let available = bytes_available(handle)?;
+        let available = match bytes_available(handle) {
+            Ok(available) => available,
+            // The peer disconnected: that is a clean end of stream for a byte-mode pipe.
+            Err(error)
+                if error.to_string().contains("Win32 error 233")
+                    || error.to_string().contains("Win32 error 109") =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
         if available == 0 {
             std::thread::sleep(Duration::from_millis(5));
             continue;

@@ -85,6 +85,11 @@ pub struct Settings {
     pub launch_at_login: bool,
     pub left_click: LeftClick,
     pub badges: Badges,
+    /// Show the monitor name in the tooltip and the flyout heading even with one controlled monitor.
+    ///
+    /// With several controlled monitors the name is always shown: an unlabelled icon would be
+    /// ambiguous. This is a label preference and never changes which monitor is targeted.
+    pub always_show_monitor_name: bool,
     pub remember: bool,
     pub monitor_ids: Vec<String>,
     pub profiles_startup: StartupPolicy,
@@ -99,6 +104,7 @@ impl Default for Settings {
             launch_at_login: false,
             left_click: LeftClick::Flyout,
             badges: Badges::WhenMultiple,
+            always_show_monitor_name: false,
             remember: false,
             monitor_ids: Vec::new(),
             profiles_startup: StartupPolicy::Preserve,
@@ -217,8 +223,18 @@ pub fn parse(text: &str, path: &Path) -> Result<Settings, SettingsError> {
         match item.as_table() {
             Some(table) => {
                 for (key, _) in table.iter() {
-                    if key != "left_click" && key != "badges" {
+                    if key != "left_click" && key != "badges" && key != "always_show_monitor_name" {
                         complain(format!("unknown settings key `tray.{key}`"));
+                    }
+                }
+                // Missing means false, so a settings file written before this key existed keeps
+                // working: the key is additive inside schema version 1.
+                if let Some(item) = table.get("always_show_monitor_name") {
+                    match as_bool(item) {
+                        Some(value) => settings.always_show_monitor_name = value,
+                        None => complain(String::from(
+                            "tray.always_show_monitor_name must be true or false",
+                        )),
                     }
                 }
                 if let Some(item) = table.get("left_click") {
@@ -361,6 +377,7 @@ fn apply(document: &mut DocumentMut, settings: &Settings) {
     if let Some(table) = document["tray"].as_table_mut() {
         set_string(table, "left_click", settings.left_click.as_str());
         set_string(table, "badges", "when_multiple");
+        table["always_show_monitor_name"] = value(settings.always_show_monitor_name);
     }
 
     if !document.contains_key("selection") {
@@ -546,6 +563,15 @@ pub fn set_key(path: &Path, text: &str, key: &str, raw_value: &str) -> Result<St
                 set_string(table, "left_click", parsed.as_str());
             }
         }
+        "tray.always_show_monitor_name" => {
+            let value_bool = parsed_bool()?;
+            if !document.contains_key("tray") {
+                document["tray"] = Item::Table(toml_edit::Table::new());
+            }
+            if let Some(table) = document["tray"].as_table_mut() {
+                table["always_show_monitor_name"] = value(value_bool);
+            }
+        }
         "profiles.unsupported" => {
             let parsed = UnsupportedPolicy::parse(raw_value).ok_or_else(|| {
                 SettingsError::single(path, String::from("profiles.unsupported must be skip or fail"))
@@ -604,7 +630,7 @@ mod tests {
         PathBuf::from("C:\\\\settings.toml")
     }
 
-    const SHIPPED: &str = "schema_version = 1\n\n[startup]\nlaunch_at_login = false\n\n[tray]\nleft_click = \"flyout\"\nbadges = \"when_multiple\"\n\n[selection]\nremember = false\nmonitor_ids = []\n\n[profiles]\nstartup = \"preserve\"\nunsupported = \"skip\"\n\n[logging]\nlevel = \"warn\"\n";
+    const SHIPPED: &str = "schema_version = 1\n\n[startup]\nlaunch_at_login = false\n\n[tray]\nleft_click = \"flyout\"\nbadges = \"when_multiple\"\nalways_show_monitor_name = false\n\n[selection]\nremember = false\nmonitor_ids = []\n\n[profiles]\nstartup = \"preserve\"\nunsupported = \"skip\"\n\n[logging]\nlevel = \"warn\"\n";
 
     fn scratch(name: &str) -> PathBuf {
         let mut directory = std::env::temp_dir();
@@ -656,6 +682,52 @@ mod tests {
     fn parses_the_shipped_settings_file() {
         let settings = parse(SHIPPED, &path()).expect("settings");
         assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn a_settings_file_written_before_the_monitor_name_key_defaults_it_to_false() {
+        // The key is additive inside schema version 1: an existing file must keep working unchanged.
+        let older = SHIPPED.replace("always_show_monitor_name = false\n", "");
+        let settings = parse(&older, &path()).expect("older settings");
+        assert!(!settings.always_show_monitor_name);
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn the_monitor_name_preference_round_trips_through_the_cli_key() {
+        let updated = set_key(
+            &path(),
+            SHIPPED,
+            "tray.always_show_monitor_name",
+            "true",
+        )
+        .expect("update");
+        let settings = parse(&updated, &path()).expect("parse");
+        assert!(settings.always_show_monitor_name);
+        // It is a boolean setting, not a free-form string.
+        assert!(set_key(&path(), SHIPPED, "tray.always_show_monitor_name", "maybe")
+            .expect_err("not a boolean")
+            .render()
+            .contains("not a boolean"));
+        // Saving keeps it, and keeps the user's comments.
+        let directory = scratch("monitor-name-save");
+        let file = directory.join("settings.toml");
+        std::fs::write(&file, format!("# keep\n{SHIPPED}")).expect("write");
+        save(&file, &settings).expect("save");
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert!(text.contains("always_show_monitor_name = true"), "{text}");
+        assert!(text.starts_with("# keep\n"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_non_boolean_monitor_name_value_is_rejected_when_parsing() {
+        let text = SHIPPED.replace(
+            "always_show_monitor_name = false",
+            "always_show_monitor_name = \"yes\"",
+        );
+        let error = parse(&text, &path()).expect_err("wrong type");
+        assert!(error.render().contains("always_show_monitor_name"));
     }
 
     #[test]

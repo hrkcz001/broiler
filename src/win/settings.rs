@@ -1,78 +1,115 @@
 //! The settings window.
 //!
-//! One ordinary native window, modeless like the flyout, so the resident instance keeps answering
-//! while it is open. It shows only what this build can actually do, and says so where it cannot: the
-//! startup row is present and disabled rather than pretending to toggle a registry value this build
-//! never writes.
+//! One ordinary native dialog, modeless so the resident instance keeps serving while it is open. It is
+//! built from a dialog template held in memory rather than by composing child windows by hand, because
+//! that is what gives the window its standard frame, its system font, its themed controls, Tab
+//! navigation, the default-button and Escape behaviour, and the dialog keyboard semantics an
+//! accessibility client expects. `Common-Controls` v6 is activated for the process in
+//! `res/broiler.manifest`, so the controls are drawn by the themed implementation.
 //!
-//! The window decides nothing either. Every action is reported to the caller, which performs it and
-//! then calls [`Settings::set_left_click`] with the value the coordinator ended up with.
+//! The window decides nothing. Every action is reported to the caller, which performs it and then
+//! calls [`Settings::set_snapshot`] with what the coordinator ended up holding; a refused save
+//! therefore cannot leave the window claiming a value that was never written.
+//!
+//! One row is honest about a missing feature: this build registers no logon entry, so the startup
+//! checkbox is shown and disabled instead of offering a promise it cannot keep.
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, GetStockObject, MonitorFromPoint, DEFAULT_GUI_FONT, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, GetWindowLongPtrW, IsWindow,
-    LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_SHOW, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CreateDialogIndirectParamW, DestroyWindow, GetDlgItem, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowRect, IsWindow, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, DLGTEMPLATE, GWLP_USERDATA, SM_CXSCREEN, SM_CYSCREEN,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 
 use crate::config::settings::LeftClick;
 use crate::win::wide::to_wide;
 
-// Combo-box styles, from `winuser.h`. Spelled out because this build takes no dependency on a
-// header crate that exports them, and a wrong literal here is exactly the defect this names.
-/// An editable combo box with a drop-down list. Never wanted: the user must choose, not type. Named
-/// so a test can assert the selector is not this.
+// ---------------------------------------------------------------------------
+// Control identifiers. `WM_COMMAND` reports these, and IDCANCEL is what Escape sends.
+// ---------------------------------------------------------------------------
+
+pub const COMBO: i32 = 100;
+pub const STARTUP_BOX: i32 = 101;
+pub const MONITOR_NAME_BOX: i32 = 102;
+pub const SELECT_MONITORS: i32 = 103;
+pub const OPEN_PROFILES: i32 = 104;
+pub const RELOAD_PROFILES: i32 = 105;
+pub const OPEN_REPOSITORY: i32 = 106;
+/// `IDCANCEL`: the close box and Escape both end here.
+pub const CLOSE: i32 = 2;
+
+// Dialog and control styles, from `winuser.h` and `commctrl.h`.
+const WS_POPUP: u32 = 0x8000_0000;
+const WS_CAPTION: u32 = 0x00C0_0000;
+const WS_SYSMENU: u32 = 0x0008_0000;
+const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+const WS_TABSTOP: u32 = 0x0001_0000;
+const WS_VSCROLL: u32 = 0x0020_0000;
+const DS_SETFONT: u32 = 0x0000_0040;
+const DS_MODALFRAME: u32 = 0x0000_0080;
+/// `BS_AUTOCHECKBOX`.
+const BS_AUTOCHECKBOX: u32 = 0x0003;
+const BS_PUSHBUTTON: u32 = 0x0000;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
+/// An editable combo box with a drop-down list. Named so a test can assert the selector is not this.
 pub const CBS_DROPDOWN: u32 = 0x0002;
 /// A drop-down list that is not editable. This is the one the settings window uses.
 pub const CBS_DROPDOWNLIST: u32 = 0x0003;
-/// The list part keeps its own height instead of being sized to fit the edit field.
+/// The list part keeps its own height instead of being sized to fit an edit field.
 const CBS_NOINTEGRALHEIGHT: u32 = 0x0040;
+/// `SS_LEFT`.
+const SS_LEFT: u32 = 0x0000;
 
-/// The style bits for the left-click selector.
-///
-/// Pure, so the value is asserted by a test instead of being trusted from a comment: the previous
-/// build passed `CBS_DROPDOWN` with a comment claiming `CBS_DROPDOWNLIST`, which made the selector an
-/// editable text field with a misleading label.
-pub fn combo_style() -> u32 {
-    CBS_DROPDOWNLIST | CBS_NOINTEGRALHEIGHT | WS_TABSTOP
-}
-
-/// Control identifiers. `WM_COMMAND` reports these.
-pub const COMBO: i32 = 10;
-pub const STARTUP_BOX: i32 = 11;
-pub const SELECT_MONITORS: i32 = 12;
-pub const OPEN_PROFILES: i32 = 13;
-pub const CLOSE: i32 = 14;
+const WM_INITDIALOG: u32 = 0x0110;
+const WM_COMMAND: u32 = 0x0111;
+const WM_CLOSE: u32 = 0x0010;
+const CBN_SELCHANGE: u16 = 1;
+const BN_CLICKED: u16 = 0;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_SETCURSEL: u32 = 0x014E;
+const CB_GETCURSEL: u32 = 0x0147;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
+const BST_CHECKED: usize = 1;
+const BST_UNCHECKED: usize = 0;
 
 /// What the window asks its owner to do. The owner performs it and reports the outcome back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// The user changed the left-click behaviour; the value is the one to store.
     LeftClick(LeftClick),
+    /// The user changed `tray.always_show_monitor_name`.
+    AlwaysShowMonitorName(bool),
     /// The user asked for the monitor selection dialog.
     SelectMonitors,
     /// The user asked for the profiles directory.
     OpenProfiles,
+    /// The user asked the coordinator to re-read the profiles directory.
+    ReloadProfiles,
+    /// The user asked for the repository page.
+    OpenRepository,
     /// The user closed the window.
     Close,
 }
 
-/// The state the window shows when it opens.
+/// The state the window shows when it opens, and again after every action.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     /// Current left-click behaviour.
     pub left_click: LeftClick,
-    /// How many monitors this instance controls, for the selection line.
+    /// Current `tray.always_show_monitor_name`.
+    pub always_show_monitor_name: bool,
+    /// How many monitors this instance controls, for the summary line.
     pub monitors: usize,
     /// How many profiles are loaded.
     pub profiles: usize,
@@ -117,56 +154,205 @@ pub fn startup_text(registered: bool) -> String {
 
 /// The summary line under the controls.
 pub fn summary_text(monitors: usize, profiles: usize) -> String {
-    format!(
-        "{monitors} monitor(s) controlled, {profiles} profile(s) loaded"
-    )
+    format!("{monitors} monitor(s) controlled, {profiles} profile(s) loaded")
 }
 
-struct Metrics {
-    width: i32,
-    margin: i32,
-    label: i32,
-    row: i32,
-    gap: i32,
+// ---------------------------------------------------------------------------
+// The dialog template
+// ---------------------------------------------------------------------------
+
+/// The dialog's own style bits, as one value so a test can assert what the window is.
+pub fn dialog_style() -> u32 {
+    // A framed, owned window with a close box and no maximise or minimise: the standard shape of a
+    // settings dialog, and the reason the previous bare popup looked like nothing else on the system.
+    DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN
 }
 
-impl Metrics {
-    fn new(dpi: u32) -> Metrics {
-        let scale = |px: i32| (px * dpi as i32 + 48) / 96;
-        Metrics {
-            width: scale(380),
-            margin: scale(12),
-            label: scale(20),
-            row: scale(26),
-            gap: scale(8),
+/// One control in the template, before it is serialised.
+struct Item {
+    style: u32,
+    id: i32,
+    class: Class,
+    text: String,
+    /// Dialog units: x, y, width, height.
+    rect: (i16, i16, i16, i16),
+}
+
+#[derive(Clone, Copy)]
+enum Class {
+    Button,
+    Static,
+    ComboBox,
+}
+
+impl Class {
+    /// The predefined class atom the template uses (`0xFFFF`, ordinal).
+    fn ordinal(self) -> u16 {
+        match self {
+            Class::Button => 0x0080,
+            Class::Static => 0x0082,
+            Class::ComboBox => 0x0085,
         }
     }
+}
 
-    fn combo_top(&self) -> i32 {
-        self.margin + self.label + self.gap
-    }
+fn push_u16(out: &mut Vec<u16>, value: u16) {
+    out.push(value);
+}
 
-    fn startup_top(&self) -> i32 {
-        self.combo_top() + self.row + self.gap * 2
-    }
+fn push_u32(out: &mut Vec<u16>, value: u32) {
+    out.push((value & 0xFFFF) as u16);
+    out.push((value >> 16) as u16);
+}
 
-    fn summary_top(&self) -> i32 {
-        self.startup_top() + self.row + self.gap
-    }
+fn push_i16(out: &mut Vec<u16>, value: i16) {
+    out.push(value as u16);
+}
 
-    fn buttons_top(&self) -> i32 {
-        self.summary_top() + self.label + self.gap
-    }
+fn push_text(out: &mut Vec<u16>, text: &str) {
+    out.extend(text.encode_utf16());
+    out.push(0);
+}
 
-    fn height(&self) -> i32 {
-        self.buttons_top() + 2 * self.row + self.gap + self.margin
+fn align_dword(out: &mut Vec<u16>) {
+    if out.len() % 2 != 0 {
+        out.push(0);
     }
 }
+
+/// The combo style, read from the template by the tests as well as used to build it.
+fn combo_style() -> u32 {
+    // Not editable: a drop-down list has no edit field at all. The previous build passed 0x0002 here
+    // under a comment claiming this constant, which is the defect the test pins down.
+    CBS_DROPDOWNLIST | CBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+}
+
+/// The rows the template holds, in tab order.
+fn items(snapshot: &Snapshot) -> Vec<Item> {
+    vec![
+        Item {
+            style: SS_LEFT,
+            id: 0,
+            class: Class::Static,
+            text: String::from("Left click on the tray icon"),
+            rect: (7, 6, 226, 9),
+        },
+        Item {
+            style: combo_style(),
+            id: COMBO,
+            class: Class::ComboBox,
+            text: String::new(),
+            rect: (7, 17, 226, 64),
+        },
+        Item {
+            style: BS_AUTOCHECKBOX | WS_TABSTOP,
+            id: MONITOR_NAME_BOX,
+            class: Class::Button,
+            text: String::from("Always show monitor name"),
+            rect: (7, 86, 226, 10),
+        },
+        Item {
+            style: BS_AUTOCHECKBOX | WS_TABSTOP,
+            id: STARTUP_BOX,
+            class: Class::Button,
+            text: startup_text(snapshot.start_at_logon),
+            rect: (7, 98, 226, 10),
+        },
+        Item {
+            style: SS_LEFT,
+            id: 0,
+            class: Class::Static,
+            text: summary_text(snapshot.monitors, snapshot.profiles),
+            rect: (7, 110, 226, 9),
+        },
+        Item {
+            style: BS_PUSHBUTTON | WS_TABSTOP,
+            id: SELECT_MONITORS,
+            class: Class::Button,
+            text: String::from("Select monitors..."),
+            rect: (7, 124, 110, 14),
+        },
+        Item {
+            style: BS_PUSHBUTTON | WS_TABSTOP,
+            id: OPEN_PROFILES,
+            class: Class::Button,
+            text: String::from("Open profiles directory"),
+            rect: (123, 124, 110, 14),
+        },
+        Item {
+            style: BS_PUSHBUTTON | WS_TABSTOP,
+            id: RELOAD_PROFILES,
+            class: Class::Button,
+            text: String::from("Reload profiles"),
+            rect: (7, 141, 110, 14),
+        },
+        Item {
+            style: BS_PUSHBUTTON | WS_TABSTOP,
+            id: OPEN_REPOSITORY,
+            class: Class::Button,
+            text: String::from("Open repository"),
+            rect: (123, 141, 110, 14),
+        },
+        Item {
+            style: BS_DEFPUSHBUTTON | WS_TABSTOP,
+            id: CLOSE,
+            class: Class::Button,
+            text: String::from("Close"),
+            rect: (158, 162, 75, 14),
+        },
+    ]
+}
+
+/// Serialise a `DLGTEMPLATE` and its items exactly as `CreateDialogIndirectParamW` expects.
+///
+/// The structure is a sequence of 16-bit words: header, menu, class, title, font, then per item the
+/// `DLGITEMTEMPLATE` followed by its class, title and creation-data length. Item records must start on
+/// a `DWORD` boundary, which is why every item is preceded by an alignment step.
+fn build_template(snapshot: &Snapshot) -> Vec<u16> {
+    let rows = items(snapshot);
+    let mut out: Vec<u16> = Vec::new();
+    push_u32(&mut out, dialog_style());
+    push_u32(&mut out, 0); // no extended style
+    push_u16(&mut out, rows.len() as u16);
+    push_i16(&mut out, 0); // x
+    push_i16(&mut out, 0); // y
+    push_i16(&mut out, 246); // width, dialog units
+    push_i16(&mut out, 184); // height
+    push_u16(&mut out, 0); // no menu
+    push_u16(&mut out, 0); // default window class
+    push_text(&mut out, "broiler settings");
+    // DS_SETFONT: point size and typeface. `MS Shell Dlg` is the shell's UI font alias, so the dialog
+    // follows the user's font and DPI instead of pinning a bitmap font.
+    push_u16(&mut out, 9);
+    push_text(&mut out, "MS Shell Dlg");
+
+    for row in rows {
+        align_dword(&mut out);
+        push_u32(&mut out, row.style);
+        push_u32(&mut out, 0);
+        push_i16(&mut out, row.rect.0);
+        push_i16(&mut out, row.rect.1);
+        push_i16(&mut out, row.rect.2);
+        push_i16(&mut out, row.rect.3);
+        push_u32(&mut out, row.id as u32);
+        push_u16(&mut out, 0xFFFF);
+        push_u16(&mut out, row.class.ordinal());
+        push_text(&mut out, &row.text);
+        push_u16(&mut out, 0); // no creation data
+    }
+    align_dword(&mut out);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The running window
+// ---------------------------------------------------------------------------
 
 /// The open window.
 pub struct Settings {
     window: HWND,
     combo: HWND,
+    monitor_name: HWND,
     summary: HWND,
     user: *mut c_void,
     snapshot: fn(*mut c_void) -> Snapshot,
@@ -184,123 +370,127 @@ impl Drop for Settings {
     }
 }
 
-const SETTINGS_CLASS: &str = "BroilerSettings";
-
+/// The dialog procedure. A dialog procedure returns `1` for a message it handled, unlike a window
+/// procedure's `LRESULT`.
 unsafe extern "system" fn settings_proc(
     window: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-) -> LRESULT {
-    if message == 0x0081 {
-        let create = &*(lparam as *const CREATESTRUCTW);
-        SetWindowLongPtrW(window, GWLP_USERDATA, create.lpCreateParams as isize);
-        return 1;
-    }
-    if message == 0x0082 {
-        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-        return 0;
-    }
-    let settings = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut Settings;
-    let Some(settings) = settings.as_ref() else {
-        return DefWindowProcW(window, message, wparam, lparam);
-    };
-
+) -> isize {
     match message {
-        0x0010 => {
-            // The close box behaves like the Close button.
-            (settings.apply)(settings.user, Action::Close);
-            DestroyWindow(window);
-            0
+        WM_INITDIALOG => {
+            let settings = lparam as *const Settings as *mut Settings;
+            SetWindowLongPtrW(window, GWLP_USERDATA, settings as isize);
+            if settings.is_null() {
+                return 1;
+            }
+            let settings = &*settings;
+            let snapshot = (settings.snapshot)(settings.user);
+            let combo = GetDlgItem(window, COMBO);
+            for (index, (label, _)) in left_click_items().iter().enumerate() {
+                let text = to_wide(label);
+                SendMessageW(combo, CB_ADDSTRING, index, text.as_ptr() as isize);
+            }
+            SendMessageW(
+                combo,
+                CB_SETCURSEL,
+                left_click_index(snapshot.left_click),
+                0,
+            );
+            SendMessageW(
+                settings.monitor_name,
+                BM_SETCHECK,
+                if snapshot.always_show_monitor_name {
+                    BST_CHECKED
+                } else {
+                    BST_UNCHECKED
+                },
+                0,
+            );
+            // This build registers nothing at logon, so the control is shown and disabled rather than
+            // offering a promise it cannot keep.
+            EnableWindow(GetDlgItem(window, STARTUP_BOX), 0);
+            let text = to_wide(&summary_text(snapshot.monitors, snapshot.profiles));
+            SetWindowTextW(settings.summary, text.as_ptr());
+            SetFocus(combo);
+            1
         }
-        0x0111 => {
+        WM_COMMAND => {
             let control = (wparam & 0xFFFF) as i32;
             let code = ((wparam >> 16) & 0xFFFF) as u16;
-            let sender = lparam as HWND;
-            // 1 = CBN_SELCHANGE, 0 = BN_CLICKED.
-            if control == COMBO && code == 1 {
-                let index = SendMessageW(settings.combo, 0x0147, 0, 0) as usize; // CB_GETCURSEL
-                let chosen = left_click_at(index);
-                if !(settings.apply)(settings.user, Action::LeftClick(chosen)) {
-                    // The write did not happen, so the combo must not claim it did.
-                    let stored = (settings.snapshot)(settings.user).left_click;
-                    SendMessageW(settings.combo, 0x014E, left_click_index(stored), 0);
-                }
+            let user = GetWindowLongPtrW(window, GWLP_USERDATA) as *const Settings as *mut Settings;
+            let Some(settings) = user.as_ref() else {
                 return 0;
-            }
-            if code == 0 && sender == settings.combo {
-                return 0;
-            }
-            if code == 0 {
-                match control {
-                    SELECT_MONITORS => {
-                        (settings.apply)(settings.user, Action::SelectMonitors);
+            };
+            match (control, code) {
+                (COMBO, CBN_SELCHANGE) => {
+                    let index = SendMessageW(settings.combo, CB_GETCURSEL, 0, 0) as usize;
+                    let chosen = left_click_at(index);
+                    if !(settings.apply)(settings.user, Action::LeftClick(chosen)) {
+                        // The write did not happen, so the combo must not claim it did.
+                        let stored = (settings.snapshot)(settings.user).left_click;
+                        SendMessageW(
+                            settings.combo,
+                            CB_SETCURSEL,
+                            left_click_index(stored),
+                            0,
+                        );
                     }
-                    OPEN_PROFILES => {
-                        (settings.apply)(settings.user, Action::OpenProfiles);
-                    }
-                    CLOSE => {
-                        (settings.apply)(settings.user, Action::Close);
-                        DestroyWindow(window);
-                    }
-                    _ => {}
+                    1
                 }
+                (MONITOR_NAME_BOX, BN_CLICKED) => {
+                    let checked = SendMessageW(settings.monitor_name, BM_GETCHECK, 0, 0) == 1;
+                    if !(settings.apply)(settings.user, Action::AlwaysShowMonitorName(checked)) {
+                        let stored = (settings.snapshot)(settings.user).always_show_monitor_name;
+                        SendMessageW(
+                            settings.monitor_name,
+                            BM_SETCHECK,
+                            if stored { BST_CHECKED } else { BST_UNCHECKED },
+                            0,
+                        );
+                    }
+                    1
+                }
+                (SELECT_MONITORS, BN_CLICKED) => {
+                    (settings.apply)(settings.user, Action::SelectMonitors);
+                    1
+                }
+                (OPEN_PROFILES, BN_CLICKED) => {
+                    (settings.apply)(settings.user, Action::OpenProfiles);
+                    1
+                }
+                (RELOAD_PROFILES, BN_CLICKED) => {
+                    (settings.apply)(settings.user, Action::ReloadProfiles);
+                    1
+                }
+                (OPEN_REPOSITORY, BN_CLICKED) => {
+                    (settings.apply)(settings.user, Action::OpenRepository);
+                    1
+                }
+                // Escape arrives as IDCANCEL; the close box arrives through WM_CLOSE.
+                (CLOSE, BN_CLICKED) => {
+                    (settings.apply)(settings.user, Action::Close);
+                    DestroyWindow(window);
+                    1
+                }
+                _ => 0,
             }
-            0
         }
-        _ => DefWindowProcW(window, message, wparam, lparam),
+        WM_CLOSE => {
+            let user = GetWindowLongPtrW(window, GWLP_USERDATA) as *const Settings as *mut Settings;
+            if let Some(settings) = user.as_ref() {
+                (settings.apply)(settings.user, Action::Close);
+            }
+            DestroyWindow(window);
+            1
+        }
+        _ => 0,
     }
-}
-
-unsafe fn register_class() {
-    let class_name = to_wide(SETTINGS_CLASS);
-    let mut class: WNDCLASSEXW = std::mem::zeroed();
-    class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-    class.style = CS_HREDRAW | CS_VREDRAW;
-    class.lpfnWndProc = Some(settings_proc);
-    class.hInstance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
-    class.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16);
-    class.lpszClassName = class_name.as_ptr();
-    let _ = RegisterClassExW(&class);
-    std::mem::forget(class_name);
-}
-
-unsafe fn add_control(
-    parent: HWND,
-    class: &str,
-    text: &str,
-    style: u32,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    id: i32,
-) -> HWND {
-    let class_name = to_wide(class);
-    let text = to_wide(text);
-    let control = CreateWindowExW(
-        0,
-        class_name.as_ptr(),
-        text.as_ptr(),
-        style | WS_CHILD | WS_VISIBLE,
-        x,
-        y,
-        width,
-        height,
-        parent,
-        id as usize as *mut c_void as HMENU,
-        windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()),
-        std::ptr::null_mut(),
-    );
-    if !control.is_null() {
-        let font = GetStockObject(DEFAULT_GUI_FONT as i32);
-        SendMessageW(control, 0x0030, font as WPARAM, 1);
-    }
-    control
 }
 
 impl Settings {
-    /// Create and show the window for `snapshot`.
+    /// Create and show the dialog for `snapshot`.
     pub fn open(
         owner: HWND,
         snapshot: &Snapshot,
@@ -309,137 +499,32 @@ impl Settings {
         apply: fn(*mut c_void, Action) -> bool,
     ) -> Option<Box<Settings>> {
         unsafe {
-            register_class();
-            let dpi = GetDpiForSystem().max(96);
-            let metrics = Metrics::new(dpi);
-            let width = metrics.width;
-            let height = metrics.height();
-
-            let mut window_state = Box::new(Settings {
+            let template_words = build_template(snapshot);
+            let mut state = Box::new(Settings {
                 window: std::ptr::null_mut(),
                 combo: std::ptr::null_mut(),
+                monitor_name: std::ptr::null_mut(),
                 summary: std::ptr::null_mut(),
                 user,
                 snapshot: read,
                 apply,
             });
 
-            let class_name = to_wide(SETTINGS_CLASS);
-            let title = to_wide("broiler settings");
-            let window = CreateWindowExW(
-                WS_EX_TOOLWINDOW,
-                class_name.as_ptr(),
-                title.as_ptr(),
-                windows_sys::Win32::UI::WindowsAndMessaging::WS_POPUP
-                    | windows_sys::Win32::UI::WindowsAndMessaging::WS_CAPTION
-                    | windows_sys::Win32::UI::WindowsAndMessaging::WS_SYSMENU,
-                0,
-                0,
-                width,
-                height,
+            let window = CreateDialogIndirectParamW(
+                GetModuleHandleW(std::ptr::null()),
+                template_words.as_ptr() as *const DLGTEMPLATE,
                 owner,
-                std::ptr::null_mut(),
-                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()),
-                &mut *window_state as *mut Settings as *const c_void,
+                Some(settings_proc),
+                &mut *state as *mut Settings as isize,
             );
             if window.is_null() {
                 return None;
             }
-            window_state.window = window;
-
-            let inner = width - 2 * metrics.margin;
-            add_control(
-                window,
-                "STATIC",
-                "Left click on the tray icon",
-                0,
-                metrics.margin,
-                metrics.margin,
-                inner,
-                metrics.label,
-                0,
-            );
-            let combo = add_control(
-                window,
-                "COMBOBOX",
-                "",
-                combo_style(),
-                metrics.margin,
-                metrics.combo_top(),
-                inner,
-                metrics.row * 6,
-                COMBO,
-            );
-            for (index, (label, _)) in left_click_items().iter().enumerate() {
-                let text = to_wide(label);
-                SendMessageW(combo, 0x0143, 0, text.as_ptr() as isize); // CB_ADDSTRING
-                let _ = index;
-            }
-            SendMessageW(combo, 0x014E, left_click_index(snapshot.left_click), 0); // CB_SETCURSEL
-
-            let startup = add_control(
-                window,
-                "BUTTON",
-                &startup_text(snapshot.start_at_logon),
-                BS_AUTOCHECKBOX,
-                metrics.margin,
-                metrics.startup_top(),
-                inner,
-                metrics.row,
-                STARTUP_BOX,
-            );
-            // This build registers nothing at logon, so the control is shown and disabled rather
-            // than offering a promise it cannot keep.
-            EnableWindow(startup, 0);
-
-            let summary = add_control(
-                window,
-                "STATIC",
-                &summary_text(snapshot.monitors, snapshot.profiles),
-                0,
-                metrics.margin,
-                metrics.summary_top(),
-                inner,
-                metrics.label,
-                0,
-            );
-
-            let half = (inner - metrics.gap) / 2;
-            add_control(
-                window,
-                "BUTTON",
-                "Select monitors\u{2026}",
-                WS_TABSTOP,
-                metrics.margin,
-                metrics.buttons_top(),
-                half,
-                metrics.row,
-                SELECT_MONITORS,
-            );
-            add_control(
-                window,
-                "BUTTON",
-                "Open profiles directory",
-                WS_TABSTOP,
-                metrics.margin + half + metrics.gap,
-                metrics.buttons_top(),
-                half,
-                metrics.row,
-                OPEN_PROFILES,
-            );
-
-            let button_width = (inner - 2 * metrics.gap) / 3;
-            add_control(
-                window,
-                "BUTTON",
-                "Close",
-                WS_TABSTOP | 0x0001, // BS_DEFPUSHBUTTON
-                metrics.margin,
-                metrics.buttons_top() + metrics.row + metrics.gap,
-                button_width,
-                metrics.row,
-                CLOSE,
-            );
+            state.window = window;
+            state.combo = GetDlgItem(window, COMBO);
+            state.monitor_name = GetDlgItem(window, MONITOR_NAME_BOX);
+            // The summary static has no identifier, so it is found by position among the children.
+            state.summary = summary_handle(window);
 
             let area = work_area_around_cursor().unwrap_or(RECT {
                 left: 0,
@@ -447,6 +532,10 @@ impl Settings {
                 right: GetSystemMetrics(SM_CXSCREEN),
                 bottom: GetSystemMetrics(SM_CYSCREEN),
             });
+            let mut bounds: RECT = std::mem::zeroed();
+            GetWindowRect(window, &mut bounds);
+            let width = bounds.right - bounds.left;
+            let height = bounds.bottom - bounds.top;
             let x = area.left + ((area.right - area.left) - width) / 2;
             let y = area.top + ((area.bottom - area.top) - height) / 2;
             SetWindowPos(
@@ -460,30 +549,40 @@ impl Settings {
             );
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
-            window_state.combo = combo;
-            window_state.summary = summary;
-            Some(window_state)
+            Some(state)
         }
     }
 
-    /// Show the behaviour the coordinator actually stored, which may differ from what was clicked if
-    /// the write failed.
-    pub fn set_left_click(&mut self, value: LeftClick) {
+    /// Show the state the coordinator actually holds, which may differ from what was clicked if the
+    /// write failed.
+    pub fn set_snapshot(&mut self, snapshot: &Snapshot) {
         if self.combo.is_null() {
             return;
         }
         unsafe {
-            SendMessageW(self.combo, 0x014E, left_click_index(value), 0);
+            SendMessageW(
+                self.combo,
+                CB_SETCURSEL,
+                left_click_index(snapshot.left_click),
+                0,
+            );
+            if !self.monitor_name.is_null() {
+                SendMessageW(
+                    self.monitor_name,
+                    BM_SETCHECK,
+                    if snapshot.always_show_monitor_name {
+                        BST_CHECKED
+                    } else {
+                        BST_UNCHECKED
+                    },
+                    0,
+                );
+            }
+            if !self.summary.is_null() {
+                let text = to_wide(&summary_text(snapshot.monitors, snapshot.profiles));
+                SetWindowTextW(self.summary, text.as_ptr());
+            }
         }
-    }
-
-    /// Update the counts after a selection change.
-    pub fn set_summary(&mut self, monitors: usize, profiles: usize) {
-        if self.summary.is_null() {
-            return;
-        }
-        let text = to_wide(&summary_text(monitors, profiles));
-        unsafe { SetWindowTextW(self.summary, text.as_ptr()) };
     }
 
     pub fn window_id(&self) -> isize {
@@ -495,9 +594,32 @@ impl Settings {
     }
 }
 
-/// `BS_AUTOCHECKBOX`. The style bits are spelled out because the crate exports them only through the
-/// controls module on some versions.
-const BS_AUTOCHECKBOX: u32 = 0x0003;
+/// The static row that carries the summary: the fifth item of the template, the second unlabelled one.
+unsafe fn summary_handle(window: HWND) -> HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GW_CHILD, GW_HWNDNEXT,
+    };
+    // Walk the children in creation order and take the second static with id 0 after the label.
+    let mut found: Vec<HWND> = Vec::new();
+    let mut child = GetWindow(window, GW_CHILD);
+    while !child.is_null() {
+        let class = {
+            let mut buffer = [0u16; 64];
+            let length = windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW(
+                child,
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+            );
+            String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+        };
+        if class.eq_ignore_ascii_case("Static") {
+            found.push(child);
+        }
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+    // The template order is: label, combo, name box, startup box, summary.
+    found.get(1).copied().unwrap_or(std::ptr::null_mut())
+}
 
 unsafe fn work_area_around_cursor() -> Option<RECT> {
     let mut point = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
@@ -514,21 +636,108 @@ unsafe fn work_area_around_cursor() -> Option<RECT> {
     Some(info.rcWork)
 }
 
+/// The system DPI, for a caller that needs to reason about the window's size.
+pub fn current_dpi() -> u32 {
+    unsafe { GetDpiForSystem().max(96) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            left_click: LeftClick::Flyout,
+            always_show_monitor_name: false,
+            monitors: 1,
+            profiles: 2,
+            start_at_logon: false,
+        }
+    }
+
+    #[test]
+    fn the_window_is_a_framed_dialog_with_a_system_font() {
+        let style = dialog_style();
+        // A framed window with a title bar and a close box: this is what the previous bare popup lacked.
+        assert_eq!(style & WS_CAPTION, WS_CAPTION);
+        assert_eq!(style & WS_SYSMENU, WS_SYSMENU);
+        assert_eq!(style & WS_POPUP, WS_POPUP);
+        assert_eq!(style & DS_MODALFRAME, DS_MODALFRAME);
+        // The dialog carries its own font, so it follows the user's UI font and DPI.
+        assert_eq!(style & DS_SETFONT, DS_SETFONT);
+        // No maximise or minimise box: a settings dialog is not a resizable document window.
+        assert_eq!(style & 0x0001_0000, 0, "WS_MAXIMIZEBOX must not be set");
+        assert_eq!(style & 0x0002_0000, 0, "WS_MINIMIZEBOX must not be set");
+    }
 
     #[test]
     fn the_selector_is_a_dropdown_list_and_not_an_editable_field() {
         let style = combo_style();
         // The two low bits are the combo type: 1 simple, 2 drop-down, 3 drop-down list.
         assert_eq!(style & 0x0003, CBS_DROPDOWNLIST, "style was {style:#06X}");
-        assert_eq!(style & 0x0003, 0x0003);
         assert_ne!(style & 0x0003, CBS_DROPDOWN);
-        // Not editable is the point: a drop-down list has no edit field at all.
         assert_eq!(CBS_DROPDOWNLIST, CBS_DROPDOWN | 0x0001);
-        // It stays reachable from the keyboard.
         assert_ne!(style & WS_TABSTOP, 0);
+    }
+
+    #[test]
+    fn the_template_is_the_shape_the_loader_expects() {
+        let rows = items(&snapshot());
+        let words = build_template(&snapshot());
+        // Header: style, exStyle, item count, rectangle, menu, class, title, font.
+        // The header is style (two words), extended style (two words), then the item count.
+        assert_eq!(words[0] as u32 | ((words[1] as u32) << 16), dialog_style());
+        assert_eq!(words[2] as u32 | ((words[3] as u32) << 16), 0);
+        assert_eq!(words[4], rows.len() as u16);
+        let mut expected: Vec<u16> = Vec::new();
+        push_text(&mut expected, "broiler settings");
+        assert!(words
+            .windows(expected.len())
+            .any(|window| window == expected.as_slice()));
+        let mut font: Vec<u16> = Vec::new();
+        push_text(&mut font, "MS Shell Dlg");
+        assert!(words
+            .windows(font.len())
+            .any(|window| window == font.as_slice()));
+        // Every item record starts on a DWORD boundary, which the dialog manager requires.
+        assert_eq!(words.len() % 2, 0);
+    }
+
+    #[test]
+    fn the_rows_are_in_tab_order_and_include_every_action() {
+        let rows = items(&snapshot());
+        let ids: Vec<i32> = rows.iter().map(|row| row.id).collect();
+        // The tab order the dialog walks: selector, name preference, startup, then the buttons.
+        assert_eq!(
+            ids,
+            vec![
+                0,
+                COMBO,
+                MONITOR_NAME_BOX,
+                STARTUP_BOX,
+                0,
+                SELECT_MONITORS,
+                OPEN_PROFILES,
+                RELOAD_PROFILES,
+                OPEN_REPOSITORY,
+                CLOSE
+            ]
+        );
+        // Close is the default button, so Enter closes and Escape (IDCANCEL) matches it.
+        let close = rows.iter().find(|row| row.id == CLOSE).expect("close row");
+        assert_eq!(close.style & BS_DEFPUSHBUTTON, BS_DEFPUSHBUTTON);
+        assert_eq!(CLOSE, 2, "the close button must be IDCANCEL so Escape works");
+    }
+
+    #[test]
+    fn every_control_is_reachable_from_the_keyboard() {
+        // Static rows are labels; every interactive row carries WS_TABSTOP.
+        for row in items(&snapshot()) {
+            let interactive = matches!(row.class, Class::ComboBox) || row.id != 0;
+            if interactive {
+                assert_ne!(row.style & WS_TABSTOP, 0, "control {} is not tabbable", row.id);
+            }
+        }
     }
 
     #[test]
@@ -562,14 +771,35 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_stacks_rows_without_overlapping_them() {
-        for dpi in [96u32, 120, 144, 192] {
-            let metrics = Metrics::new(dpi);
-            assert!(metrics.combo_top() >= metrics.margin + metrics.label);
-            assert!(metrics.startup_top() >= metrics.combo_top() + metrics.row);
-            assert!(metrics.summary_top() >= metrics.startup_top() + metrics.row);
-            assert!(metrics.buttons_top() >= metrics.summary_top() + metrics.label);
-            assert!(metrics.height() > metrics.buttons_top() + metrics.row);
+    fn the_dialog_scales_with_the_system_font_rather_than_a_pixel_grid() {
+        // Sizes are in dialog units, so the layout follows the font and DPI instead of a fixed pixel
+        // grid that would clip text on a scaled display.
+        let rows = items(&snapshot());
+        let width = rows
+            .iter()
+            .map(|row| row.rect.0 + row.rect.2)
+            .max()
+            .unwrap_or(0);
+        assert!(width <= 246, "a control is wider than the dialog: {width}");
+        let height = rows
+            .iter()
+            .map(|row| row.rect.1 + row.rect.3)
+            .max()
+            .unwrap_or(0);
+        assert!(height <= 184, "a control is taller than the dialog: {height}");
+        // No two rows in the same column overlap vertically.
+        for (index, left) in rows.iter().enumerate() {
+            for right in rows.iter().skip(index + 1) {
+                let overlap = left.rect.1 < right.rect.1 + right.rect.3
+                    && right.rect.1 < left.rect.1 + left.rect.3;
+                let same_column = left.rect.0 == right.rect.0;
+                assert!(!(overlap && same_column), "rows overlap at {}", left.rect.1);
+            }
         }
+    }
+
+    #[test]
+    fn the_current_dpi_is_sane() {
+        assert!((96..=768).contains(&current_dpi()));
     }
 }

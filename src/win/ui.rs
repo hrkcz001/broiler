@@ -702,9 +702,18 @@ pub fn entries_for(monitors: &[crate::transport::MonitorSummary]) -> Vec<Entry> 
 
 /// Open a directory with the shell's default handler.
 pub fn open_directory(directory: &Path) -> Result<(), String> {
+    let target = directory.display().to_string();
+    open_target(&target)
+}
+
+/// Open a path or URL with the shell's default handler.
+///
+/// The same call for a directory and a repository URL: the shell decides what "open" means, so the
+/// product never hardcodes a browser or a file manager.
+pub fn open_target(target: &str) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     let operation = to_wide("open");
-    let file = to_wide(&directory.display().to_string());
+    let file = to_wide(target);
     let result = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
@@ -716,7 +725,7 @@ pub fn open_directory(directory: &Path) -> Result<(), String> {
         )
     };
     if result as isize <= 32 {
-        return Err(format!("cannot open {}", directory.display()));
+        return Err(format!("cannot open {target}"));
     }
     Ok(())
 }

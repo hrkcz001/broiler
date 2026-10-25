@@ -612,6 +612,7 @@ fn settings_key_value(
         "startup.launch_at_login" => Some(json!(settings.launch_at_login)),
         "tray.left_click" => Some(json!(settings.left_click.as_str())),
         "tray.badges" => Some(json!("when_multiple")),
+        "tray.always_show_monitor_name" => Some(json!(settings.always_show_monitor_name)),
         "selection.remember" => Some(json!(settings.remember)),
         "selection.monitor_ids" => Some(json!(settings.monitor_ids)),
         "profiles.startup" => Some(json!("preserve")),

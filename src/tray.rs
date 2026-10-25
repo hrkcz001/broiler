@@ -35,8 +35,8 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
+    IsDialogMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
     CREATESTRUCTW,
     GWLP_USERDATA, ICONINFO, MF_STRING, SM_CXSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
@@ -152,18 +152,39 @@ pub fn icon_identity(monitor: &str) -> [u8; 16] {
     bytes
 }
 
-/// The tooltip for one icon: index and name, verified state, brightness when it is known.
+/// The monitor part of a tooltip.
 ///
-/// The contract asks for all four pieces, and for the tray tooltip to stay short enough for the
+/// One controlled monitor with `tray.always_show_monitor_name = false` omits the name: the owner asked
+/// for a label preference, and a single monitor needs no label to be identified. With several
+/// controlled monitors the index and name are always shown, because an unlabelled icon would be
+/// ambiguous.
+pub fn monitor_label(index: usize, total: usize, name: &str, show_name: bool) -> String {
+    if total > 1 {
+        return format!("{index}/{total} {name}");
+    }
+    if show_name {
+        return name.to_string();
+    }
+    String::new()
+}
+
+/// The tooltip for one icon: monitor label, verified state, brightness when it is known.
+///
+/// The contract asks for all pieces, and for the tray tooltip to stay short enough for the
 /// notification area.
-pub fn tooltip(index: usize, total: usize, name: &str, state: &str, brightness: Option<u32>) -> String {
-    let mut text = if total > 1 {
-        format!("{index}/{total} {name}")
-    } else {
-        name.to_string()
-    };
+pub fn tooltip(
+    index: usize,
+    total: usize,
+    name: &str,
+    show_name: bool,
+    state: &str,
+    brightness: Option<u32>,
+) -> String {
+    let mut text = monitor_label(index, total, name, show_name);
     if !state.is_empty() {
-        text.push_str(" - ");
+        if !text.is_empty() {
+            text.push_str(" - ");
+        }
         text.push_str(state);
     }
     if let Some(value) = brightness {
@@ -195,15 +216,32 @@ impl Bitmap {
         }
     }
 
-    fn put(&mut self, x: i32, y: i32, value: u8) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+    /// Write one pixel with straight alpha, `(red, green, blue, alpha)`, replacing what was there.
+    fn put(&mut self, x: i32, y: i32, colour: (u8, u8, u8), alpha: u8) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 || alpha == 0 {
             return;
         }
         let offset = ((y as u32 * self.width + x as u32) * 4) as usize;
-        self.pixels[offset] = value;
-        self.pixels[offset + 1] = value;
-        self.pixels[offset + 2] = value;
-        self.pixels[offset + 3] = 255;
+        self.pixels[offset] = colour.2;
+        self.pixels[offset + 1] = colour.1;
+        self.pixels[offset + 2] = colour.0;
+        self.pixels[offset + 3] = alpha;
+    }
+
+    /// One pixel as `(red, green, blue, alpha)`. Test-only: production code writes and hands the
+    /// buffer to the shell without reading it back.
+    #[cfg(test)]
+    fn pixel(&self, x: i32, y: i32) -> Option<(u8, u8, u8, u8)> {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return None;
+        }
+        let offset = ((y as u32 * self.width + x as u32) * 4) as usize;
+        Some((
+            self.pixels[offset + 2],
+            self.pixels[offset + 1],
+            self.pixels[offset],
+            self.pixels[offset + 3],
+        ))
     }
 
     /// Number of pixels that are not fully transparent.
@@ -211,13 +249,80 @@ impl Bitmap {
         self.pixels.chunks(4).filter(|pixel| pixel[3] != 0).count()
     }
 
-    /// True when every painted pixel is either white or black, which is what "monochrome" means here.
-    pub fn is_monochrome(&self) -> bool {
+    /// True when at least one pixel carries a colour that is not a shade of grey.
+    pub fn has_colour(&self) -> bool {
         self.pixels
             .chunks(4)
             .filter(|pixel| pixel[3] != 0)
-            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2])
+            .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2])
     }
+
+    /// Number of pixels whose alpha is neither 0 nor 255: the antialiased edge of a shape.
+    pub fn partial_alpha(&self) -> usize {
+        self.pixels
+            .chunks(4)
+            .filter(|pixel| pixel[3] != 0 && pixel[3] != 255)
+            .count()
+    }
+}
+
+/// The colours of the built-in set.
+///
+/// These are original flat glyphs, not an emoji font and not vendor artwork: one silhouette and one
+/// colour family per name, chosen so the shapes stay distinguishable in the notification area where
+/// colour alone cannot be relied on. `docs/architecture.md` asked for monochrome; the owner overrode
+/// that, and the reversal is recorded there with a date.
+fn palette(glyph: Glyph) -> (u8, u8, u8) {
+    match glyph {
+        Glyph::Day => (0xF2, 0xA3, 0x2B),
+        Glyph::Night => (0x5B, 0x6B, 0xD6),
+        Glyph::Dawn => (0xF0, 0x82, 0x4A),
+        Glyph::Dusk => (0x8B, 0x5C, 0xB5),
+        Glyph::Coding => (0x2F, 0xB3, 0xA6),
+        Glyph::Reading => (0xC9, 0x8B, 0x4B),
+        Glyph::Movie => (0xD8, 0x4A, 0x4A),
+        Glyph::Gaming => (0x4C, 0xAF, 0x50),
+        Glyph::Work => (0x44, 0x8A, 0xEF),
+        Glyph::Presentation => (0x76, 0x87, 0xA3),
+        Glyph::Photo => (0xD4, 0x5B, 0xB0),
+        Glyph::Eco => (0x3F, 0x9E, 0x4F),
+        Glyph::Focus => (0x2A, 0xA7, 0xC7),
+        Glyph::Monitor => (0x93, 0x9E, 0xAB),
+        Glyph::Custom => (0xA5, 0x7B, 0xD6),
+    }
+}
+
+/// The badge plate and its digits.
+///
+/// Opaque by design: a translucent plate over a coloured glyph would let the shape show through the
+/// numeral, and the number is the only cue that tells two icons of the same profile apart.
+const BADGE_PLATE: (u8, u8, u8) = (0x1B, 0x24, 0x2E);
+const BADGE_TEXT: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
+/// WCAG relative luminance of an sRGB colour, for the badge contrast test.
+fn luminance(colour: (u8, u8, u8)) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let value = value as f32 / 255.0;
+        if value <= 0.039_28 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(colour.0) + 0.7152 * channel(colour.1) + 0.0722 * channel(colour.2)
+}
+
+/// Contrast ratio between two opaque colours, `1.0` (identical) to `21.0` (black on white).
+pub fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
+    let (light, dark) = {
+        let (la, lb) = (luminance(a), luminance(b));
+        if la >= lb {
+            (la, lb)
+        } else {
+            (lb, la)
+        }
+    };
+    (light + 0.05) / (dark + 0.05)
 }
 
 /// 3x5 digits, so a two-digit badge needs no separate artwork and no cap at nine monitors.
@@ -234,128 +339,145 @@ const DIGITS: [[u8; 5]; 10] = [
     [0b111, 0b101, 0b111, 0b001, 0b111],
 ];
 
-/// Render one icon: a monochrome glyph, plus the numeric badge when several monitors are controlled.
+/// True when a point, relative to the glyph centre, lies inside the shape.
+///
+/// Separated from the rasteriser so the geometry can be sampled at sub-pixel positions for the
+/// antialiased edge, and so a test can reason about a silhouette without walking a bitmap.
+fn inside(glyph: Glyph, fx: f32, fy: f32, radius: f32, unit: f32) -> bool {
+    match glyph {
+        // A sun: a solid disk and eight rays, so it is not mistaken for a plain dot at 16 px. The
+        // rays are short and thick on purpose; thin spokes disappear.
+        Glyph::Day => {
+            let disk = fx * fx + fy * fy <= (radius * 0.66).powi(2);
+            let distance = (fx * fx + fy * fy).sqrt();
+            let angle = fy.atan2(fx);
+            let spoke = (angle.to_degrees() / 45.0).round() as i32;
+            let offset = angle.to_degrees() - spoke as f32 * 45.0;
+            let near_spoke = offset.abs() < 22.0;
+            let ring = distance >= radius * 0.80 && distance <= radius;
+            disk || (ring && near_spoke)
+        }
+        // A crescent: the disk minus a disk shifted up and right. The cut is generous enough that the
+        // remaining body is a wide arc instead of a sliver.
+        Glyph::Night => {
+            let outer = fx * fx + fy * fy <= radius * radius;
+            let cut = (fx - radius * 0.38).powi(2) + (fy + radius * 0.22).powi(2)
+                <= (radius * 0.74).powi(2);
+            outer && !cut
+        }
+        Glyph::Dawn | Glyph::Dusk => {
+            let disk = fx * fx + fy * fy <= radius * radius;
+            let horizon = fy > radius * 0.55;
+            disk || horizon && fx.abs() <= radius
+        }
+        Glyph::Monitor => {
+            let body = fx.abs() <= radius && fy.abs() <= radius * 0.72;
+            let stand = fx.abs() <= unit * 1.2 && fy > radius * 0.72 && fy <= radius;
+            let outline = fx.abs() > radius - unit * 1.2 || fy.abs() > radius * 0.72 - unit;
+            (body && outline) || stand
+        }
+        Glyph::Custom => {
+            // Sliders: two tracks with a knob each.
+            let track = |ymid: f32, knob: f32| {
+                (fy - ymid).abs() <= unit * 0.8 && fx.abs() <= radius
+                    || (fx - knob).abs() <= unit * 1.4 && (fy - ymid).abs() <= unit * 1.6
+            };
+            track(-radius * 0.4, -radius * 0.3) || track(radius * 0.4, radius * 0.4)
+        }
+        Glyph::Coding => {
+            // Two angle brackets: "< >" without a font.
+            let arm = |sign: f32| {
+                let slope = (fx * sign + radius * 0.15).abs();
+                let stroke = slope <= radius * 0.18 && fy.abs() <= radius * 0.8 && fx * sign < 0.0;
+                let cap = (fx - sign * radius * 0.35).abs() <= unit * 1.2 && fy.abs() <= radius * 0.16;
+                stroke || cap
+            };
+            arm(-1.0) || arm(1.0)
+        }
+        Glyph::Reading => {
+            // An open book: two pages with a spine between them.
+            let pages = fy.abs() <= radius * 0.7 && fx.abs() <= radius;
+            let spine = fx.abs() <= unit * 0.9;
+            pages && !spine
+        }
+        Glyph::Movie => {
+            let frame = fx.abs() <= radius && fy.abs() <= radius * 0.78;
+            let border = fx.abs() > radius - unit * 1.4 || fy.abs() > radius * 0.78 - unit;
+            let sprocket = ((fx / (radius * 0.5)).round() * radius * 0.5 - fx).abs() <= unit * 0.8
+                && fy.abs() <= radius * 0.78;
+            frame && (border || sprocket)
+        }
+        Glyph::Gaming => {
+            // A controller: a rounded body with two grips.
+            let body = fx.abs() <= radius && fy.abs() <= radius * 0.5;
+            let grip = ((fx.abs() - radius * 0.8).powi(2) + (fy - radius * 0.6).powi(2))
+                <= (radius * 0.35).powi(2);
+            body || grip
+        }
+        Glyph::Work => {
+            let body = fx.abs() <= radius && fy > -radius * 0.35 && fy <= radius * 0.75;
+            let outline = fx.abs() > radius - unit * 1.4 || fy > radius * 0.75 - unit * 1.4;
+            let handle = fx.abs() <= radius * 0.35 && fy <= -radius * 0.35 && fy > -radius * 0.75;
+            (body && outline) || handle
+        }
+        Glyph::Presentation => {
+            let board = fx.abs() <= radius && fy.abs() <= radius * 0.6;
+            let border = fx.abs() > radius - unit * 1.4 || fy.abs() > radius * 0.6 - unit;
+            let leg = (fx * 0.8).abs() <= unit && fy > radius * 0.6 && fy <= radius;
+            (board && border) || leg
+        }
+        Glyph::Photo => {
+            let body = fx.abs() <= radius && fy.abs() <= radius * 0.7;
+            let lens = fx * fx + fy * fy <= (radius * 0.35).powi(2);
+            let ring = (fx * fx + fy * fy <= (radius * 0.5).powi(2))
+                && !(fx * fx + fy * fy <= (radius * 0.32).powi(2));
+            body && (lens || ring)
+        }
+        Glyph::Eco => {
+            // A leaf: an ellipse rotated by using a sheared coordinate.
+            let sx = fx * 0.8 - fy * 0.4;
+            let sy = fx * 0.4 + fy * 0.8;
+            (sx * sx) / (radius * radius) + (sy * sy) / (radius * radius * 0.45) <= 1.0
+        }
+        Glyph::Focus => {
+            // A target: two concentric rings.
+            let outer = fx * fx + fy * fy <= radius * radius;
+            let inner_hole = fx * fx + fy * fy <= (radius * 0.62).powi(2);
+            let core = fx * fx + fy * fy <= (radius * 0.28).powi(2);
+            (outer && !inner_hole) || core
+        }
+    }
+}
+
+/// The four sub-pixel samples per pixel, giving the edge a partial alpha instead of a staircase.
+const SUBSAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+
+/// Render one icon: a coloured glyph, plus the numeric badge when several monitors are controlled.
 ///
 /// Drawing instead of loading an asset keeps the icon set inside the source, which is what the
-/// "no vendor logos, no emoji, no font dependency" rule needs, and it makes the geometry testable.
+/// "no vendor logos, no emoji, no font dependency" rule needs, and it makes the geometry and the
+/// colours testable.
 pub fn render(glyph: Glyph, badge: Option<u32>, size: u32) -> Bitmap {
     let mut bitmap = Bitmap::new(size);
     let unit = (size as f32) / 16.0;
     let centre = (size as f32) / 2.0;
     // A badge needs room, so the glyph shrinks into the upper-left three quarters. Without a badge
-    // the glyph fills the canvas: at 16 px every pixel of the small icon counts, and an art that
-    // covers two thirds of a 16 px square reads as a speck in the notification area.
+    // the glyph fills the canvas: at 16 px every pixel counts, and art that covers two thirds of a
+    // 16 px square reads as a speck in the notification area.
     let scale = if badge.is_some() { 0.72 } else { 1.0 };
     let radius = centre * 0.86 * scale;
     let cx = centre - if badge.is_some() { unit * 1.5 } else { 0.0 };
+    let colour = palette(glyph);
     for y in 0..size as i32 {
         for x in 0..size as i32 {
-            let fx = x as f32 + 0.5 - cx;
-            let fy = y as f32 + 0.5 - centre;
-            let inside = match glyph {
-                // A sun: a solid disk and eight rays, so it is not mistaken for a plain dot at
-                // 16 px. The rays are short and thick on purpose; thin spokes disappear.
-                Glyph::Day => {
-                    let disk = fx * fx + fy * fy <= (radius * 0.66).powi(2);
-                    let distance = (fx * fx + fy * fy).sqrt();
-                    let angle = fy.atan2(fx);
-                    let spoke = (angle.to_degrees() / 45.0).round() as i32;
-                    let offset = angle.to_degrees() - spoke as f32 * 45.0;
-                    let near_spoke = offset.abs() < 22.0;
-                    let ring = distance >= radius * 0.80 && distance <= radius;
-                    disk || (ring && near_spoke)
+            let mut hits = 0u32;
+            for (sx, sy) in SUBSAMPLES {
+                if inside(glyph, x as f32 + sx - cx, y as f32 + sy - centre, radius, unit) {
+                    hits += 1;
                 }
-                // A crescent: the disk minus a disk shifted up and right. The cut is generous enough
-                // that the remaining body is a wide arc instead of a sliver.
-                Glyph::Night => {
-                    let outer = fx * fx + fy * fy <= radius * radius;
-                    let cut = (fx - radius * 0.38).powi(2) + (fy + radius * 0.22).powi(2)
-                        <= (radius * 0.74).powi(2);
-                    outer && !cut
-                }
-                Glyph::Dawn | Glyph::Dusk => {
-                    let disk = fx * fx + fy * fy <= radius * radius;
-                    let horizon = fy > radius * 0.55;
-                    disk || horizon && fx.abs() <= radius
-                }
-                Glyph::Monitor => {
-                    let body = fx.abs() <= radius && fy.abs() <= radius * 0.72;
-                    let stand = fx.abs() <= unit * 1.2 && fy > radius * 0.72 && fy <= radius;
-                    let outline = fx.abs() > radius - unit * 1.2 || fy.abs() > radius * 0.72 - unit;
-                    (body && outline) || stand
-                }
-                Glyph::Custom => {
-                    // Sliders: two tracks with a knob each.
-                    let track = |ymid: f32, knob: f32| {
-                        (fy - ymid).abs() <= unit * 0.8 && fx.abs() <= radius
-                            || (fx - knob).abs() <= unit * 1.4 && (fy - ymid).abs() <= unit * 1.6
-                    };
-                    track(-radius * 0.4, -radius * 0.3) || track(radius * 0.4, radius * 0.4)
-                }
-                Glyph::Coding => {
-                    let arm = |sign: f32| {
-                        ((fx - sign * radius * 0.5).abs() <= unit * 1.6
-                            && (fy.abs() - (radius - fx * sign * 0.0)).abs() < radius * 0.2)
-                            || (fx - sign * radius * 0.9).abs() <= unit * 1.6 && fy.abs() <= radius
-                    };
-                    arm(-1.0) || arm(1.0) || (fy.abs() <= unit && fx.abs() <= radius)
-                }
-                Glyph::Reading => {
-                    // An open book: two pages that meet in the middle.
-                    (fy.abs() <= radius * 0.7 && fx.abs() <= radius && (fx - fx.round()).abs() > 0.0)
-                        && ((fx > 0.0) ^ (fy.abs() < radius * 0.1))
-                }
-                Glyph::Movie => {
-                    let frame = fx.abs() <= radius && fy.abs() <= radius * 0.78;
-                    let border = fx.abs() > radius - unit * 1.4 || fy.abs() > radius * 0.78 - unit;
-                    let sprocket = ((fx / (radius * 0.5)).round() * radius * 0.5 - fx).abs()
-                        <= unit * 0.8
-                        && fy.abs() <= radius * 0.78;
-                    frame && (border || sprocket)
-                }
-                Glyph::Gaming => {
-                    // A controller: a rounded body with two grips.
-                    let body = fx.abs() <= radius && fy.abs() <= radius * 0.5;
-                    let grip = ((fx.abs() - radius * 0.8).powi(2) + (fy - radius * 0.6).powi(2))
-                        <= (radius * 0.35).powi(2);
-                    body || grip
-                }
-                Glyph::Work => {
-                    let body = fx.abs() <= radius && fy > -radius * 0.35 && fy <= radius * 0.75;
-                    let outline = fx.abs() > radius - unit * 1.4 || fy > radius * 0.75 - unit * 1.4;
-                    let handle = fx.abs() <= radius * 0.35 && fy <= -radius * 0.35
-                        && fy > -radius * 0.75;
-                    (body && outline) || handle
-                }
-                Glyph::Presentation => {
-                    let board = fx.abs() <= radius && fy.abs() <= radius * 0.6;
-                    let border = fx.abs() > radius - unit * 1.4 || fy.abs() > radius * 0.6 - unit;
-                    let leg = (fx * 0.8).abs() <= unit && fy > radius * 0.6 && fy <= radius;
-                    (board && border) || leg
-                }
-                Glyph::Photo => {
-                    let body = fx.abs() <= radius && fy.abs() <= radius * 0.7;
-                    let lens = fx * fx + fy * fy <= (radius * 0.35).powi(2);
-                    let ring = (fx * fx + fy * fy <= (radius * 0.5).powi(2))
-                        && !(fx * fx + fy * fy <= (radius * 0.32).powi(2));
-                    body && (lens || ring)
-                }
-                Glyph::Eco => {
-                    // A leaf: an ellipse rotated by using a sheared coordinate.
-                    let sx = fx * 0.8 - fy * 0.4;
-                    let sy = fx * 0.4 + fy * 0.8;
-                    (sx * sx) / (radius * radius) + (sy * sy) / (radius * radius * 0.45) <= 1.0
-                }
-                Glyph::Focus => {
-                    // A target: two concentric rings.
-                    let outer = fx * fx + fy * fy <= radius * radius;
-                    let inner_hole = fx * fx + fy * fy <= (radius * 0.62).powi(2);
-                    let core = fx * fx + fy * fy <= (radius * 0.28).powi(2);
-                    (outer && !inner_hole) || core
-                }
-            };
-            if inside {
-                bitmap.put(x, y, 0xFF);
+            }
+            if hits > 0 {
+                bitmap.put(x, y, colour, (hits * 255 / 4) as u8);
             }
         }
     }
@@ -365,7 +487,10 @@ pub fn render(glyph: Glyph, badge: Option<u32>, size: u32) -> Bitmap {
     bitmap
 }
 
-/// The opaque badge: a white plate with the index in black, in the bottom-right corner.
+/// The badge: an opaque dark plate with white digits, in the bottom-right corner.
+///
+/// The plate is opaque so the numeral never competes with the shape underneath it, and the digit
+/// colour has a contrast ratio of about 14:1 against the plate.
 fn draw_badge(bitmap: &mut Bitmap, value: u32, unit: f32) {
     let digits: Vec<u32> = value
         .to_string()
@@ -382,7 +507,7 @@ fn draw_badge(bitmap: &mut Bitmap, value: u32, unit: f32) {
     let y0 = bitmap.height as f32 - plate_height;
     for y in y0 as i32..bitmap.height as i32 {
         for x in x0 as i32..bitmap.width as i32 {
-            bitmap.put(x, y, 0xFF);
+            bitmap.put(x, y, BADGE_PLATE, 255);
         }
     }
     for (position, digit) in digits.iter().enumerate() {
@@ -395,7 +520,7 @@ fn draw_badge(bitmap: &mut Bitmap, value: u32, unit: f32) {
                     let py = top + row as f32 * unit;
                     for dy in 0..unit.ceil() as i32 {
                         for dx in 0..unit.ceil() as i32 {
-                            bitmap.put(px as i32 + dx, py as i32 + dy, 0x00);
+                            bitmap.put(px as i32 + dx, py as i32 + dy, BADGE_TEXT, 255);
                         }
                     }
                 }
@@ -563,7 +688,12 @@ unsafe extern "system" fn tray_proc(
             0
         }
         crate::win::flyout::RESULT => {
-            tray.flyout_result(wparam as usize, lparam == 0);
+            // `lParam` 2 means the request is still in flight; 0 and 1 are the outcome.
+            if lparam == 2 {
+                tray.flyout_pending(wparam as usize);
+            } else {
+                tray.flyout_result(wparam as usize, lparam == 0);
+            }
             0
         }
         0x0111 => {
@@ -840,6 +970,11 @@ impl Tray {
     }
 
     /// Run the message loop until the window quits.
+    ///
+    /// A modeless dialog does not get its keyboard semantics from `DispatchMessage` alone: Tab, the
+    /// default button and Escape come from `IsDialogMessage`, which is why the open settings window is
+    /// offered every message before it is dispatched. Without this call a dialog looks native and
+    /// behaves like a dead form.
     pub fn run(&mut self) -> i32 {
         let mut message: windows_sys::Win32::UI::WindowsAndMessaging::MSG =
             unsafe { std::mem::zeroed() };
@@ -850,6 +985,17 @@ impl Tray {
             }
             if result == -1 {
                 return 1;
+            }
+            let settings_window = self
+                .settings
+                .as_ref()
+                .filter(|settings| settings.is_open())
+                .map(|settings| settings.window_id() as windows_sys::Win32::Foundation::HWND)
+                .unwrap_or(std::ptr::null_mut());
+            if !settings_window.is_null()
+                && unsafe { IsDialogMessageW(settings_window, &message) } != 0
+            {
+                continue;
             }
             unsafe {
                 TranslateMessage(&message);
@@ -929,8 +1075,7 @@ impl Tray {
             return;
         }
         let snapshot = (self.callbacks.settings_snapshot)(self.callbacks.user);
-        window.set_left_click(snapshot.left_click);
-        window.set_summary(snapshot.monitors, snapshot.profiles);
+        window.set_snapshot(&snapshot);
     }
 
     /// Show the profile flyout for the monitor at `slot`.
@@ -958,35 +1103,48 @@ impl Tray {
         }
     }
 
+    /// Show that a row's apply is in flight, in the status area.
+    ///
+    /// The row's own text and marker do not change: a profile name must not be rewritten because an
+    /// operation started, and the marker states what is true, not what was requested.
+    pub fn flyout_pending(&mut self, row: usize) {
+        let (slot, open) = match self.flyout.as_ref() {
+            Some(flyout) => (flyout.target(), flyout.is_open()),
+            None => return,
+        };
+        if !open {
+            self.flyout = None;
+            return;
+        }
+        if let Some(flyout) = self.flyout.as_mut() {
+            flyout.set_state(row, crate::win::flyout::State::Pending);
+        }
+        self.refresh_icon(slot);
+    }
+
     /// Report the outcome of a click back into the open flyout, then refresh what the icon claims.
+    ///
+    /// The marker is never set here from the click: it is re-read from the coordinator's current
+    /// snapshot, so a successful apply and a read-only match both show the truth and a refused one
+    /// shows the reason in the status area.
     pub fn flyout_result(&mut self, row: usize, applied: bool) {
-        let Some(flyout) = self.flyout.as_mut() else {
+        let Some(flyout) = self.flyout.as_ref() else {
             return;
         };
         if !flyout.is_open() {
             self.flyout = None;
             return;
         }
-        if applied {
-            let items = flyout.item_count();
-            for index in 0..items {
-                flyout.set_state(
-                    index,
-                    if index == row {
-                        crate::win::flyout::State::Current
-                    } else {
-                        crate::win::flyout::State::Normal
-                    },
-                );
-            }
-        } else {
+        let slot = flyout.target();
+        if !applied {
             let reason = (self.callbacks.failure)(self.callbacks.user)
                 .unwrap_or_else(|| String::from("the coordinator refused the profile"));
-            flyout.set_state(row, crate::win::flyout::State::Failed(reason));
+            if let Some(flyout) = self.flyout.as_mut() {
+                flyout.set_state(row, crate::win::flyout::State::Failed(reason));
+            }
         }
-        let slot = flyout.target();
-        self.refresh_icon(slot);
-        self.refresh_tooltip(slot);
+        self.publish_state();
+        let _ = slot;
     }
 
     /// Update every surface that shows state, after one publication from the coordinator.
@@ -1219,31 +1377,105 @@ mod tests {
     #[test]
     fn a_tooltip_carries_index_state_and_brightness() {
         assert_eq!(
-            tooltip(2, 3, "MSI MAG275R", "Night", Some(0)),
+            tooltip(2, 3, "MSI MAG275R", true, "Night", Some(0)),
             "2/3 MSI MAG275R - Night, 0%"
         );
-        // With one monitor the index is redundant.
-        assert_eq!(tooltip(1, 1, "MSI MAG275R", "Custom", None), "MSI MAG275R - Custom");
-        assert!(tooltip(1, 1, "MSI MAG275R", "Custom", None).chars().count() <= 120);
+        // With one monitor the index is redundant; the name follows the preference.
+        assert_eq!(
+            tooltip(1, 1, "MSI MAG275R", true, "Custom", None),
+            "MSI MAG275R - Custom"
+        );
+        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Custom", None), "Custom");
+        assert!(tooltip(1, 1, "MSI MAG275R", true, "Custom", None).chars().count() <= 120);
+    }
+
+    #[test]
+    fn the_monitor_name_is_omitted_only_for_one_monitor_and_only_when_asked() {
+        // One monitor, preference off: no name at all.
+        assert_eq!(monitor_label(1, 1, "MSI MAG275R", false), "");
+        // One monitor, preference on: the name.
+        assert_eq!(monitor_label(1, 1, "MSI MAG275R", true), "MSI MAG275R");
+        // Several monitors: index and name regardless of the preference.
+        assert_eq!(monitor_label(2, 2, "MSI MAG275R", false), "2/2 MSI MAG275R");
+        assert_eq!(monitor_label(2, 2, "MSI MAG275R", true), "2/2 MSI MAG275R");
+        // With the name omitted the tooltip starts at the state, with no leading separator.
+        assert_eq!(tooltip(1, 1, "MSI MAG275R", false, "Night", Some(40)), "Night, 40%");
     }
 
     #[test]
     fn a_long_tooltip_is_truncated_without_splitting_a_character() {
         let name = "М".repeat(200);
-        let text = tooltip(1, 1, &name, "Night", None);
+        let text = tooltip(1, 1, &name, true, "Night", None);
         assert!(text.chars().count() <= 120, "{}", text.chars().count());
         assert!(text.ends_with('…'));
     }
 
+    /// Every built-in glyph name, for tests that must cover the whole set.
+    const ALL_GLYPHS: [Glyph; 15] = [
+        Glyph::Monitor,
+        Glyph::Custom,
+        Glyph::Day,
+        Glyph::Night,
+        Glyph::Dawn,
+        Glyph::Dusk,
+        Glyph::Coding,
+        Glyph::Reading,
+        Glyph::Movie,
+        Glyph::Gaming,
+        Glyph::Work,
+        Glyph::Presentation,
+        Glyph::Photo,
+        Glyph::Eco,
+        Glyph::Focus,
+    ];
+
     #[test]
-    fn an_icon_is_drawn_monochrome_with_content() {
-        for glyph in [Glyph::Monitor, Glyph::Day, Glyph::Night, Glyph::Custom, Glyph::Eco] {
-            for size in [16u32, 24, 32] {
+    fn every_glyph_is_drawn_in_colour_with_content_at_real_tray_sizes() {
+        // The owner rejected the monochrome set; this is the assertion that replaces the old one.
+        for glyph in ALL_GLYPHS {
+            for size in [16u32, 20, 24, 32, 48] {
                 let icon = render(glyph, None, size);
                 assert_eq!(icon.width, size);
                 assert_eq!(icon.pixels.len(), (size * size * 4) as usize);
                 assert!(icon.painted() > 10, "{glyph:?} at {size} painted nothing");
-                assert!(icon.is_monochrome(), "{glyph:?} at {size} used colour");
+                assert!(icon.has_colour(), "{glyph:?} at {size} was drawn in grey");
+            }
+        }
+    }
+
+    #[test]
+    fn a_glyph_edge_carries_partial_alpha_instead_of_a_staircase() {
+        // Supersampling is what makes a 16 px icon look drawn; a hard mask has only 0 and 255.
+        for glyph in [Glyph::Day, Glyph::Night, Glyph::Focus] {
+            let icon = render(glyph, None, 16);
+            assert!(
+                icon.partial_alpha() > 4,
+                "{glyph:?} had {} antialiased pixels",
+                icon.partial_alpha()
+            );
+            // No pixel is fully opaque outside the alpha range, and transparent pixels stay colourless.
+            for pixel in icon.pixels.chunks(4) {
+                if pixel[3] == 0 {
+                    assert_eq!(&pixel[..3], &[0, 0, 0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_glyphs_have_distinct_silhouettes_and_distinct_colours() {
+        // Colour alone cannot carry the meaning: the notification area may render at 16 px, in High
+        // Contrast, or on a coloured taskbar. Two names must differ in shape as well as in hue.
+        for (index, left) in ALL_GLYPHS.iter().enumerate() {
+            for right in ALL_GLYPHS.iter().skip(index + 1) {
+                let a = render(*left, None, 32);
+                let b = render(*right, None, 32);
+                assert_ne!(a.pixels, b.pixels, "{left:?} and {right:?} look identical");
+                assert_ne!(
+                    palette(*left),
+                    palette(*right),
+                    "{left:?} and {right:?} share a colour"
+                );
             }
         }
     }
@@ -1275,6 +1507,38 @@ mod tests {
         // The badge is opaque and touches the bottom-right corner.
         let corner = ((31 * 32 + 31) * 4) as usize;
         assert_eq!(tenth.pixels[corner + 3], 255);
+    }
+
+    #[test]
+    fn the_badge_digits_are_readable_on_an_opaque_plate() {
+        // White on the dark plate, well above the WCAG 4.5:1 minimum for small text, so the numeral
+        // survives at 16 px without relying on the glyph's own colour.
+        assert!(
+            contrast_ratio(BADGE_TEXT, BADGE_PLATE) >= 4.5,
+            "contrast was {}",
+            contrast_ratio(BADGE_TEXT, BADGE_PLATE)
+        );
+        // The plate is a solid block: every pixel of the bottom-right corner is opaque.
+        let icon = render(Glyph::Day, Some(2), 16);
+        let corner = ((15 * 16 + 15) * 4) as usize;
+        assert_eq!(icon.pixels[corner + 3], 255);
+        // And the digits are painted on it: the badge area contains both plate and text colours.
+        let mut plate = 0usize;
+        let mut text = 0usize;
+        for y in 10..16 {
+            for x in 10..16 {
+                if let Some(pixel) = icon.pixel(x, y) {
+                    if pixel.3 == 255 && (pixel.0, pixel.1, pixel.2) == BADGE_PLATE {
+                        plate += 1;
+                    }
+                    if pixel.3 == 255 && (pixel.0, pixel.1, pixel.2) == BADGE_TEXT {
+                        text += 1;
+                    }
+                }
+            }
+        }
+        assert!(plate > 8, "plate pixels: {plate}");
+        assert!(text > 3, "digit pixels: {text}");
     }
 
     #[test]

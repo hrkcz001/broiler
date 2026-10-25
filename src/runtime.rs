@@ -778,17 +778,21 @@ fn tray_tooltip(user: *mut std::ffi::c_void, monitor: usize) -> String {
         .get(monitor)
         .cloned()
         .unwrap_or_else(|| fallback.clone());
-    let (brightness, state) = match host.coordinator.lock() {
+    let (brightness, state, show_name) = match host.coordinator.lock() {
         Ok(guard) => {
             let brightness = guard
                 .cached_reading(&fallback, "brightness")
                 .map(|reading| reading.current as u32);
             // The display name of the profile, not the file id the user never sees.
-            (brightness, state_label(&guard, &fallback))
+            (
+                brightness,
+                state_label(&guard, &fallback),
+                guard.settings().always_show_monitor_name,
+            )
         }
-        Err(_) => (None, String::from("Custom")),
+        Err(_) => (None, String::from("Custom"), false),
     };
-    crate::tray::tooltip(monitor + 1, total, &name, &state, brightness)
+    crate::tray::tooltip(monitor + 1, total, &name, show_name, &state, brightness)
 }
 
 fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate::tray::Activation) {
@@ -839,10 +843,10 @@ fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate
     }
 }
 
-/// The rows the flyout shows: every profile in registry order, with the verified one marked.
+/// The rows the flyout shows: every profile in registry order, with the certified one marked.
 ///
-/// The current marker comes from `applied_profile`, which only reports what this process verified;
-/// an edited file or a monitor that was never touched shows no marker rather than a guess.
+/// The marker comes from the coordinator's current snapshot, which is the same answer the icon and the
+/// tooltip read; a monitor whose state is unknown shows no marker rather than a guess.
 fn tray_flyout_content(
     user: *mut std::ffi::c_void,
     slot: usize,
@@ -851,19 +855,25 @@ fn tray_flyout_content(
 
     let Some(host) = (unsafe { host(user) }) else {
         return Content {
-            title: crate::win::flyout::title_text(slot + 1, PRODUCT_NAME),
+            title: crate::win::flyout::heading(
+                slot + 1,
+                0,
+                PRODUCT_NAME,
+                false,
+            ),
             items: Vec::new(),
         };
     };
+    let total = host.targets.len();
     let Some(id) = host.targets.get(slot).cloned() else {
         return Content {
-            title: crate::win::flyout::title_text(slot + 1, PRODUCT_NAME),
+            title: crate::win::flyout::heading(slot + 1, total, PRODUCT_NAME, false),
             items: Vec::new(),
         };
     };
     let Ok(mut guard) = host.coordinator.lock() else {
         return Content {
-            title: crate::win::flyout::title_text(slot + 1, &id),
+            title: crate::win::flyout::heading(slot + 1, total, &id, false),
             items: Vec::new(),
         };
     };
@@ -872,6 +882,7 @@ fn tray_flyout_content(
         .get(slot)
         .cloned()
         .unwrap_or_else(|| id.clone());
+    let show_name = guard.settings().always_show_monitor_name;
     // The marker comes from the same snapshot as the icon and the tooltip, so the flyout cannot claim
     // a profile the other surfaces do not.
     let current = guard.current(&id).profile_id().map(str::to_string);
@@ -909,7 +920,7 @@ fn tray_flyout_content(
         })
         .collect();
     Content {
-        title: crate::win::flyout::title_text(slot + 1, &name),
+        title: crate::win::flyout::heading(slot + 1, total, &name, show_name),
         items,
     }
 }
@@ -994,6 +1005,18 @@ fn start_operation(
     let coordinator = Arc::clone(&host.coordinator);
     let failure = Arc::clone(&host.last_failure);
     let applying = Arc::clone(&host.applying);
+    // A request that started on a row says so in the status area before the DDC transaction begins, so
+    // a slow monitor shows that something is happening instead of looking unresponsive.
+    if let (Some(row), true) = (row, window != 0) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                window as windows_sys::Win32::Foundation::HWND,
+                crate::win::flyout::RESULT,
+                row,
+                2,
+            );
+        }
+    }
     std::thread::spawn(move || {
         let outcome = match coordinator.lock() {
             Ok(mut guard) => guard.handle(method, &params),
@@ -1108,6 +1131,7 @@ fn tray_failure(user: *mut std::ffi::c_void) -> Option<String> {
 fn tray_settings_snapshot(user: *mut std::ffi::c_void) -> crate::win::settings::Snapshot {
     let fallback = crate::win::settings::Snapshot {
         left_click: crate::config::settings::LeftClick::Cycle,
+        always_show_monitor_name: false,
         monitors: 0,
         profiles: 0,
         start_at_logon: false,
@@ -1127,6 +1151,7 @@ fn tray_settings_snapshot(user: *mut std::ffi::c_void) -> crate::win::settings::
         .unwrap_or(0);
     crate::win::settings::Snapshot {
         left_click: guard.settings().left_click,
+        always_show_monitor_name: guard.settings().always_show_monitor_name,
         monitors,
         profiles,
         start_at_logon: false,
@@ -1148,23 +1173,14 @@ fn tray_settings_apply(
                 crate::config::settings::LeftClick::Cycle => "cycle",
                 crate::config::settings::LeftClick::Flyout => "flyout",
             };
-            let result = match host.coordinator.lock() {
-                Ok(mut guard) => guard.handle(
-                    "settings.set",
-                    &serde_json::json!({"key": "tray.left_click", "value": text}),
-                ),
-                Err(_) => return false,
-            };
-            match result {
-                Ok(_) => {
-                    log_info!("tray.left_click is now {text}");
-                    true
-                }
-                Err(error) => {
-                    log_error!("tray.left_click was not saved: {}", error.message);
-                    false
-                }
-            }
+            apply_setting(host, "tray.left_click", text)
+        }
+        Action::AlwaysShowMonitorName(show) => {
+            apply_setting(
+                host,
+                "tray.always_show_monitor_name",
+                if show { "true" } else { "false" },
+            )
         }
         Action::SelectMonitors => {
             // The dialog is modal and owns its own loop; it belongs on the UI thread, which is where
@@ -1209,7 +1225,58 @@ fn tray_settings_apply(
             }
         }
         Action::OpenProfiles => crate::win::ui::open_directory(&host.storage.profiles_dir()).is_ok(),
+        Action::ReloadProfiles => {
+            // A failed reload keeps the last good registry and reports why; the window says so through
+            // its summary line rather than a modal dialog.
+            let result = match host.coordinator.lock() {
+                Ok(mut guard) => guard.handle("profiles.reload", &serde_json::Value::Null),
+                Err(_) => return false,
+            };
+            match result {
+                Ok(value) => {
+                    log_info!(
+                        "profiles reloaded: {} profile(s)",
+                        value.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                    );
+                    true
+                }
+                Err(error) => {
+                    log_error!("profiles were not reloaded: {}", error.message);
+                    if let Ok(mut guard) = host.last_failure.lock() {
+                        *guard = Some(error.message.clone());
+                    }
+                    false
+                }
+            }
+        }
+        Action::OpenRepository => {
+            crate::win::ui::open_target("https://github.com/hrkcz001/broiler").is_ok()
+        }
         Action::Close => true,
+    }
+}
+
+/// Perform one `settings.set` and report whether the coordinator accepted it.
+///
+/// The window shows what the coordinator holds, so a refused write must return false: the caller
+/// reverts the control instead of leaving a value visible that was never stored.
+fn apply_setting(host: &TrayHost, key: &str, value: &str) -> bool {
+    let result = match host.coordinator.lock() {
+        Ok(mut guard) => guard.handle(
+            "settings.set",
+            &serde_json::json!({"key": key, "value": value}),
+        ),
+        Err(_) => return false,
+    };
+    match result {
+        Ok(_) => {
+            log_info!("{key} is now {value}");
+            true
+        }
+        Err(error) => {
+            log_error!("{key} was not saved: {}", error.message);
+            false
+        }
     }
 }
 
@@ -1516,7 +1583,7 @@ mod tests {
             .expect("direct set");
         assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Matched);
         assert_eq!(
-            crate::tray::tooltip(1, 1, "Panel", &state_label(&coordinator, "mon-a"), Some(40)),
+            crate::tray::tooltip(1, 1, "Panel", true, &state_label(&coordinator, "mon-a"), Some(40)),
             "Panel - Night mode, 40%"
         );
         let _ = std::fs::remove_dir_all(base);

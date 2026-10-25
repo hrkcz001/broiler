@@ -1331,7 +1331,11 @@ fn settings_json(settings: &Settings) -> Value {
     json!({
         "schema_version": settings.schema_version,
         "startup": {"launch_at_login": settings.launch_at_login},
-        "tray": {"left_click": settings.left_click.as_str(), "badges": "when_multiple"},
+        "tray": {
+            "left_click": settings.left_click.as_str(),
+            "badges": "when_multiple",
+            "always_show_monitor_name": settings.always_show_monitor_name,
+        },
         "selection": {"remember": settings.remember, "monitor_ids": settings.monitor_ids},
         "profiles": {"startup": "preserve", "unsupported": settings.unsupported.as_str()},
         "logging": {"level": settings.log_level.as_str()},
@@ -1343,6 +1347,7 @@ fn settings_value(settings: &Settings, key: &str) -> Option<Value> {
         "startup.launch_at_login" => Some(json!(settings.launch_at_login)),
         "tray.left_click" => Some(json!(settings.left_click.as_str())),
         "tray.badges" => Some(json!("when_multiple")),
+        "tray.always_show_monitor_name" => Some(json!(settings.always_show_monitor_name)),
         "selection.remember" => Some(json!(settings.remember)),
         "selection.monitor_ids" => Some(json!(settings.monitor_ids)),
         "profiles.startup" => Some(json!("preserve")),

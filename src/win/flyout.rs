@@ -1,40 +1,52 @@
 //! The modeless profile flyout.
 //!
-//! One reusable popup owns the whole surface: a visible header naming the monitor, one native radio
-//! button per profile, and nothing else. There is deliberately no Settings control here: the flyout is
-//! a profile picker, and every other action lives in the settings window or on the command line.
+//! A compact popup anchored to one tray icon. Its rows are a standard themed list view driven by an
+//! image list, not a hand-drawn button per profile: that is what gives selection, hover, keyboard
+//! navigation, a visible focus rectangle and the screen-reader behaviour of a real control.
 //!
-//! The flyout never applies anything itself. It reports the chosen index to its owner through a plain
-//! function pointer and lets the caller decide, so the hardware policy stays in one place; the caller
-//! then calls [`Flyout::set_state`] with the outcome, which is what keeps a pending or failed apply
-//! visible instead of pretending the profile took effect.
+//! Two cues are kept apart on purpose. Which profile the monitor is *in* is a leading state column —
+//! an icon plus the word `Current` — while the row the user is pointing at or has moved to with the
+//! arrow keys is the list view's own selection and focus. Marking the current profile by selecting
+//! its row would make "what is true" and "what is focused" the same thing, and they are not.
+//!
+//! Pending and failed operations get a short status line at the bottom instead of being appended to
+//! profile names, so a name never changes because an operation is running.
+//!
+//! There is deliberately no Settings control here: this surface picks a profile, and every other
+//! action lives in the settings window or on the command line.
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    DeleteObject, DrawFocusRect, DrawTextW, Ellipse, FillRect, GetMonitorInfoW, GetStockObject,
-    GetSysColor, GetSysColorBrush, MonitorFromPoint, SelectObject, SetBkMode, SetTextColor,
-    COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
-    DEFAULT_GUI_FONT, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    CreateDIBSection, DeleteObject, GetMonitorInfoW, GetStockObject, MonitorFromPoint,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
+use windows_sys::Win32::UI:: Controls::{
+    ImageList_Add, ImageList_Create, ImageList_Destroy, InitCommonControlsEx, ICC_LISTVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, LVCOLUMNW, LVITEMW, NMHDR, NMITEMACTIVATE, NMLVKEYDOWN,
+};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, GetWindowLongPtrW, IsWindow,
-    LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU,
-    IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WNDCLASSEXW,
-    WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics,
+    GetWindowLongPtrW, IsWindow, LoadCursorW, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_DROPSHADOW, CS_HREDRAW,
+    CS_VREDRAW, GWLP_USERDATA, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_SHOW, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::win::wide::to_wide;
 
-/// Controls the flyout creates. `WM_COMMAND` reports these.
+/// Controls the flyout creates.
 const TITLE_ID: i32 = 1;
-const FIRST_ITEM_ID: i32 = 100;
+const LIST_ID: i32 = 2;
+const STATUS_ID: i32 = 3;
+
+/// `WC_LISTVIEW`.
+const LISTVIEW_CLASS: &str = "SysListView32";
 
 /// The private message range, spelled out because not every `windows-sys` version exports `WM_APP`.
 const WM_APP: u32 = 0x8000;
@@ -45,8 +57,37 @@ pub const OPEN: u32 = WM_APP + 40;
 /// Apply result: `wParam` is the row index, `lParam` is 0 for success or 1 for failure.
 pub const RESULT: u32 = WM_APP + 41;
 
-/// The state one row can be in. `Pending` and `Failed` exist so the surface never claims a profile
-/// applied when the hardware has not confirmed it.
+// List view messages, from `commctrl.h`.
+const LVM_SETIMAGELIST: u32 = 0x1003;
+const LVM_SETITEMSTATE: u32 = 0x102B;
+const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = 0x1036;
+const LVM_GETNEXTITEM: u32 = 0x100C;
+const LVM_SETITEMW: u32 = 0x104C;
+const LVM_INSERTITEMW: u32 = 0x104D;
+const LVM_INSERTCOLUMNW: u32 = 0x1061;
+const LVIF_TEXT: u32 = 0x0001;
+const LVIF_IMAGE: u32 = 0x0002;
+const LVIF_PARAM: u32 = 0x0004;
+const LVIF_STATE: u32 = 0x0008;
+const LVIS_FOCUSED: u32 = 0x0001;
+const LVS_REPORT: u32 = 0x0001;
+const LVS_SINGLESEL: u32 = 0x0004;
+const LVS_SHOWSELALWAYS: u32 = 0x0008;
+const LVS_NOCOLUMNHEADER: u32 = 0x4000;
+const LVS_EX_FULLROWSELECT: u32 = 0x0000_0020;
+const LVS_EX_SUBITEMIMAGES: u32 = 0x0000_0002;
+const LVS_EX_DOUBLEBUFFER: u32 = 0x0001_0000;
+const LVNI_FOCUSED: u32 = 0x0001;
+const LVSIL_SMALL: usize = 1;
+/// `LVN_FIRST - 55`: the list view's key-down notification.
+const LVN_KEYDOWN: i32 = -155;
+/// `NM_CLICK`, as it arrives in `NMHDR.code`.
+const NM_CLICK: i32 = -2;
+const VK_RETURN: usize = 0x0D;
+const VK_ESCAPE: usize = 0x1B;
+
+/// The state one row can be in. `Pending` and `Failed` describe an operation, not a profile, so they
+/// are shown in the status line instead of in the row caption.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
     /// The profile this monitor is verified to be in.
@@ -64,7 +105,7 @@ pub enum State {
 pub struct Item {
     pub id: String,
     pub name: String,
-    /// The profile's icon name, drawn to the left of the name.
+    /// The profile's icon name, drawn in the row.
     pub icon: String,
     pub state: State,
 }
@@ -76,21 +117,41 @@ pub struct Content {
     pub items: Vec<Item>,
 }
 
-/// The header: the product calls it `Monitor 2 — MSI MAG275R`, using the same index the tray badge
-/// and the tooltip use, so the three never disagree.
-pub fn title_text(index: usize, name: &str) -> String {
-    format!("Monitor {index} \u{2014} {name}")
+/// The header of the flyout.
+///
+/// Several controlled monitors are always identified by index and name, because the popup belongs to
+/// one icon and the user has to be able to tell which. A single monitor uses its name only when
+/// `tray.always_show_monitor_name` is on; otherwise the heading is the neutral `Profiles`, which is
+/// what "omit the monitor name" means for a window that still needs a title.
+pub fn heading(index: usize, total: usize, name: &str, show_name: bool) -> String {
+    if total > 1 {
+        return format!("Monitor {index} \u{2014} {name}");
+    }
+    if show_name {
+        return name.to_string();
+    }
+    String::from("Profiles")
 }
 
-/// One row's caption. The state is spelled out because a radio button alone cannot say "failed".
-pub fn item_text(name: &str, state: &State) -> String {
+/// The caption of one row: the profile's own name, never decorated with operation state.
+pub fn item_text(name: &str, _state: &State) -> String {
+    name.to_string()
+}
+
+/// The text of the leading state column: the accessible name of the current marker.
+pub fn marker_text(state: &State) -> &'static str {
     match state {
-        // The marker to the left of the name says which profile is current; the caption does not
-        // repeat it. A state that is not "nothing special" is still spelled out, because a dot cannot
-        // express "this is being written right now" or why it failed.
-        State::Current | State::Normal => name.to_string(),
-        State::Pending => format!("{name} (applying\u{2026})"),
-        State::Failed(reason) => format!("{name} (failed: {reason})"),
+        State::Current => "Current",
+        _ => "",
+    }
+}
+
+/// The short status line under the rows. Empty means "nothing to report".
+pub fn status_text(state: &State, name: &str) -> String {
+    match state {
+        State::Normal | State::Current => String::new(),
+        State::Pending => format!("Applying {name}\u{2026}"),
+        State::Failed(reason) => format!("{name}: {reason}"),
     }
 }
 
@@ -122,55 +183,64 @@ fn clamp(value: i32, low: i32, high: i32) -> i32 {
     value.max(low).min(high)
 }
 
-/// Sizes for one DPI. Rows and margins scale, so the popup does not become unreadable at 200 %.
+/// Sizes for one DPI. Everything scales, so the popup stays readable at 200 %.
 struct Metrics {
     width: i32,
     margin: i32,
     title_height: i32,
     row_height: i32,
+    status_height: i32,
     gap: i32,
     /// Icon and marker size in pixels.
     icon: i32,
+    /// The leading state column: wide enough for the marker icon and the word `Current`.
+    state_column: i32,
 }
-
-/// `BS_OWNERDRAW`: the row is drawn by `WM_DRAWITEM`.
-const BS_OWNERDRAW: u32 = 0x0000000B;
 
 impl Metrics {
     fn new(dpi: u32) -> Metrics {
         let scale = |px: i32| (px * dpi as i32 + 48) / 96;
         Metrics {
-            width: scale(260),
+            width: scale(300),
             margin: scale(12),
-            title_height: scale(30),
-            // Rows are taller than the icon, so a 20 px glyph sits in a 34 px row instead of looking
-            // lost: the notification area's own 16 px icon is the wrong reference for a menu.
-            row_height: scale(34),
-            gap: scale(4),
-            icon: scale(20),
+            title_height: scale(24),
+            row_height: scale(26),
+            status_height: scale(20),
+            gap: scale(6),
+            icon: scale(16),
+            state_column: scale(84),
         }
     }
 
-    fn height(&self, rows: usize) -> i32 {
-        2 * self.margin + self.title_height + self.gap + rows as i32 * (self.row_height + self.gap)
+    fn list_height(&self, rows: usize) -> i32 {
+        (rows.max(1) as i32) * self.row_height + 2
     }
 
     fn title_top(&self) -> i32 {
         self.margin
     }
 
-    fn row_top(&self, index: usize) -> i32 {
-        self.margin + self.title_height + self.gap + index as i32 * (self.row_height + self.gap)
+    fn list_top(&self) -> i32 {
+        self.margin + self.title_height + self.gap
+    }
+
+    fn status_top(&self, rows: usize) -> i32 {
+        self.list_top() + self.list_height(rows) + self.gap
+    }
+
+    fn height(&self, rows: usize) -> i32 {
+        self.status_top(rows) + self.status_height + self.margin
     }
 }
 
 /// The open popup.
 pub struct Flyout {
     window: HWND,
-    rows: Vec<HWND>,
+    list: HWND,
+    status: HWND,
+    /// The image list: 0 is blank, 1 is the current marker, then one per profile icon.
+    images: isize,
     items: Vec<Item>,
-    /// Icon size in pixels, scaled for the DPI the popup opened at.
-    icon_size: i32,
     /// Index into the owner's monitor list, echoed back with every choice.
     target: usize,
     user: *mut c_void,
@@ -184,16 +254,25 @@ impl Drop for Flyout {
                 DestroyWindow(self.window);
             }
             self.window = std::ptr::null_mut();
+            if self.images != 0 {
+                ImageList_Destroy(self.images as isize);
+                self.images = 0;
+            }
         }
     }
 }
+
+/// Index 0 of the image list: nothing to show. Index 1: the current-profile marker.
+const IMAGE_BLANK: i32 = 0;
+const IMAGE_CURRENT: i32 = 1;
+const IMAGES_FIXED: usize = 2;
 
 unsafe extern "system" fn flyout_proc(
     window: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-) -> LRESULT {
+) -> isize {
     if message == 0x0081 {
         let create = &*(lparam as *const CREATESTRUCTW);
         SetWindowLongPtrW(window, GWLP_USERDATA, create.lpCreateParams as isize);
@@ -209,8 +288,9 @@ unsafe extern "system" fn flyout_proc(
     };
 
     match message {
-        // Losing the foreground closes the popup. This is the documented behaviour for a tray flyout:
-        // it is one click away, and a popup that stays behind other windows is a stray window.
+        // Losing the foreground closes the popup: it is one click away, and a popup that stays behind
+        // other windows is a stray window. `WM_ACTIVATE` with an inactive, non-minimised state is a
+        // click elsewhere, which is the documented dismissal gesture for a tray flyout.
         0x0006 => {
             let activated = (wparam & 0xFFFF) as u32;
             if activated == 0 {
@@ -218,51 +298,56 @@ unsafe extern "system" fn flyout_proc(
             }
             0
         }
-        0x0010 => {
-            // Destroyed by the owner or by focus loss; nothing else is pending.
-            0
-        }
         0x0100 => {
             // Escape dismisses without applying anything.
-            if wparam as u32 == 0x1B {
+            if wparam == VK_ESCAPE {
                 DestroyWindow(window);
             }
             0
         }
-        0x002B => {
-            // WM_DRAWITEM: one row, drawn as marker + profile icon + name.
-            let item = &*(lparam as *const DRAWITEMSTRUCT);
-            if item.CtlType == 4 {
-                let index = (item.CtlID as i32 - FIRST_ITEM_ID).max(0) as usize;
-                if let Some(drawn) = flyout.items.get(index) {
-                    draw_row(flyout, drawn, item);
-                }
-            }
-            1
-        }
-        0x0111 => {
-            let control = (wparam & 0xFFFF) as i32;
-            let code = ((wparam >> 16) & 0xFFFF) as u16;
-            // A click reports BN_CLICKED (0) with the control handle in `lParam`. Requiring the
-            // handle is what distinguishes a real activation from a stray command: a notification
-            // with no sender must never apply a profile.
-            let sender = lparam as HWND;
-            let matches_row = flyout.rows.iter().any(|row| *row == sender);
-            if code == 0 && matches_row {
-                if let Some(index) = control.checked_sub(FIRST_ITEM_ID) {
-                    if (index as usize) < flyout.items.len() {
-                        crate::log_info!(
-                            "flyout row {index} chosen for slot {}",
-                            flyout.target
-                        );
-                        (flyout.choose)(flyout.user, flyout.target, index as usize);
-                    }
-                }
-            }
+        0x0010 => {
+            DestroyWindow(window);
             0
+        }
+        // WM_NOTIFY: a click, a double click or Enter on the focused row starts the apply.
+        0x004E => {
+            let header = &*(lparam as *const NMHDR);
+            if header.idFrom as i32 != LIST_ID {
+                return 0;
+            }
+            match header.code as i32 {
+                NM_CLICK => {
+                    let item = &*(lparam as *const NMITEMACTIVATE);
+                    activ(flyout, item.iItem);
+                    0
+                }
+                LVN_KEYDOWN => {
+                    let key = &*(lparam as *const NMLVKEYDOWN);
+                    if key.wVKey as usize == VK_RETURN {
+                        let focused = SendMessageW(
+                            flyout.list,
+                            LVM_GETNEXTITEM,
+                            usize::MAX, // -1: from the beginning
+                            LVNI_FOCUSED as isize,
+                        );
+                        activ(flyout, focused as i32);
+                    }
+                    0
+                }
+                _ => 0,
+            }
         }
         _ => DefWindowProcW(window, message, wparam, lparam),
     }
+}
+
+/// Report a chosen row to the owner. Out-of-range indices are ignored rather than guessed.
+fn activ(flyout: &Flyout, index: i32) {
+    if index < 0 || index as usize >= flyout.items.len() {
+        return;
+    }
+    crate::log_info!("flyout row {index} chosen for slot {}", flyout.target);
+    (flyout.choose)(flyout.user, flyout.target, index as usize);
 }
 
 const FLYOUT_CLASS: &str = "BroilerFlyout";
@@ -271,14 +356,28 @@ unsafe fn register_class() {
     let class_name = to_wide(FLYOUT_CLASS);
     let mut class: WNDCLASSEXW = std::mem::zeroed();
     class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-    class.style = CS_HREDRAW | CS_VREDRAW;
+    // CS_DROPSHADOW is the documented way for a popup to get the shell's shadow instead of a
+    // hand-painted one.
+    class.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
     class.lpfnWndProc = Some(flyout_proc);
     class.hInstance = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
     class.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16);
+    // The dialog face, so the heading and the status line sit on the window's own colour.
+    class.hbrBackground = (windows_sys::Win32::Graphics::Gdi::COLOR_WINDOW + 1) as usize as *mut c_void;
     class.lpszClassName = class_name.as_ptr();
     let _ = RegisterClassExW(&class);
     // The class name is copied into the registered class, so the local vector may go.
     std::mem::forget(class_name);
+}
+
+/// Ask for the list-view class before one is created.
+pub fn init_common_controls() {
+    unsafe {
+        let mut settings: INITCOMMONCONTROLSEX = std::mem::zeroed();
+        settings.dwSize = std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32;
+        settings.dwICC = ICC_LISTVIEW_CLASSES;
+        InitCommonControlsEx(&settings);
+    }
 }
 
 unsafe fn add_control(
@@ -304,15 +403,71 @@ unsafe fn add_control(
         width,
         height,
         parent,
-        id as usize as *mut c_void as HMENU,
+        id as usize as *mut c_void as windows_sys::Win32::UI::WindowsAndMessaging::HMENU,
         windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()),
         std::ptr::null_mut(),
     );
     if !control.is_null() {
-        let font = GetStockObject(DEFAULT_GUI_FONT as i32);
+        let font = GetStockObject(windows_sys::Win32::Graphics::Gdi::DEFAULT_GUI_FONT as i32);
         SendMessageW(control, 0x0030, font as WPARAM, 1);
     }
     control
+}
+
+/// A bitmap and its pixels for the image list, from one rendered icon.
+unsafe fn dib(bitmap: &crate::tray::Bitmap) -> Option<(HBITMAP, *mut c_void)> {
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = bitmap.width as i32;
+    // A negative height requests a top-down bitmap, matching the pixel order of `Bitmap`.
+    info.bmiHeader.biHeight = -(bitmap.height as i32);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB as u32;
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    let colour = CreateDIBSection(
+        std::ptr::null_mut(),
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    if colour.is_null() || bits.is_null() {
+        return None;
+    }
+    std::ptr::copy_nonoverlapping(
+        bitmap.pixels.as_ptr(),
+        bits as *mut u8,
+        bitmap.pixels.len(),
+    );
+    Some((colour, bits))
+}
+
+/// The marker: a filled dot on a transparent square, the same accent colour at every size.
+fn marker_bitmap(size: u32) -> crate::tray::Bitmap {
+    let mut bitmap = crate::tray::Bitmap {
+        width: size,
+        height: size,
+        pixels: vec![0; (size * size * 4) as usize],
+    };
+    let centre = size as f32 / 2.0;
+    let radius = size as f32 * 0.28;
+    for y in 0..size as i32 {
+        for x in 0..size as i32 {
+            let dx = x as f32 + 0.5 - centre;
+            let dy = y as f32 + 0.5 - centre;
+            if dx * dx + dy * dy <= radius * radius {
+                let offset = ((y as u32 * size + x as u32) * 4) as usize;
+                // BGRA: the accent blue #2F6FEB, fully opaque.
+                bitmap.pixels[offset] = 0xEB;
+                bitmap.pixels[offset + 1] = 0x6F;
+                bitmap.pixels[offset + 2] = 0x2F;
+                bitmap.pixels[offset + 3] = 255;
+            }
+        }
+    }
+    bitmap
 }
 
 impl Flyout {
@@ -330,6 +485,7 @@ impl Flyout {
     ) -> Option<Box<Flyout>> {
         unsafe {
             register_class();
+            init_common_controls();
             let dpi = GetDpiForSystem().max(96);
             let metrics = Metrics::new(dpi);
             let rows = content.items.len().max(1);
@@ -338,9 +494,10 @@ impl Flyout {
 
             let mut flyout = Box::new(Flyout {
                 window: std::ptr::null_mut(),
-                rows: Vec::new(),
+                list: std::ptr::null_mut(),
+                status: std::ptr::null_mut(),
+                images: 0,
                 items: content.items.clone(),
-                icon_size: metrics.icon, // placeholder until the geometry is known
                 target,
                 user,
                 choose,
@@ -379,30 +536,144 @@ impl Flyout {
                 TITLE_ID,
             );
 
-            for (index, item) in content.items.iter().enumerate() {
-                // Owner-drawn push buttons: a button gives click, focus, Enter and Space for free,
-                // while the drawing puts the profile icon and the current marker where they belong.
-                // Radio buttons are not an option: an auto-radio that takes focus sends BN_CLICKED on
-                // this build, which applied a profile with no user action.
-                let control = add_control(
-                    window,
-                    "BUTTON",
-                    &item_text(&item.name, &item.state),
-                    WS_TABSTOP | BS_OWNERDRAW,
-                    metrics.margin,
-                    metrics.row_top(index),
-                    width - 2 * metrics.margin,
-                    metrics.row_height,
-                    FIRST_ITEM_ID + index as i32,
-                );
-                flyout.rows.push(control);
+            let list = add_control(
+                window,
+                LISTVIEW_CLASS,
+                "",
+                LVS_REPORT
+                    | LVS_SINGLESEL
+                    | LVS_SHOWSELALWAYS
+                    | LVS_NOCOLUMNHEADER
+                    | WS_BORDER
+                    | WS_TABSTOP,
+                metrics.margin,
+                metrics.list_top(),
+                width - 2 * metrics.margin,
+                metrics.list_height(rows),
+                LIST_ID,
+            );
+            if list.is_null() {
+                crate::log_error!("the flyout list view could not be created");
+                return None;
             }
+            flyout.list = list;
+            SendMessageW(
+                list,
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                0,
+                (LVS_EX_FULLROWSELECT | LVS_EX_SUBITEMIMAGES | LVS_EX_DOUBLEBUFFER) as isize,
+            );
+
+            // One image list serves every row: a blank, the current marker, and one image per profile.
+            let size = metrics.icon as u32;
+            let images: isize = ImageList_Create(
+                size as i32,
+                size as i32,
+                0x0020 | 0x0001, // ILC_COLOR32 | ILC_MASK
+                (content.items.len() + IMAGES_FIXED) as i32,
+                0,
+            );
+            if images == 0 {
+                crate::log_error!("the flyout image list could not be created");
+                return None;
+            }
+            flyout.images = images;
+            for bitmap in [crate::tray::Bitmap {
+                width: size,
+                height: size,
+                pixels: vec![0; (size * size * 4) as usize],
+            }, marker_bitmap(size)] {
+                if let Some((colour, _)) = dib(&bitmap) {
+                    ImageList_Add(images as isize, colour, std::ptr::null_mut());
+                    DeleteObject(colour as *mut c_void);
+                }
+            }
+            for item in &content.items {
+                let bitmap = crate::tray::render(
+                    crate::tray::Glyph::from_name(&item.icon),
+                    None,
+                    size,
+                );
+                if let Some((colour, _)) = dib(&bitmap) {
+                    ImageList_Add(images as isize, colour, std::ptr::null_mut());
+                    DeleteObject(colour as *mut c_void);
+                }
+            }
+            SendMessageW(list, LVM_SETIMAGELIST, LVSIL_SMALL, images);
+
+            // Two columns: the state marker, then the profile with its icon.
+            for (index, (label, width)) in [
+                ("", metrics.state_column),
+                ("Profile", width - 2 * metrics.margin - metrics.state_column - 4),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let mut column: LVCOLUMNW = std::mem::zeroed();
+                column.mask = 0x0002; // LVCF_WIDTH
+                column.cx = *width;
+                let mut text = to_wide(label);
+                if !label.is_empty() {
+                    column.mask |= 0x0001; // LVCF_TEXT
+                    column.pszText = text.as_mut_ptr();
+                }
+                SendMessageW(list, LVM_INSERTCOLUMNW, index, &mut column as *mut LVCOLUMNW as isize);
+                // The label vector only has to live for the duration of the call.
+                std::mem::forget(text);
+            }
+
+            for (index, item) in content.items.iter().enumerate() {
+                let mut marker = to_wide(marker_text(&item.state));
+                let mut row: LVITEMW = std::mem::zeroed();
+                row.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+                row.iItem = index as i32;
+                row.pszText = marker.as_mut_ptr();
+                row.iImage = if item.state == State::Current {
+                    IMAGE_CURRENT
+                } else {
+                    IMAGE_BLANK
+                };
+                row.lParam = index as isize;
+                SendMessageW(list, LVM_INSERTITEMW, 0, &row as *const LVITEMW as isize);
+                std::mem::forget(marker);
+
+                let mut name = to_wide(&item_text(&item.name, &item.state));
+                let mut subitem: LVITEMW = std::mem::zeroed();
+                subitem.mask = LVIF_TEXT | LVIF_IMAGE;
+                subitem.iItem = index as i32;
+                subitem.iSubItem = 1;
+                subitem.pszText = name.as_mut_ptr();
+                subitem.iImage = (IMAGES_FIXED + index) as i32;
+                SendMessageW(list, LVM_SETITEMW, 0, &subitem as *const LVITEMW as isize);
+                std::mem::forget(name);
+            }
+
+            // Focus the first row so the keyboard works immediately; the selection stays empty, which
+            // keeps "focused" visibly distinct from "current".
+            let mut state: LVITEMW = std::mem::zeroed();
+            state.mask = LVIF_STATE;
+            state.state = LVIS_FOCUSED;
+            state.stateMask = LVIS_FOCUSED;
+            SendMessageW(list, LVM_SETITEMSTATE, 0, &state as *const LVITEMW as isize);
+
+            let status = add_control(
+                window,
+                "STATIC",
+                "",
+                0,
+                metrics.margin,
+                metrics.status_top(rows),
+                width - 2 * metrics.margin,
+                metrics.status_height,
+                STATUS_ID,
+            );
+            flyout.status = status;
 
             // The anchor is the icon rectangle when the shell can report one, and the pointer
             // otherwise, which is where the user just clicked.
             let anchor_rect = anchor.unwrap_or_else(|| {
                 let mut pointer = POINT { x: 0, y: 0 };
-                windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pointer);
+                GetCursorPos(&mut pointer);
                 RECT {
                     left: pointer.x,
                     top: pointer.y,
@@ -434,9 +705,7 @@ impl Flyout {
             ShowWindow(window, SW_SHOW);
             // The popup needs the foreground to receive the keyboard and to notice focus loss.
             SetForegroundWindow(window);
-            if let Some(first) = flyout.rows.first() {
-                SetFocus(*first);
-            }
+            SetFocus(list);
             Some(flyout)
         }
     }
@@ -449,24 +718,43 @@ impl Flyout {
         self.target
     }
 
-    /// Replace one row's state, keeping the caption in the form the user reads.
+    /// Replace one row's state: the leading marker and the status line, never the profile name.
     pub fn set_state(&mut self, index: usize, state: State) {
         let Some(item) = self.items.get_mut(index) else {
             return;
         };
         item.state = state.clone();
-        let Some(control) = self.rows.get(index).copied() else {
-            return;
-        };
-        let text = to_wide(&item_text(&item.name, &state));
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(control, text.as_ptr());
-            // A row being applied cannot be clicked again; the others stay available.
-            EnableWindow(control, i32::from(state != State::Pending));
+            let mut marker = to_wide(marker_text(&state));
+            let mut row: LVITEMW = std::mem::zeroed();
+            row.mask = LVIF_TEXT | LVIF_IMAGE;
+            row.iItem = index as i32;
+            row.iSubItem = 0;
+            row.pszText = marker.as_mut_ptr();
+            row.iImage = if state == State::Current {
+                IMAGE_CURRENT
+            } else {
+                IMAGE_BLANK
+            };
+            SendMessageW(self.list, LVM_SETITEMW, 0, &row as *const LVITEMW as isize);
+            std::mem::forget(marker);
+        }
+        let line = status_text(&state, &item.name);
+        self.set_status(&line);
+    }
+
+    /// The short status line: what is happening now, or why the last attempt failed.
+    pub fn set_status(&mut self, text: &str) {
+        if self.status.is_null() {
+            return;
+        }
+        let text = to_wide(text);
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(self.status, text.as_ptr());
         }
     }
 
-    /// Bring the rows in line with state that was just re-read, without rebuilding the window.
+    /// Bring the rows in line with state that was just re-read.
     ///
     /// Rows are matched by profile id, so the marker follows the coordinator's answer rather than the
     /// row the user last clicked. A registry that gained or lost a profile needs new rows, which this
@@ -476,9 +764,8 @@ impl Flyout {
             return false;
         }
         for (index, fresh) in content.items.iter().enumerate() {
-            match self.items.get(index) {
-                Some(current) if current.id == fresh.id => {}
-                _ => return false,
+            if self.items[index].id != fresh.id {
+                return false;
             }
         }
         for (index, fresh) in content.items.iter().enumerate() {
@@ -491,7 +778,7 @@ impl Flyout {
 
     /// How many rows the popup shows.
     pub fn item_count(&self) -> usize {
-        self.rows.len()
+        self.items.len()
     }
 
     pub fn is_open(&self) -> bool {
@@ -511,107 +798,6 @@ unsafe fn work_area(monitor: HMONITOR) -> Option<RECT> {
     Some(info.rcWork)
 }
 
-/// Draw one row: a filled marker when this profile is current, the profile icon, then the name.
-///
-/// Everything is painted on a stock background brush, so the row follows the system colours and the
-/// selected state the button already tracks.
-unsafe fn draw_row(flyout: &Flyout, item: &Item, draw: &DRAWITEMSTRUCT) {
-    let rect = draw.rcItem;
-    let selected = draw.itemState & ODS_SELECTED != 0;
-    let disabled = draw.itemState & ODS_DISABLED != 0;
-    let background = if selected {
-        COLOR_HIGHLIGHT
-    } else {
-        COLOR_WINDOW
-    };
-    let foreground = if disabled {
-        COLOR_GRAYTEXT
-    } else if selected {
-        COLOR_HIGHLIGHTTEXT
-    } else {
-        COLOR_WINDOWTEXT
-    };
-
-    FillRect(draw.hDC, &rect, GetSysColorBrush(background));
-
-    let size = flyout.icon_size;
-    let mark = (size / 2).max(3);
-    let padding = (size / 2).max(4);
-    let middle = rect.top + (rect.bottom - rect.top) / 2;
-    let mark_centre = rect.left + padding + mark / 2;
-
-    if item.state == State::Current {
-        let brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(
-            GetSysColor(foreground),
-        );
-        if !brush.is_null() {
-            let previous = SelectObject(draw.hDC, brush as *mut c_void);
-            Ellipse(
-                draw.hDC,
-                mark_centre - mark / 2,
-                middle - mark / 2,
-                mark_centre + mark / 2 + 1,
-                middle + mark / 2 + 1,
-            );
-            SelectObject(draw.hDC, previous);
-            DeleteObject(brush as *mut c_void);
-        }
-    }
-
-    // The profile icon, pixel by pixel: the glyph already exists as a rendered bitmap, and at 16 to
-    // 32 pixels this is cheaper than managing a mask.
-    let icon_left = rect.left + padding + mark + padding;
-    let icon_top = middle - size / 2;
-    let glyph = crate::tray::render(
-        crate::tray::Glyph::from_name(&item.icon),
-        None,
-        size as u32,
-    );
-    let colour: COLORREF = GetSysColor(foreground);
-    for y in 0..glyph.height as i32 {
-        for x in 0..glyph.width as i32 {
-            let index = ((y as u32 * glyph.width + x as u32) * 4) as usize;
-            if glyph.pixels.get(index + 3).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            windows_sys::Win32::Graphics::Gdi::SetPixelV(
-                draw.hDC,
-                icon_left + x,
-                icon_top + y,
-                colour,
-            );
-        }
-    }
-
-    // The text follows the icon closely; a gap as wide as the icon reads as two columns.
-    let text_left = icon_left + size + size / 3;
-    let mut text = to_wide(&item_text(&item.name, &item.state));
-    SetBkMode(draw.hDC, TRANSPARENT as i32);
-    SetTextColor(draw.hDC, colour);
-    let mut text_rect = RECT {
-        left: text_left,
-        top: rect.top,
-        right: rect.right - padding,
-        bottom: rect.bottom,
-    };
-    DrawTextW(
-        draw.hDC,
-        text.as_mut_ptr(),
-        -1,
-        &mut text_rect,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-    );
-
-    if draw.itemState & ODS_FOCUS != 0 {
-        let mut focus = rect;
-        focus.left += 1;
-        focus.top += 1;
-        focus.right -= 1;
-        focus.bottom -= 1;
-        DrawFocusRect(draw.hDC, &focus);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,18 +811,44 @@ mod tests {
 
     #[test]
     fn the_header_names_the_monitor_with_the_same_index_as_the_badge() {
-        assert_eq!(title_text(2, "MSI MAG275R"), "Monitor 2 \u{2014} MSI MAG275R");
+        assert_eq!(heading(2, 2, "MSI MAG275R", false), "Monitor 2 \u{2014} MSI MAG275R");
+        // One monitor with the name preference off: a neutral heading, no name to omit.
+        assert_eq!(heading(1, 1, "MSI MAG275R", false), "Profiles");
+        assert_eq!(heading(1, 1, "MSI MAG275R", true), "MSI MAG275R");
+        // Several monitors are always identified, whatever the preference says.
+        assert_eq!(heading(1, 3, "MSI MAG275R", false), "Monitor 1 \u{2014} MSI MAG275R");
     }
 
     #[test]
-    fn a_row_says_what_is_true_about_it() {
-        assert_eq!(item_text("Night", &State::Normal), "Night");
-        // The marker to the left of the name carries "current"; the caption does not repeat it.
-        assert_eq!(item_text("Night", &State::Current), "Night");
-        assert_eq!(item_text("Night", &State::Pending), "Night (applying\u{2026})");
+    fn a_row_caption_is_the_profile_name_and_nothing_else() {
+        // Names stay stable: an operation in flight must not rewrite a row's text.
+        for state in [
+            State::Normal,
+            State::Current,
+            State::Pending,
+            State::Failed(String::from("busy")),
+        ] {
+            assert_eq!(item_text("Night", &state), "Night", "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_current_marker_is_separate_from_focus_and_selection() {
+        // The marker is a leading column with its own accessible name, not the list view's selection.
+        assert_eq!(marker_text(&State::Current), "Current");
+        for state in [State::Normal, State::Pending, State::Failed(String::from("x"))] {
+            assert_eq!(marker_text(&state), "");
+        }
+    }
+
+    #[test]
+    fn pending_and_failed_operations_use_the_status_line() {
+        assert_eq!(status_text(&State::Normal, "Night"), "");
+        assert_eq!(status_text(&State::Current, "Night"), "");
+        assert_eq!(status_text(&State::Pending, "Night"), "Applying Night\u{2026}");
         assert_eq!(
-            item_text("Night", &State::Failed(String::from("busy"))),
-            "Night (failed: busy)"
+            status_text(&State::Failed(String::from("verification_failed")), "Night"),
+            "Night: verification_failed"
         );
     }
 
@@ -719,11 +931,30 @@ mod tests {
     fn metrics_scale_with_dpi() {
         let low = Metrics::new(96);
         let high = Metrics::new(192);
-        assert_eq!(low.width, 260);
-        assert_eq!(high.width, 520);
+        assert_eq!(low.width, 300);
+        assert_eq!(high.width, 600);
         assert!(high.height(3) > low.height(3));
-        // Rows never overlap at either scale.
-        assert!(low.row_top(1) >= low.row_top(0) + low.row_height);
-        assert!(high.row_top(1) >= high.row_top(0) + high.row_height);
+        // The rows fit inside the window at either scale, with room for the status line.
+        for metrics in [Metrics::new(96), Metrics::new(144), Metrics::new(192)] {
+            assert!(metrics.height(3) > metrics.status_top(3));
+            assert!(metrics.status_top(3) > metrics.list_top());
+            // The state column leaves room for the profile column.
+            assert!(metrics.state_column < metrics.width - 2 * metrics.margin);
+        }
+    }
+
+    #[test]
+    fn the_marker_bitmap_is_a_transparent_square_with_one_solid_dot() {
+        let marker = marker_bitmap(16);
+        assert_eq!(marker.width, 16);
+        assert_eq!(marker.pixels.len(), 16 * 16 * 4);
+        // Corners stay transparent, the centre is opaque.
+        let corner = 0usize;
+        assert_eq!(marker.pixels[corner + 3], 0);
+        let centre = ((8 * 16 + 8) * 4) as usize;
+        assert_eq!(marker.pixels[centre + 3], 255);
+        // And it is the accent colour, so it does not depend on a system colour that High Contrast
+        // would replace with something invisible.
+        assert_eq!(&marker.pixels[centre..centre + 3], &[0xEB, 0x6F, 0x2F]);
     }
 }

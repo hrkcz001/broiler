@@ -532,6 +532,15 @@ pub fn run_resident(storage: StorageContext) -> i32 {
         tray_window: std::sync::atomic::AtomicIsize::new(0),
         last_failure: Arc::new(Mutex::new(None)),
         applying: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        left_click: {
+            let stored = coordinator
+                .lock()
+                .map(|guard| guard.settings().left_click)
+                .unwrap_or(crate::config::settings::LeftClick::Cycle);
+            let cached = std::sync::atomic::AtomicU8::new(0);
+            cache_click_behaviour(&cached, stored);
+            Arc::new(cached)
+        },
     });
     let user = Box::into_raw(host) as *mut std::ffi::c_void;
 
@@ -654,6 +663,11 @@ struct TrayHost {
     last_failure: Arc<Mutex<Option<String>>>,
     /// The monitor a profile is being applied to, so a second click cannot start a second writer.
     applying: Arc<std::sync::atomic::AtomicBool>,
+    /// The stored left-click behaviour, republished whenever settings are applied.
+    ///
+    /// The UI thread must never wait for the coordinator's lock: a DDC transaction holds it for the
+    /// whole write, and a click that waited would freeze the popup for as long as the monitor takes.
+    left_click: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Which monitors a resident instance controls.
@@ -728,13 +742,20 @@ fn resident_names(
 /// settings window changes this value while the tray is running, and the point of that window is that
 /// the change takes effect without a restart. A poisoned lock keeps the cycle behaviour, which cannot
 /// open a window that would then be unresponsive.
-fn click_behaviour<T: crate::transport::Transport>(
-    coordinator: &Arc<Mutex<Coordinator<T>>>,
-) -> crate::config::settings::LeftClick {
-    coordinator
-        .lock()
-        .map(|guard| guard.settings().left_click)
-        .unwrap_or(crate::config::settings::LeftClick::Cycle)
+fn click_behaviour(cached: &std::sync::atomic::AtomicU8) -> crate::config::settings::LeftClick {
+    match cached.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => crate::config::settings::LeftClick::Flyout,
+        _ => crate::config::settings::LeftClick::Cycle,
+    }
+}
+
+/// Store the behaviour so the next activation can read it without a lock.
+fn cache_click_behaviour(cached: &std::sync::atomic::AtomicU8, value: crate::config::settings::LeftClick) {
+    let code = match value {
+        crate::config::settings::LeftClick::Cycle => 0,
+        crate::config::settings::LeftClick::Flyout => 1,
+    };
+    cached.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The state label a tooltip or a flyout header shows for one monitor.
@@ -804,17 +825,18 @@ fn tray_activate(user: *mut std::ffi::c_void, monitor: usize, _activation: crate
     };
     // Read on every activation. Snapshotting this when the icons were installed is what made a change
     // in the settings window take effect only after a restart.
-    match click_behaviour(&host.coordinator) {
+    match click_behaviour(&host.left_click) {
         crate::config::settings::LeftClick::Cycle => {
             // One cycle is a DDC transaction: it must not run on the UI thread, and its result becomes
             // visible through the same publication every other command uses.
             start_operation(
                 host,
                 id.clone(),
-                String::from("cycle"),
-                "profile.next",
-                serde_json::json!({"monitor": id}),
-                None,
+                Work::Direct {
+                    what: String::from("cycle"),
+                    method: "profile.next",
+                    params: serde_json::json!({"monitor": id}),
+                },
             );
         }
         crate::config::settings::LeftClick::Flyout => {
@@ -936,30 +958,10 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
     let Some(monitor) = host.targets.get(slot).cloned() else {
         return;
     };
-    let profile = match host.coordinator.lock() {
-        Ok(mut guard) => guard
-            .handle("profiles.list", &serde_json::Value::Null)
-            .ok()
-            .and_then(|result| result.get("profiles").cloned())
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default()
-            .get(row)
-            .and_then(|profile| profile.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        Err(_) => None,
-    };
-    let Some(profile) = profile else {
-        return;
-    };
-    start_operation(
-        host,
-        monitor.clone(),
-        profile.clone(),
-        "profile.apply",
-        serde_json::json!({"id": profile, "monitor": monitor}),
-        Some(row),
-    );
+    // Nothing is looked up here. The row is turned into a profile id inside the worker thread: this
+    // callback runs on the UI thread, and a lookup would wait for the coordinator lock that a running
+    // DDC transaction holds, which is exactly how the popup stopped responding under a slow worker.
+    start_operation(host, monitor, Work::Row { row });
 }
 
 /// Run one coordinator command off the UI thread and report the outcome back to the tray.
@@ -970,14 +972,31 @@ fn tray_choose(user: *mut std::ffi::c_void, slot: usize, row: usize) {
 /// while one is in flight is refused with a reason instead of queued behind it. And the outcome is
 /// reported through the coordinator's own publication, so the icon, the tooltip and the flyout all
 /// learn about a completed cycle or apply instead of only the surface that started it.
-fn start_operation(
-    host: &TrayHost,
-    monitor: String,
-    what: String,
-    method: &'static str,
-    params: serde_json::Value,
-    row: Option<usize>,
-) {
+/// What one operation applies.
+///
+/// The row case carries no profile id: it is resolved inside the worker thread, because resolving it
+/// needs the coordinator lock and a DDC transaction holds that lock for the whole write. Doing the
+/// lookup on the UI thread is what froze the popup when the worker was slow.
+enum Work {
+    Direct {
+        what: String,
+        method: &'static str,
+        params: serde_json::Value,
+    },
+    Row {
+        row: usize,
+    },
+}
+
+fn start_operation(host: &TrayHost, monitor: String, request: Work) {
+    let row = match &request {
+        Work::Direct { .. } => None,
+        Work::Row { row } => Some(*row),
+    };
+    let what = match &request {
+        Work::Direct { what, .. } => what.clone(),
+        Work::Row { .. } => String::from("profile"),
+    };
     let window = host
         .tray_window
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -1018,12 +1037,55 @@ fn start_operation(
         }
     }
     std::thread::spawn(move || {
-        let outcome = match coordinator.lock() {
-            Ok(mut guard) => guard.handle(method, &params),
-            Err(_) => Err(crate::ipc::Failure::new(
-                "internal",
-                "the coordinator lock was poisoned",
-            )),
+        let mut method = "profile.apply";
+        let mut what = what;
+        let outcome = match request {
+            Work::Direct {
+                what: direct_what,
+                method: direct_method,
+                params,
+            } => {
+                what = direct_what;
+                method = direct_method;
+                match coordinator.lock() {
+                    Ok(mut guard) => guard.handle(method, &params),
+                    Err(_) => Err(crate::ipc::Failure::new(
+                        "internal",
+                        "the coordinator lock was poisoned",
+                    )),
+                }
+            }
+            Work::Row { row } => match coordinator.lock() {
+                Ok(mut guard) => {
+                    let profile = guard
+                        .handle("profiles.list", &serde_json::Value::Null)
+                        .ok()
+                        .and_then(|result| result.get("profiles").cloned())
+                        .and_then(|value| value.as_array().cloned())
+                        .unwrap_or_default()
+                        .get(row)
+                        .and_then(|profile| profile.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    match profile {
+                        Some(profile) => {
+                            what = profile.clone();
+                            guard.handle(
+                                "profile.apply",
+                                &serde_json::json!({"id": profile, "monitor": monitor}),
+                            )
+                        }
+                        None => Err(crate::ipc::Failure::new(
+                            "internal",
+                            "the chosen row no longer names a profile",
+                        )),
+                    }
+                }
+                Err(_) => Err(crate::ipc::Failure::new(
+                    "internal",
+                    "the coordinator lock was poisoned",
+                )),
+            },
         };
         let applied = matches!(
             &outcome,
@@ -1271,6 +1333,16 @@ fn apply_setting(host: &TrayHost, key: &str, value: &str) -> bool {
     match result {
         Ok(_) => {
             log_info!("{key} is now {value}");
+            if key == "tray.left_click" {
+                // Republish the cached copy here rather than reading it on every click: the click path
+                // must not wait for a coordinator lock that a DDC transaction may hold for seconds.
+                let stored = host
+                    .coordinator
+                    .lock()
+                    .map(|guard| guard.settings().left_click)
+                    .unwrap_or(crate::config::settings::LeftClick::Cycle);
+                cache_click_behaviour(&host.left_click, stored);
+            }
             true
         }
         Err(error) => {
@@ -1499,34 +1571,43 @@ mod tests {
     #[test]
     fn a_left_click_follows_the_setting_that_is_stored_now() {
         // The regression: the behaviour was captured when the icons were installed, so changing it in
-        // the settings window did nothing until the process restarted.
+        // the settings window did nothing until the process restarted. It now comes from a cache that
+        // is republished whenever the setting is stored, and the click path never takes the
+        // coordinator lock, which a slow DDC transaction can hold for seconds.
         use crate::config::settings::LeftClick;
+        use std::sync::atomic::AtomicU8;
+
         let (coordinator, base) = fixture_host("live-click", &["day", "night"]);
-        assert_eq!(click_behaviour(&coordinator), LeftClick::Flyout);
-
-        coordinator
+        let cache = AtomicU8::new(0);
+        let stored = coordinator
             .lock()
             .expect("lock")
-            .handle(
-                "settings.set",
-                &serde_json::json!({"key": "tray.left_click", "value": "cycle"}),
-            )
-            .expect("settings.set");
-        assert_eq!(
-            click_behaviour(&coordinator),
-            LeftClick::Cycle,
-            "a stored change must be what the next click obeys"
-        );
+            .settings()
+            .left_click;
+        cache_click_behaviour(&cache, stored);
+        assert_eq!(click_behaviour(&cache), LeftClick::Flyout);
 
-        coordinator
-            .lock()
-            .expect("lock")
-            .handle(
-                "settings.set",
-                &serde_json::json!({"key": "tray.left_click", "value": "flyout"}),
-            )
-            .expect("settings.set");
-        assert_eq!(click_behaviour(&coordinator), LeftClick::Flyout);
+        for (value, expected) in [("cycle", LeftClick::Cycle), ("flyout", LeftClick::Flyout)] {
+            coordinator
+                .lock()
+                .expect("lock")
+                .handle(
+                    "settings.set",
+                    &serde_json::json!({"key": "tray.left_click", "value": value}),
+                )
+                .expect("settings.set");
+            let stored = coordinator
+                .lock()
+                .expect("lock")
+                .settings()
+                .left_click;
+            cache_click_behaviour(&cache, stored);
+            assert_eq!(
+                click_behaviour(&cache),
+                expected,
+                "a stored change must be what the next click obeys"
+            );
+        }
         let _ = std::fs::remove_dir_all(base);
     }
 

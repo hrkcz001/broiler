@@ -1174,6 +1174,9 @@ impl Tray {
             self.refresh_tooltip(monitor);
         }
         self.refresh_flyout();
+        // Reading the snapshot keeps the cached click behaviour current even when no settings window is
+        // open; it is the one place the UI already asks the coordinator for the stored settings.
+        let _ = (self.callbacks.settings_snapshot)(self.callbacks.user);
         self.refresh_settings();
     }
 

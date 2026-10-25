@@ -749,6 +749,21 @@ fn click_behaviour(cached: &std::sync::atomic::AtomicU8) -> crate::config::setti
     }
 }
 
+/// Republish the cached behaviour from the coordinator's stored settings.
+///
+/// Called from every place the UI already reads settings, so a change made anywhere — this window or
+/// `broiler settings set` on the command line — reaches the next click.
+fn refresh_click_cache<T: crate::transport::Transport>(
+    coordinator: &Arc<Mutex<Coordinator<T>>>,
+    cached: &std::sync::atomic::AtomicU8,
+) {
+    let stored = coordinator
+        .lock()
+        .map(|guard| guard.settings().left_click)
+        .unwrap_or(crate::config::settings::LeftClick::Cycle);
+    cache_click_behaviour(cached, stored);
+}
+
 /// Store the behaviour so the next activation can read it without a lock.
 fn cache_click_behaviour(cached: &std::sync::atomic::AtomicU8, value: crate::config::settings::LeftClick) {
     let code = match value {
@@ -1211,8 +1226,15 @@ fn tray_settings_snapshot(user: *mut std::ffi::c_void) -> crate::win::settings::
         .and_then(|result| result.get("profiles").cloned())
         .and_then(|value| value.as_array().map(Vec::len))
         .unwrap_or(0);
+    // Anything that changes settings outside this window — `broiler settings set` on the command line,
+    // for instance — reaches the UI through this snapshot, so the cached click behaviour is refreshed
+    // here too. Without it a command-line change was obeyed by `status` and ignored by the next click.
+    let left_click = guard.settings().left_click;
+    // The cache is refreshed from the same read the window gets, so the visible control and the next
+    // click can never disagree.
+    cache_click_behaviour(&host.left_click, left_click);
     crate::win::settings::Snapshot {
-        left_click: guard.settings().left_click,
+        left_click,
         always_show_monitor_name: guard.settings().always_show_monitor_name,
         monitors,
         profiles,
@@ -1336,12 +1358,7 @@ fn apply_setting(host: &TrayHost, key: &str, value: &str) -> bool {
             if key == "tray.left_click" {
                 // Republish the cached copy here rather than reading it on every click: the click path
                 // must not wait for a coordinator lock that a DDC transaction may hold for seconds.
-                let stored = host
-                    .coordinator
-                    .lock()
-                    .map(|guard| guard.settings().left_click)
-                    .unwrap_or(crate::config::settings::LeftClick::Cycle);
-                cache_click_behaviour(&host.left_click, stored);
+                refresh_click_cache(&host.coordinator, &host.left_click);
             }
             true
         }
@@ -1608,6 +1625,36 @@ mod tests {
                 "a stored change must be what the next click obeys"
             );
         }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_click_behaviour_changed_on_the_command_line_reaches_the_next_click() {
+        // The regression: the cache was refreshed only by the settings window, so `broiler settings set
+        // tray.left_click cycle` was stored, reported by `status`, and still ignored by the next click.
+        use crate::config::settings::LeftClick;
+        use std::sync::atomic::AtomicU8;
+
+        let (coordinator, base) = fixture_host("cli-click", &["day", "night"]);
+        // Start from the opposite value, the way a process that has been running would.
+        let cache = AtomicU8::new(1);
+        assert_eq!(click_behaviour(&cache), LeftClick::Flyout);
+
+        coordinator
+            .lock()
+            .expect("lock")
+            .handle(
+                "settings.set",
+                &serde_json::json!({"key": "tray.left_click", "value": "cycle"}),
+            )
+            .expect("settings.set");
+
+        refresh_click_cache(&coordinator, &cache);
+        assert_eq!(
+            click_behaviour(&cache),
+            LeftClick::Cycle,
+            "the snapshot refresh is what carries a command-line change to the next click"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 

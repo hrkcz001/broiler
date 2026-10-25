@@ -85,6 +85,49 @@ Observations that matter for later gates:
   device name, which Windows reports as coming from the EDID.
 - `display_index` is assigned per session from left to right. Persistence is not implemented.
 
+## G3 — domain and configuration, tests first
+
+Evidenced on 2026-10-25. No hardware involved: this gate is pure domain logic and parsing.
+
+| Check | Command | Observed |
+|---|---|---|
+| Whole test suite | `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat test` | 138 passed, 0 failed |
+| Release build unchanged | `MSYS2_ARG_CONV_EXCL='*' cmd.exe /c build.bat --release` | exit 0 |
+| Shipped examples still parse | test `config::profile::tests::repository_examples_parse_with_the_current_schema` | `examples/day.toml`, `night.toml`, `full-profile.toml`, `color-temperature.toml` accepted by the parser |
+
+Startup branches, each a named test in `src/lifecycle.rs`:
+
+| Branch | Test |
+|---|---|
+| zero monitors | `zero_monitors_exits_silently_even_with_profiles`, `zero_monitors_wins_over_an_invalid_registry` |
+| one monitor, one profile | `one_monitor_and_one_profile_is_a_one_shot_run` |
+| one monitor, many profiles | `one_monitor_and_many_profiles_is_resident` |
+| many monitors, no saved choice | `many_monitors_without_a_saved_choice_require_the_dialog` |
+| saved selection partly missing | `a_saved_selection_controls_only_the_present_members` |
+| saved selection entirely missing | `a_fully_missing_saved_selection_asks_again_instead_of_retargeting` |
+| zero profiles | `zero_profiles_with_monitors_shows_the_setup_path` |
+| invalid profile file | `an_invalid_profile_aborts_activation_instead_of_using_the_valid_ones` |
+| confirmed empty selection | `a_confirmed_empty_selection_exits_without_tray_icons` |
+
+Value model and conversion edge cases are covered in `src/config/value.rs`
+(`bare integer is percent`, `hexadecimal bare integer is still percent`, `raw table is native and hex
+equals decimal`, `native values above 255 are preserved exactly`, `percent and raw together are
+rejected`, `percent mapping respects a nonzero minimum`, `percent mapping rounds half up`,
+`native values are validated against a range without clamping`, `native values are validated against
+an enumerated set`, `percentages are rejected for enumerated and unknown controls`), profile schema
+and conflict rules in `src/config/profile.rs`, and planning/verification/timing in `src/plan.rs` and
+`src/backend.rs` (including `a_timeout_is_reported_as_an_unknown_outcome_and_stops_the_monitor` and
+`transactions_are_separated_by_the_configured_gap`, which asserts the 100 ms gap through an injected
+clock instead of sleeping).
+
+Limits recorded honestly:
+
+- `cargo fmt` and `cargo clippy` are unavailable on this host: Rust was installed without rustup, so
+  neither component is present. Formatting and lint gates therefore have no local evidence yet; they
+  belong to G11's CI, which installs a normal toolchain.
+- Planning uses device metadata supplied by tests. Real per-control metadata for the MSI is still
+  unread beyond brightness, contrast and the capabilities string.
+
 ## Hardware evidence
 
 Only reads have been performed. No write of any kind has been made by this project.
@@ -96,4 +139,4 @@ Only reads have been performed. No write of any kind has been made by this proje
 
 ## Gates not yet evidenced
 
-G3 through G12 have no evidence of any kind. They are not implemented.
+G4 through G12 have no evidence of any kind. They are not implemented.

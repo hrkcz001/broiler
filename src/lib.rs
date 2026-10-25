@@ -10,14 +10,18 @@
 //! No async runtime, no service, no elevation, no WebView. Hardware writes exist only
 //! behind the single coordinator and its child worker.
 
+pub mod backend;
 pub mod caps;
 pub mod cli;
 pub mod clock;
+pub mod config;
 pub mod discovery;
+pub mod lifecycle;
 pub mod logging;
 pub mod model;
 pub mod output;
 pub mod paths;
+pub mod plan;
 pub mod win;
 
 /// Product name as used in user-visible strings.

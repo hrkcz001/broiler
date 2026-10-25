@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Both executables build, `broiler monitors list --json` and `broiler monitors capabilities --monitor <id> --json` return real read-only data, and nothing else works yet: no configuration, no profiles, no tray, no write of any kind.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
+**Status: early implementation. Both executables build, `broiler monitors list --json` and `broiler monitors capabilities --monitor <id> --json` return real read-only data, and the profile/settings/value model is implemented and unit-tested but not yet wired to commands. Nothing else works yet: no profile loading from the CLI, no tray, no write of any kind.** No downloadable binaries or installable Scoop package exist. Commands and configuration below define the required v1 contract; they are not claims about a working release. The implementation worker must keep this README aligned with shipped behavior and may remove this warning only after a verified release.
 
 Research and architecture by **Hermes Agent** (Nous Research), at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), and [implementation handoff](docs/implementation-handoff.md).
 

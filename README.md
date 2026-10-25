@@ -2,7 +2,7 @@
 
 Brightness Controller: a lightweight native Windows monitor utility planned in Rust.
 
-**Status: early implementation. Working today: both executables; a resident coordinator with a logon-SID-scoped pipe; `start`/`stop`/`status`/`reload`; `monitors list`, `capabilities`, `select`; `profiles list`/`validate`, `profile apply`, `profile next`; `get`/`set` for brightness and contrast with readback verification; `settings get`/`set`; `startup status`; `icons list`. Profiles in this build write only brightness and contrast; colour temperature and the remaining controls, the tray, the flyout and every window are not implemented yet.**
+**Status: early implementation. Working today: both executables; one resolved data root for the CLI, the coordinator and migration (`paths`, `data migrate --from-appdata`); a resident coordinator with a logon-SID-scoped pipe; `start`/`stop`/`status`/`reload`; `monitors list`, `capabilities`, `select`; `profiles list`/`validate`, `profile apply`, `profile next`; `get`/`set` for brightness and contrast with readback verification; `settings get`/`set`; `startup status`; `icons list`. Profile application now plans every target before the first write. Profiles in this build write only brightness and contrast; colour temperature and the remaining controls, the tray, the flyout, every window and startup registration are not implemented yet.**
 
 Research and architecture by **Hermes Agent** (Nous Research) at the direction of **hrkcz001**. See [architecture and acceptance gates](docs/architecture.md), [parameter reference](docs/parameters.md), [the storage contract](docs/storage.md), and [the next worker handoff](docs/next-worker-handoff.md).
 
@@ -14,7 +14,7 @@ Two executables: console `broiler.exe` and native GUI/tray `broiler-tray.exe`. N
 
 ## Where data lives
 
-Specified in [docs/storage.md](docs/storage.md), not implemented yet: the current build still writes `%APPDATA%\broiler` and `%LOCALAPPDATA%\broiler`.
+Implemented as specified in [docs/storage.md](docs/storage.md): one storage context is resolved per process and passed to the CLI, the coordinator and migration. The order is an explicit `--config-dir`, then a `broiler.portable` marker beside the executable, then AppData for an unmarked install. A root that cannot be written is an error, never a reason to fall back.
 
 A Scoop or portable install gets a data directory beside the binaries, linked by Scoop to its persistent store, so profiles and settings survive every upgrade:
 

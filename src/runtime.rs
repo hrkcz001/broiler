@@ -16,7 +16,8 @@ use crate::instance::InstanceLock;
 use crate::ipc::{Failure, Request, Response, PROTOCOL_VERSION};
 use crate::pipe::{self, Client, Endpoint};
 use crate::transport::Transport;
-use crate::{log_error, log_info, output, paths, PRODUCT_NAME};
+use crate::storage::{StorageContext, StorageMode};
+use crate::{log_error, log_info, output, PRODUCT_NAME};
 
 /// Bound for a CLI request to the coordinator.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,7 +67,15 @@ impl ClientError {
 }
 
 /// Send one request to the resident coordinator, if there is one.
-pub fn request(method: &str, params: serde_json::Value) -> Result<serde_json::Value, ClientError> {
+///
+/// The request names the data root this process resolved. A coordinator that owns another root
+/// refuses it, so a second writer is never created and no answer is given about data the caller
+/// did not read.
+pub fn request(
+    storage: &StorageContext,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, ClientError> {
     let endpoint = pipe::local_endpoint().map_err(|error| ClientError::Channel(error.to_string()))?;
     let deadline = Instant::now() + CLIENT_TIMEOUT;
     let client = Client::connect(&endpoint.name, deadline).map_err(|error| {
@@ -85,6 +94,7 @@ pub fn request(method: &str, params: serde_json::Value) -> Result<serde_json::Va
                 id: 1,
                 method: method.to_string(),
                 params,
+                storage_root: Some(storage.root().display().to_string()),
             },
             deadline,
         )
@@ -109,20 +119,32 @@ pub fn request(method: &str, params: serde_json::Value) -> Result<serde_json::Va
 }
 
 /// True when a coordinator answers a ping.
-pub fn is_running() -> bool {
-    matches!(request("ping", serde_json::Value::Null), Ok(_))
+pub fn is_running(storage: &StorageContext) -> bool {
+    matches!(request(storage, "ping", serde_json::Value::Null), Ok(_))
 }
 
-fn settings_path() -> Option<PathBuf> {
-    paths::settings_file()
-}
-
-fn profiles_dir() -> Option<PathBuf> {
-    paths::profiles_dir()
+/// Actionable message for a portable first launch that still has to decide about older AppData
+/// configuration. `None` means there is nothing to decide.
+pub fn pending_import_message(storage: &StorageContext) -> Option<String> {
+    let roots = crate::storage::appdata_roots()?;
+    if !crate::migrate::pending_import(storage, &roots) {
+        return None;
+    }
+    let source = crate::storage::appdata_of(&roots);
+    Some(format!(
+        "an older configuration exists in {} and {} is empty. Run `{} data migrate --from-appdata \
+         --dry-run` to inspect it, `{} data migrate --from-appdata` to copy it, or `{} data migrate \
+         --from-appdata --decline` to keep using only the new root",
+        source.root().display(),
+        storage.root().display(),
+        PRODUCT_NAME,
+        PRODUCT_NAME,
+        PRODUCT_NAME
+    ))
 }
 
 /// Run the resident coordinator until it is asked to stop. Returns the process exit code.
-pub fn run_resident() -> i32 {
+pub fn run_resident(storage: StorageContext) -> i32 {
     let endpoint: Endpoint = match pipe::local_endpoint() {
         Ok(endpoint) => endpoint,
         Err(error) => {
@@ -150,28 +172,31 @@ pub fn run_resident() -> i32 {
         return 3;
     }
 
-    let settings: Settings = match settings_path() {
-        Some(path) => match settings::load(&path) {
-            Ok(settings) => settings,
-            Err(error) => {
-                log_error!("settings refused: {}", error.render());
-                output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
-                return 2;
-            }
-        },
-        None => Settings::default(),
+    // A portable first launch must decide about the older AppData configuration before it starts
+    // serving: silently ignoring the user's old profiles is not an option, and silently importing
+    // them is worse.
+    if let Some(reason) = pending_import_message(&storage) {
+        log_error!("{reason}");
+        output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
+        return 2;
+    }
+
+    let settings: Settings = match settings::load(&storage.settings_file()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            log_error!("settings refused: {}", error.render());
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+            return 2;
+        }
     };
 
-    let registry: ProfileRegistry = match profiles_dir() {
-        Some(directory) => match ProfileRegistry::load_dir(&directory) {
-            Ok(registry) => registry,
-            Err(error) => {
-                log_error!("profiles refused: {}", error.render());
-                output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
-                return 2;
-            }
-        },
-        None => ProfileRegistry::default(),
+    let registry: ProfileRegistry = match ProfileRegistry::load_dir(&storage.profiles_dir()) {
+        Ok(registry) => registry,
+        Err(error) => {
+            log_error!("profiles refused: {}", error.render());
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+            return 2;
+        }
     };
 
     let tray = match tray_executable() {
@@ -183,15 +208,14 @@ pub fn run_resident() -> i32 {
     };
 
     let transport = crate::transport::WorkerTransport::new(tray);
-    let mut coordinator_state = Coordinator::new(
+    let coordinator_state = Coordinator::new(
         transport,
         settings,
         registry,
-        settings_path().unwrap_or_else(|| PathBuf::from("settings.toml")),
-    );
-    if let Some(directory) = profiles_dir() {
-        coordinator_state = coordinator_state.with_profiles_dir(directory);
-    }
+        storage.settings_file(),
+    )
+    .with_profiles_dir(storage.profiles_dir())
+    .with_storage(storage.clone());
     let coordinator = Arc::new(Mutex::new(coordinator_state));
 
     log_info!(
@@ -215,15 +239,24 @@ pub fn run_resident() -> i32 {
 }
 
 /// Start the resident coordinator as a detached process and wait until it answers.
-pub fn start_resident() -> Result<(), String> {
+///
+/// An explicit root is handed to the child so it does not resolve one of its own; a portable or
+/// AppData installation resolves the same root from the same executable and marker. The started
+/// coordinator is then checked against the root this command used.
+pub fn start_resident(storage: &StorageContext) -> Result<(), String> {
     let tray = tray_executable()?;
-    let child = crate::win::process::Child::spawn_detached(&tray, &[])
+    let mut arguments: Vec<String> = Vec::new();
+    if storage.mode() == StorageMode::Explicit {
+        arguments.push(String::from("--config-dir"));
+        arguments.push(storage.root().display().to_string());
+    }
+    let child = crate::win::process::Child::spawn_detached(&tray, &arguments)
         .map_err(|error| format!("cannot start {}: {error}", tray.display()))?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if is_running() {
-            return Ok(());
+        if is_running(storage) {
+            return verify_running_root(storage);
         }
         if !child.still_running() {
             return Err(format!(
@@ -239,11 +272,37 @@ pub fn start_resident() -> Result<(), String> {
 }
 
 /// Ask the resident coordinator to stop. Idempotent.
-pub fn stop_resident() -> Result<bool, ClientError> {
-    match request("shutdown", serde_json::Value::Null) {
+pub fn stop_resident(storage: &StorageContext) -> Result<bool, ClientError> {
+    match request(storage, "shutdown", serde_json::Value::Null) {
         Ok(_) => Ok(true),
         Err(ClientError::NotRunning) => Ok(false),
         Err(other) => Err(other),
+    }
+}
+
+/// Confirm that the coordinator now answering owns the root this command resolved.
+fn verify_running_root(storage: &StorageContext) -> Result<(), String> {
+    let ours = storage.root().display().to_string();
+    match request(storage, "storage.info", serde_json::Value::Null) {
+        Ok(info) => {
+            let theirs = info
+                .get("storage")
+                .and_then(|storage| storage.get("root"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if theirs == ours {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the coordinator answered from {theirs}, not from {ours}; stop it and retry"
+                ))
+            }
+        }
+        // A coordinator too old to report its root is not one this build can vouch for.
+        Err(error) => Err(format!(
+            "the coordinator did not report its data root: {}",
+            error.message()
+        )),
     }
 }
 
@@ -290,17 +349,30 @@ impl Transport for TransientTransport {
 mod tests {
     use super::*;
 
+    /// An isolated root in the scratch directory: no test reads the user's real AppData.
+    fn isolated(name: &str) -> (StorageContext, PathBuf) {
+        let mut base = std::env::temp_dir();
+        base.push(format!("broiler-runtime-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        (StorageContext::for_test(&base.join("data")), base)
+    }
+
     #[test]
     fn a_request_without_a_coordinator_reports_not_running() {
         // No daemon is started in the test process; the endpoint simply has no server.
+        let (storage, base) = isolated("no-coordinator");
         assert_eq!(
-            request("ping", serde_json::Value::Null),
+            request(&storage, "ping", serde_json::Value::Null),
             Err(ClientError::NotRunning)
         );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn stopping_without_a_coordinator_is_idempotent() {
-        assert_eq!(stop_resident(), Ok(false));
+        let (storage, base) = isolated("stop");
+        assert_eq!(stop_resident(&storage), Ok(false));
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -23,6 +23,12 @@ pub struct Request {
     pub method: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Data root the caller resolved, when it uses user data at all.
+    ///
+    /// The coordinator refuses a request that names a different root, so a CLI started with another
+    /// `--config-dir` cannot make the resident writer act on data the caller did not resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<String>,
 }
 
 /// One response from the worker.
@@ -151,6 +157,7 @@ mod tests {
             id: 7,
             method: String::from("read"),
             params: serde_json::json!({"monitor": "mon-aa", "control": "brightness"}),
+            storage_root: None,
         };
         let frame = encode_frame(&request).expect("encode");
         assert_eq!(&frame[..4], &((frame.len() - 4) as u32).to_le_bytes());
@@ -212,6 +219,7 @@ mod tests {
             id: 1,
             method: String::from("ping"),
             params: serde_json::Value::Null,
+            storage_root: None,
         };
         let frame = encode_frame(&request).expect("encode");
         let mut buffer: Vec<u8> = frame.clone();

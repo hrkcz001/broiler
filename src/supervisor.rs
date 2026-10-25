@@ -190,6 +190,7 @@ impl Supervisor {
             id,
             method: method.to_string(),
             params,
+            storage_root: None,
         };
         let frame = ipc::encode_frame(&request)
             .map_err(|error| SupervisorError::Protocol(error.to_string()))?;

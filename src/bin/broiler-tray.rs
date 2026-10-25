@@ -11,17 +11,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // The internal worker mode speaks the private protocol on inherited standard handles and must
-    // never touch a console or the user interface.
+    // never touch a console, a log file or the user interface.
     if args.first().map(String::as_str) == Some("--internal-ddc-worker") {
         std::process::exit(broiler::worker::serve());
     }
 
-    if args.is_empty() {
-        // No arguments: become the resident coordinator. The tray, selection dialog and settings
-        // window of later gates live in this same process.
-        std::process::exit(broiler::runtime::run_resident());
-    }
-
-    let code = broiler::cli::run(broiler::cli::Program::Tray, &args);
-    std::process::exit(code);
+    // Everything else, including the resident start with no arguments, goes through the shared
+    // entry point, so the one data root is resolved once for the whole process tree. The tray,
+    // selection dialog and settings window of later gates live in this same process.
+    std::process::exit(broiler::cli::run(broiler::cli::Program::Tray, &args));
 }

@@ -186,6 +186,9 @@ pub struct Coordinator<T: Transport> {
     /// Last fully applied profile per monitor. A profile id is not a claim about current hardware
     /// state; it only records what this coordinator last applied and verified.
     last_applied: std::collections::HashMap<String, String>,
+    /// The data root this coordinator owns. Every filesystem decision goes through it, and a client
+    /// that resolved another root is refused rather than answered about data it never read.
+    storage: Option<crate::storage::StorageContext>,
     shutdown_requested: bool,
     observed_at: String,
 }
@@ -199,6 +202,7 @@ impl<T: Transport> Coordinator<T> {
             settings_path,
             profiles_dir: None,
             last_applied: std::collections::HashMap::new(),
+            storage: None,
             shutdown_requested: false,
             observed_at: crate::clock::iso_local(),
         }
@@ -208,6 +212,19 @@ impl<T: Transport> Coordinator<T> {
     pub fn with_profiles_dir(mut self, directory: PathBuf) -> Coordinator<T> {
         self.profiles_dir = Some(directory);
         self
+    }
+
+    /// Attach the resolved data root this coordinator owns.
+    pub fn with_storage(mut self, storage: crate::storage::StorageContext) -> Coordinator<T> {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// The data root this coordinator owns, as the string clients are checked against.
+    pub fn storage_root(&self) -> Option<String> {
+        self.storage
+            .as_ref()
+            .map(|storage| storage.root().display().to_string())
     }
 
     pub fn shutdown_requested(&self) -> bool {
@@ -623,8 +640,14 @@ impl<T: Transport> Coordinator<T> {
                     "profile_ids": self.registry.profiles().iter().map(|profile| profile.id.clone()).collect::<Vec<String>>(),
                     "selection": self.settings.monitor_ids,
                     "settings_path": self.settings_path.display().to_string(),
+                    "storage": self.storage.as_ref().map(|storage| storage.describe()),
                 }))
             }
+            "storage.info" => Ok(json!({
+                "storage": self.storage.as_ref().map(|storage| storage.describe()),
+                "settings_path": self.settings_path.display().to_string(),
+                "profiles_dir": self.profiles_dir.as_ref().map(|path| path.display().to_string()),
+            })),
             "monitors.list" => {
                 let monitors = self.transport.monitors().map_err(transport_failure)?;
                 Ok(json!({
@@ -690,17 +713,16 @@ impl<T: Transport> Coordinator<T> {
             "settings.set" => {
                 let key = string_param(params, "key")?;
                 let value = string_param(params, "value")?;
-                let text = std::fs::read_to_string(&self.settings_path).unwrap_or_default();
-                let updated = settings::set_key(&self.settings_path, &text, &key, &value)
+                // Read the file that is on disk now, edit it in place to keep the user's comments,
+                // validate the result, and replace the file atomically. A file that changed between
+                // the read and the write is a stale edit and is refused rather than overwritten.
+                let original = std::fs::read_to_string(&self.settings_path).unwrap_or_default();
+                let updated = settings::set_key(&self.settings_path, &original, &key, &value)
                     .map_err(|error| Failure::new("invalid_config", error.render()))?;
                 let parsed = settings::parse(&updated, &self.settings_path)
                     .map_err(|error| Failure::new("invalid_config", error.render()))?;
-                if let Some(parent) = self.settings_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(&self.settings_path, updated).map_err(|error| {
-                    Failure::new("io_error", format!("cannot write settings: {error}"))
-                })?;
+                settings::replace_text(&self.settings_path, &original, &updated)
+                    .map_err(|error| Failure::new("invalid_config", error.render()))?;
                 self.settings = parsed;
                 Ok(json!({"key": key, "value": settings_value(&self.settings, &key).unwrap_or(Value::Null)}))
             }
@@ -1385,6 +1407,63 @@ mod tests {
         assert!(
             !coordinator.last_applied.contains_key("mon-a"),
             "a direct change makes the monitor Custom, not still on the old profile"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_set_writes_the_selected_root_and_keeps_the_user_comments() {
+        let directory = scratch("settings-set");
+        let file = directory.join("settings.toml");
+        std::fs::write(
+            &file,
+            "# written by hand\nschema_version = 1\n\n[tray]\nleft_click = \"flyout\"\n",
+        )
+        .expect("settings");
+
+        let transport = FakeTransport::with_monitor("mon-a", "Panel");
+        let mut coordinator = coordinator_with(transport, Vec::new(), &directory);
+
+        let result = coordinator
+            .handle(
+                "settings.set",
+                &json!({"key": "tray.left_click", "value": "cycle"}),
+            )
+            .expect("set");
+
+        assert_eq!(result["value"], "cycle");
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert!(text.starts_with("# written by hand\n"), "{text}");
+        assert!(text.contains("left_click = \"cycle\""));
+        assert_eq!(
+            coordinator.settings().left_click,
+            crate::config::settings::LeftClick::Cycle
+        );
+        // The write went into the resolved root, not somewhere else.
+        assert!(!directory.join("settings.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn settings_set_refuses_a_file_it_cannot_parse_and_leaves_it_untouched() {
+        let directory = scratch("settings-broken");
+        let file = directory.join("settings.toml");
+        std::fs::write(&file, "schema_version = \n").expect("broken settings");
+
+        let transport = FakeTransport::with_monitor("mon-a", "Panel");
+        let mut coordinator = coordinator_with(transport, Vec::new(), &directory);
+
+        let error = coordinator
+            .handle(
+                "settings.set",
+                &json!({"key": "tray.left_click", "value": "cycle"}),
+            )
+            .expect_err("unparseable settings are not overwritten");
+
+        assert_eq!(error.kind, "invalid_config");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "schema_version = \n"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

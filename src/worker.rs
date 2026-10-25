@@ -258,6 +258,7 @@ mod tests {
             id: 5,
             method: String::from("hello"),
             params: Value::Null,
+            storage_root: None,
         });
         assert!(response.ok);
         let result = response.result.expect("result");
@@ -271,6 +272,7 @@ mod tests {
             id: 6,
             method: String::from("set-vcp"),
             params: json!({"monitor": "mon-aa", "code": 0xD6, "value": 5}),
+            storage_root: None,
         });
         assert!(!response.ok);
         assert_eq!(response.error.expect("error").kind, "unknown_method");
@@ -282,6 +284,7 @@ mod tests {
             id: 7,
             method: String::from("write"),
             params: json!({"monitor": "mon-aa", "control": "sharpness", "value": 5}),
+            storage_root: None,
         });
         assert!(!response.ok);
         assert_eq!(response.error.expect("error").kind, "unsupported");
@@ -293,6 +296,7 @@ mod tests {
             id: 8,
             method: String::from("write"),
             params: json!({"monitor": "mon-aa", "control": "brightness"}),
+            storage_root: None,
         });
         assert!(!response.ok);
         assert_eq!(response.error.expect("error").kind, "invalid_params");

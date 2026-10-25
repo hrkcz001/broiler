@@ -88,6 +88,27 @@ fn dispatch<T: Transport>(coordinator: &Arc<Mutex<Coordinator<T>>>, request: &Re
         }
     };
 
+    // One writer, one data root. A caller that resolved a different root would otherwise be
+    // answered about data it never read, so the request is refused before anything is executed.
+    if let Some(requested) = request.storage_root.as_deref() {
+        if let Some(ours) = guard.storage_root() {
+            if requested != ours {
+                return Response {
+                    id: request.id,
+                    ok: false,
+                    result: None,
+                    error: Some(Failure::new(
+                        "storage_conflict",
+                        format!(
+                            "the running coordinator owns {ours}; this command resolved {requested}. \
+                             Stop the coordinator or use the same --config-dir; nothing was changed"
+                        ),
+                    )),
+                };
+            }
+        }
+    }
+
     match guard.handle(&request.method, &request.params) {
         Ok(result) => Response {
             id: request.id,
@@ -195,6 +216,65 @@ mod tests {
         )))
     }
 
+    fn coordinator_in(root: &std::path::Path) -> Arc<Mutex<Coordinator<FakeTransport>>> {
+        let transport = FakeTransport::with_monitor("mon-a", "Panel");
+        Arc::new(Mutex::new(
+            Coordinator::new(
+                transport,
+                Settings::default(),
+                ProfileRegistry::default(),
+                root.join("settings.toml"),
+            )
+            .with_storage(crate::storage::StorageContext::for_test(root)),
+        ))
+    }
+
+    #[test]
+    fn a_client_that_resolved_another_root_is_refused_before_anything_is_executed() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("broiler-daemon-root-{}", std::process::id()));
+        let state = coordinator_in(&root);
+        let request = Request {
+            id: 1,
+            method: String::from("settings.get"),
+            params: serde_json::Value::Null,
+            storage_root: Some(String::from("C:\\somewhere\\else")),
+        };
+
+        let response = super::dispatch(&state, &request);
+
+        assert!(!response.ok);
+        let failure = response.error.expect("typed failure");
+        assert_eq!(failure.kind, "storage_conflict");
+        assert!(failure.message.contains("nothing was changed"));
+        // The coordinator itself was never asked to do anything.
+        assert!(state.lock().expect("lock").storage_root().is_some());
+    }
+
+    #[test]
+    fn a_client_on_the_same_root_is_served() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("broiler-daemon-same-{}", std::process::id()));
+        let state = coordinator_in(&root);
+        let ours = state
+            .lock()
+            .expect("lock")
+            .storage_root()
+            .expect("root");
+        let request = Request {
+            id: 2,
+            method: String::from("storage.info"),
+            params: serde_json::Value::Null,
+            storage_root: Some(ours.clone()),
+        };
+
+        let response = super::dispatch(&state, &request);
+
+        assert!(response.ok);
+        let result = response.result.expect("result");
+        assert_eq!(result["storage"]["root"], ours);
+    }
+
     fn serve_one(
         endpoint: &Endpoint,
         coordinator: Arc<Mutex<Coordinator<FakeTransport>>>,
@@ -255,6 +335,7 @@ mod tests {
                                     "value": 40 + index,
                                     "unit": "native"
                                 }),
+                                storage_root: None,
                             },
                             Instant::now() + Duration::from_secs(5),
                         )
@@ -329,6 +410,7 @@ mod tests {
             id: 9,
             method: String::from("ping"),
             params: serde_json::Value::Null,
+            storage_root: None,
         };
         let _ = encode_frame(&request).expect("encode");
         let response = client

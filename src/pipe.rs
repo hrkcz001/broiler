@@ -509,6 +509,7 @@ mod tests {
                         id: 1,
                         method: String::from("ping"),
                         params: serde_json::Value::Null,
+                        storage_root: None,
                     },
                     Instant::now() + Duration::from_secs(5),
                 )

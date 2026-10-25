@@ -75,3 +75,32 @@ Do not perform the owner's real migration in the planning session. The implement
 ## Source
 
 Scoop documents persistent data linking and retention by default, with `-p` as explicit uninstall purge: https://github.com/ScoopInstaller/Scoop/wiki/Persistent-data . Layout and migration policy above are broiler design decisions, not claims that the existing implementation already supports them.
+
+## Follow-up, 2026-10-25: implementation landed
+
+The paragraphs above that say the binaries still use AppData describe the state when this contract
+was written. As of commit `ea10f84` and the storage work after it, they are implemented:
+
+- `src/storage.rs` resolves one `StorageContext` per process in the stated order and passes it to
+  the CLI, the resident coordinator, migration and the log. A root that cannot be created or written
+  is an error; there is no fallback.
+- `broiler paths [--json]` reports mode, root, marker, settings, profiles, state and logs, and adds
+  the running coordinator's own root when one answers. `status --json` carries the same block in both
+  the running and the not-running case.
+- `src/migrate.rs` implements the copy-only migration with a staged, journalled publication:
+  dry run, empty destination, identical rerun, conflict, invalid source, interrupted copy, journal
+  recovery, incompatible state schema and byte-for-byte source preservation are covered by tests on
+  disposable directories. A journal entry is rolled back only when the published file still matches
+  its recorded hash.
+- `broiler data migrate --from-appdata [--dry-run | --decline] [--json]` is the only import path.
+  `--decline` records the decision in `<root>/migration.json`. A portable first launch with an older
+  AppData configuration refuses to start and prints the three commands.
+- A request on the pipe names the root its caller resolved; the coordinator refuses a different root
+  with `storage_conflict` instead of acting on data the caller never read.
+- `persist: data` and the marker/`data` creation stay in `packaging/scoop/broiler.json.template`,
+  guarded by `src/packaging.rs` tests. No pre-seeded profiles are shipped.
+
+Not yet evidenced, and not claimed: a real Scoop install, the observed junction target under an
+actual Scoop root, upgrade/uninstall retention, pre-install versus persist-linking ordering, and
+autostart pointing at a stable `current` path. Migration was proven on disposable directories only;
+the owner's real AppData was read for a dry run and not modified or copied.

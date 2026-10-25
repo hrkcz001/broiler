@@ -448,6 +448,51 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), SettingsError> {
     })
 }
 
+/// Replace the settings file with already-validated text, atomically.
+///
+/// `expected` is what the caller read before editing. If the file on disk is no longer that text,
+/// somebody else changed it in the meantime and this update would silently undo their edit, so it
+/// is refused. The replacement itself is a same-directory temporary file plus a rename, so a crash
+/// leaves either the old file or the new one, never a truncated mix.
+pub fn replace_text(path: &Path, expected: &str, updated: &str) -> Result<(), SettingsError> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(SettingsError::single(
+                path,
+                format!("cannot read the settings file: {error}"),
+            ))
+        }
+    };
+    if current != expected {
+        return Err(SettingsError::single(
+            path,
+            "the settings file changed while this update was being prepared; nothing was written",
+        ));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            SettingsError::single(path, format!("cannot create the settings directory: {error}"))
+        })?;
+    }
+
+    let temporary = temporary_path(path);
+    {
+        let mut file = std::fs::File::create(&temporary).map_err(|error| {
+            SettingsError::single(path, format!("cannot create a temporary settings file: {error}"))
+        })?;
+        file.write_all(updated.as_bytes())
+            .map_err(|error| SettingsError::single(path, format!("cannot write settings: {error}")))?;
+        file.sync_all().ok();
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        SettingsError::single(path, format!("cannot replace the settings file: {error}"))
+    })
+}
+
 fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|name| name.to_os_string()).unwrap_or_default();
     name.push(".tmp");
@@ -560,6 +605,52 @@ mod tests {
     }
 
     const SHIPPED: &str = "schema_version = 1\n\n[startup]\nlaunch_at_login = false\n\n[tray]\nleft_click = \"flyout\"\nbadges = \"when_multiple\"\n\n[selection]\nremember = false\nmonitor_ids = []\n\n[profiles]\nstartup = \"preserve\"\nunsupported = \"skip\"\n\n[logging]\nlevel = \"warn\"\n";
+
+    fn scratch(name: &str) -> PathBuf {
+        let mut directory = std::env::temp_dir();
+        directory.push(format!("broiler-settings-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("scratch");
+        directory
+    }
+
+    #[test]
+    fn an_update_replaces_the_file_atomically_and_keeps_the_user_comments() {
+        let directory = scratch("replace");
+        let file = directory.join("settings.toml");
+        let original = format!("# written by hand\n{SHIPPED}");
+        std::fs::write(&file, &original).expect("settings");
+
+        let updated = set_key(&file, &original, "tray.left_click", "cycle").expect("edit");
+        replace_text(&file, &original, &updated).expect("replace");
+
+        let on_disk = std::fs::read_to_string(&file).expect("read");
+        assert!(on_disk.starts_with("# written by hand\n"));
+        assert!(on_disk.contains("left_click = \"cycle\""));
+        assert_eq!(parse(&on_disk, &file).expect("parse").left_click, LeftClick::Cycle);
+        // No temporary file survives a successful replacement.
+        assert!(!file.with_file_name("settings.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_update_that_lost_a_race_with_another_editor_is_refused() {
+        let directory = scratch("stale");
+        let file = directory.join("settings.toml");
+        std::fs::write(&file, SHIPPED).expect("settings");
+        let expected = SHIPPED.to_string();
+
+        // Somebody else edits the file after the caller read it.
+        let changed = SHIPPED.replace("level = \"warn\"", "level = \"info\"");
+        std::fs::write(&file, &changed).expect("external edit");
+
+        let updated = set_key(&file, &expected, "tray.left_click", "cycle").expect("edit");
+        let error = replace_text(&file, &expected, &updated).expect_err("stale edit");
+
+        assert!(error.render().contains("changed while this update was being prepared"));
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), changed);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn parses_the_shipped_settings_file() {

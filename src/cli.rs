@@ -15,7 +15,8 @@ use crate::discovery::{self, DiscoveryFailure};
 use crate::logging::{self, Level};
 use crate::model::{CapabilitiesReport, ControlEvidence, MonitorListReport, Reading};
 use crate::supervisor::{Supervisor, SupervisorError, WorkerCommand};
-use crate::{log_info, output, paths, PRODUCT_NAME, VERSION};
+use crate::storage::StorageContext;
+use crate::{output, PRODUCT_NAME, VERSION};
 
 /// Command completed, or an idempotent stop, or a normal start with no monitors.
 pub const EXIT_OK: i32 = 0;
@@ -47,26 +48,39 @@ fn help_text() -> String {
         "{name} {version} - native Windows DDC/CI monitor controller\n\
          \n\
          Usage:\n\
-         \x20 {name} <command> [options]\n\
+         \x20 {name} [--config-dir <path>] <command> [options]\n\
          \n\
-         Commands defined by the v1 contract:\n\
+         Data:\n\
+         \x20 paths [--json]                       where settings, profiles and logs live\n\
+         \x20 data migrate --from-appdata [--dry-run | --decline] [--json]\n\
+         \x20                                     copy an older AppData configuration here\n\
+         \n\
+         Coordinator:\n\
          \x20 start | stop | status [--json] [--refresh] | reload\n\
+         \n\
+         Monitors and parameters:\n\
          \x20 monitors list [--json] | monitors capabilities --monitor <id> [--json]\n\
-         \x20 monitors select --monitor <id> [--remember] | monitors select --none | --dialog\n\
+         \x20 monitors select --monitor <id> [--remember] | monitors select --none\n\
          \x20 monitors validate-value <parameter> <value> --vcp <code> --monitor <id> --confirm-write\n\
+         \x20 get <parameter> --monitor <id> | set <parameter> <value> --monitor <id> [--wait]\n\
+         \n\
+         Profiles and settings:\n\
          \x20 profiles list [--json] | profiles validate | profiles open\n\
          \x20 profile apply <id> (--monitor <id> | --all-selected) [--wait] | profile next --monitor <id>\n\
-         \x20 get <parameter> --monitor <id> | set <parameter> <value> --monitor <id> [--wait]\n\
          \x20 settings get [key] [--json] | settings set <key> <value> | settings open\n\
-         \x20 startup status | repository open | icons list | flyout --monitor <id>\n\
+         \x20 startup status | repository open | icons list\n\
          \n\
          General:\n\
-         \x20 --version, -V   print the version\n\
-         \x20 --help, -h      print this help\n\
+         \x20 --config-dir <path>   use one data root instead of AppData; must be writable\n\
+         \x20 --version, -V         print the version\n\
+         \x20 --help, -h            print this help\n\
          \n\
-         Status: this build is the build skeleton. Command dispatch, the bounded log and the\n\
-         two executables exist; hardware access, configuration and user interface do not.\n\
-         Every command above except --version and --help reports that it is not implemented.\n\
+         Implemented: storage resolution and copy-only migration, monitor discovery, high-level\n\
+         brightness and contrast reads and writes, profile parsing and planning, the resident\n\
+         coordinator, and the bounded log.\n\
+         Not implemented in this build: the tray and its windows, the selection dialog, colour\n\
+         temperature and the remaining conditional controls, speaker volume and mute, and\n\
+         startup registration. A command that is not implemented reports it and exits 2.\n\
          Exit codes: 0 success, 2 validation error, 3 daemon unavailable, 4 missing target,\n\
          5 unsupported control, 6 transport or verification failure, 7 partial application.",
         name = PRODUCT_NAME,
@@ -77,10 +91,8 @@ fn help_text() -> String {
 /// Default log level until settings are implemented.
 const DEFAULT_LOG_LEVEL: Level = Level::Warn;
 
-fn init_logging() {
-    if let Some(path) = paths::log_file() {
-        logging::init(DEFAULT_LOG_LEVEL, path);
-    }
+fn init_logging(storage: &StorageContext) {
+    logging::init(DEFAULT_LOG_LEVEL, storage.log_file());
 }
 
 fn print_version() {
@@ -95,7 +107,7 @@ fn report_unimplemented(command: &str) -> i32 {
     EXIT_USAGE
 }
 
-fn dispatch_console(args: &[String]) -> i32 {
+fn dispatch_console(args: &[String], storage: &StorageContext) -> i32 {
     let Some(first) = args.first() else {
         output::error_line(&help_text());
         return EXIT_USAGE;
@@ -110,19 +122,21 @@ fn dispatch_console(args: &[String]) -> i32 {
             output::line(&help_text());
             EXIT_OK
         }
-        "monitors" => handle_monitors(&args[1..]),
-        "start" => handle_start(&args[1..]),
-        "stop" => handle_stop(&args[1..]),
-        "status" => handle_status(&args[1..]),
-        "profiles" => handle_profiles(&args[1..]),
-        "settings" => handle_settings(&args[1..]),
-        "reload" => handle_reload(&args[1..]),
-        "profile" => handle_profile(&args[1..]),
-        "startup" => handle_startup(&args[1..]),
+        "monitors" => handle_monitors(&args[1..], storage),
+        "start" => handle_start(&args[1..], storage),
+        "stop" => handle_stop(&args[1..], storage),
+        "status" => handle_status(&args[1..], storage),
+        "profiles" => handle_profiles(&args[1..], storage),
+        "settings" => handle_settings(&args[1..], storage),
+        "reload" => handle_reload(&args[1..], storage),
+        "profile" => handle_profile(&args[1..], storage),
+        "startup" => handle_startup(&args[1..], storage),
         "icons" => handle_icons(&args[1..]),
+        "paths" => handle_paths(&args[1..], storage),
+        "data" => handle_data(&args[1..], storage),
         "repository" => handle_repository(&args[1..]),
-        "get" => handle_get(&args[1..]),
-        "set" => handle_set(&args[1..]),
+        "get" => handle_get(&args[1..], storage),
+        "set" => handle_set(&args[1..], storage),
         other if PLANNED_COMMANDS.contains(&other) => report_unimplemented(other),
         other => {
             output::error_line(&format!("{}: unknown command: {}", PRODUCT_NAME, other));
@@ -144,6 +158,7 @@ fn client_exit_code(error: &crate::runtime::ClientError) -> i32 {
             "invalid" | "invalid_config" => EXIT_USAGE,
             "unsupported" => EXIT_UNSUPPORTED,
             "unknown_monitor" | "ambiguous_monitor" => EXIT_TARGET,
+            "storage_conflict" => EXIT_USAGE,
             "partial" => EXIT_PARTIAL,
             _ => EXIT_TRANSPORT,
         },
@@ -155,7 +170,7 @@ fn report_client_error(error: &crate::runtime::ClientError) -> i32 {
     client_exit_code(error)
 }
 
-fn handle_status(args: &[String]) -> i32 {
+fn handle_status(args: &[String], storage: &StorageContext) -> i32 {
     let mut json_output = false;
     for argument in args {
         match argument.as_str() {
@@ -165,7 +180,7 @@ fn handle_status(args: &[String]) -> i32 {
         }
     }
 
-    match crate::runtime::request("status", json!(null)) {
+    match crate::runtime::request(storage, "status", json!(null)) {
         Ok(result) => {
             if json_output {
                 emit_json(&result);
@@ -184,7 +199,9 @@ fn handle_status(args: &[String]) -> i32 {
         }
         Err(crate::runtime::ClientError::NotRunning) => {
             if json_output {
-                emit_json(&json!({"running": false}));
+                // The roots are known without a coordinator, so they are reported rather than
+                // omitted: a script should not have to guess where this build keeps its data.
+                emit_json(&json!({"running": false, "storage": storage.describe()}));
             } else {
                 output::line("not running");
             }
@@ -194,7 +211,7 @@ fn handle_status(args: &[String]) -> i32 {
             // A coordinator that has answered `stop` is not a running coordinator any more.
             if matches!(&error, crate::runtime::ClientError::Failure(failure) if failure.kind == "shutting_down") {
                 if json_output {
-                    emit_json(&json!({"running": false}));
+                    emit_json(&json!({"running": false, "storage": storage.describe()}));
                 } else {
                     output::line("not running");
                 }
@@ -206,11 +223,11 @@ fn handle_status(args: &[String]) -> i32 {
     }
 }
 
-fn handle_stop(args: &[String]) -> i32 {
+fn handle_stop(args: &[String], storage: &StorageContext) -> i32 {
     if let Some(argument) = args.first() {
         return usage_error(&format!("stop: unexpected argument: {argument}"));
     }
-    match crate::runtime::stop_resident() {
+    match crate::runtime::stop_resident(storage) {
         Ok(true) => {
             output::line("coordinator stopped");
             EXIT_OK
@@ -223,15 +240,21 @@ fn handle_stop(args: &[String]) -> i32 {
     }
 }
 
-fn handle_start(args: &[String]) -> i32 {
+fn handle_start(args: &[String], storage: &StorageContext) -> i32 {
     if let Some(argument) = args.first() {
         return usage_error(&format!("start: unexpected argument: {argument}"));
     }
-    if crate::runtime::is_running() {
+    if crate::runtime::is_running(storage) {
         output::line("already running");
         return EXIT_OK;
     }
-    match crate::runtime::start_resident() {
+    // Report the same actionable message the resident process would, instead of starting a child
+    // that exits immediately.
+    if let Some(reason) = crate::runtime::pending_import_message(storage) {
+        output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
+        return EXIT_USAGE;
+    }
+    match crate::runtime::start_resident(storage) {
         Ok(()) => {
             output::line("coordinator started");
             EXIT_OK
@@ -269,15 +292,12 @@ fn open_path(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn handle_profiles(args: &[String]) -> i32 {
+fn handle_profiles(args: &[String], storage: &StorageContext) -> i32 {
     let Some(subcommand) = args.first() else {
         return usage_error("profiles: expected 'list', 'validate' or 'open'");
     };
 
-    let directory = match paths::profiles_dir() {
-        Some(directory) => directory,
-        None => return usage_error("profiles: the roaming AppData directory is unavailable"),
-    };
+    let directory = storage.profiles_dir();
 
     match subcommand.as_str() {
         "list" => {
@@ -343,14 +363,11 @@ fn handle_profiles(args: &[String]) -> i32 {
     }
 }
 
-fn handle_settings(args: &[String]) -> i32 {
+fn handle_settings(args: &[String], storage: &StorageContext) -> i32 {
     let Some(subcommand) = args.first() else {
         return usage_error("settings: expected 'get', 'set' or 'open'");
     };
-    let path = match paths::settings_file() {
-        Some(path) => path,
-        None => return usage_error("settings: the roaming AppData directory is unavailable"),
-    };
+    let path = storage.settings_file();
 
     match subcommand.as_str() {
         "get" => {
@@ -363,7 +380,7 @@ fn handle_settings(args: &[String]) -> i32 {
                     other => return usage_error(&format!("settings get: unexpected argument: {other}")),
                 }
             }
-            match crate::runtime::request(
+            match crate::runtime::request(storage, 
                 "settings.get",
                 match key {
                     Some(key) => json!({ "key": key }),
@@ -414,7 +431,7 @@ fn handle_settings(args: &[String]) -> i32 {
             let Some(value) = args.get(2) else {
                 return usage_error("settings set: a value is required");
             };
-            match crate::runtime::request("settings.set", json!({"key": key, "value": value})) {
+            match crate::runtime::request(storage, "settings.set", json!({"key": key, "value": value})) {
                 Ok(result) => {
                     emit_json(&result);
                     EXIT_OK
@@ -475,11 +492,11 @@ fn settings_key_value(
 // profiles, monitor selection, startup, icons
 // ---------------------------------------------------------------------------
 
-fn handle_reload(args: &[String]) -> i32 {
+fn handle_reload(args: &[String], storage: &StorageContext) -> i32 {
     if let Some(argument) = args.first() {
         return usage_error(&format!("reload: unexpected argument: {argument}"));
     }
-    match crate::runtime::request("profiles.reload", json!(null)) {
+    match crate::runtime::request(storage, "profiles.reload", json!(null)) {
         Ok(result) => {
             let count = result.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0);
             output::line(&format!("reloaded {count} profile(s)"));
@@ -489,7 +506,7 @@ fn handle_reload(args: &[String]) -> i32 {
     }
 }
 
-fn handle_profile(args: &[String]) -> i32 {
+fn handle_profile(args: &[String], storage: &StorageContext) -> i32 {
     let Some(subcommand) = args.first() else {
         return usage_error("profile: expected 'apply' or 'next'");
     };
@@ -533,7 +550,7 @@ fn handle_profile(args: &[String]) -> i32 {
                     )
                 }
             };
-            match crate::runtime::request("profile.apply", params) {
+            match crate::runtime::request(storage, "profile.apply", params) {
                 Ok(result) => report_apply(&result, json_output),
                 Err(error) => report_client_error(&error),
             }
@@ -559,7 +576,7 @@ fn handle_profile(args: &[String]) -> i32 {
             let Some(monitor) = monitor else {
                 return usage_error("profile next: --monitor <id> is required");
             };
-            match crate::runtime::request("profile.next", json!({"monitor": monitor})) {
+            match crate::runtime::request(storage, "profile.next", json!({"monitor": monitor})) {
                 Ok(result) => report_apply(&result, json_output),
                 Err(error) => report_client_error(&error),
             }
@@ -638,9 +655,9 @@ fn report_apply(result: &serde_json::Value, json_output: bool) -> i32 {
     }
 }
 
-fn handle_startup(args: &[String]) -> i32 {
+fn handle_startup(args: &[String], storage: &StorageContext) -> i32 {
     match args.first().map(String::as_str) {
-        Some("status") => match crate::runtime::request("startup.status", json!(null)) {
+        Some("status") => match crate::runtime::request(storage, "startup.status", json!(null)) {
             Ok(result) => {
                 emit_json(&result);
                 EXIT_OK
@@ -649,6 +666,167 @@ fn handle_startup(args: &[String]) -> i32 {
         },
         Some(other) => usage_error(&format!("startup: unknown subcommand: {other}")),
         None => usage_error("startup: expected 'status'"),
+    }
+}
+
+/// `broiler paths [--json]`: where this installation actually keeps its data.
+///
+/// A running coordinator reports its own root as well, so a mismatch between the CLI and the
+/// resident writer is visible instead of silently splitting the configuration.
+fn handle_paths(args: &[String], storage: &StorageContext) -> i32 {
+    let mut json_output = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json_output = true,
+            other => return usage_error(&format!("paths: unexpected argument: {other}")),
+        }
+    }
+
+    let mut described = storage.describe();
+    match crate::runtime::request(storage, "storage.info", json!(null)) {
+        Ok(info) => {
+            if let Some(daemon) = info.get("storage") {
+                described["coordinator"] = serde_json::json!({
+                    "running": true,
+                    "root": daemon.get("root").cloned().unwrap_or(serde_json::Value::Null),
+                    "mode": daemon.get("mode").cloned().unwrap_or(serde_json::Value::Null),
+                });
+            }
+        }
+        Err(crate::runtime::ClientError::NotRunning) => {
+            described["coordinator"] = serde_json::json!({ "running": false });
+        }
+        Err(error) => return report_client_error(&error),
+    }
+
+    if json_output {
+        emit_json(&described);
+    } else {
+        output::line(&format!("mode      {}", storage.mode().as_str()));
+        output::line(&format!("root      {}", storage.root().display()));
+        output::line(&format!("settings  {}", storage.settings_file().display()));
+        output::line(&format!("profiles  {}", storage.profiles_dir().display()));
+        output::line(&format!("state     {}", storage.state_file().display()));
+        output::line(&format!("logs      {}", storage.log_dir().display()));
+        if let Some(marker) = storage.marker() {
+            output::line(&format!("marker    {}", marker.display()));
+        }
+    }
+    EXIT_OK
+}
+
+/// `broiler data migrate --from-appdata [--dry-run|--decline] [--json]`
+///
+/// Copy-only and explicit: it never deletes the source, never overwrites a different destination,
+/// and never touches hardware, the coordinator or startup registration.
+fn handle_data(args: &[String], storage: &StorageContext) -> i32 {
+    let Some(roots) = crate::storage::appdata_roots() else {
+        return usage_error("data migrate: the AppData known folders are unavailable");
+    };
+    run_data(args, storage, &roots)
+}
+
+/// The migration command with its source roots supplied explicitly, so the whole command surface
+/// can be exercised against disposable directories.
+fn run_data(
+    args: &[String],
+    storage: &StorageContext,
+    roots: &crate::storage::AppDataRoots,
+) -> i32 {
+    let Some(subcommand) = args.first() else {
+        return usage_error("data: expected 'migrate'");
+    };
+    if subcommand != "migrate" {
+        return usage_error(&format!("data: unknown subcommand: {subcommand}"));
+    }
+
+    let mut from_appdata = false;
+    let mut dry_run = false;
+    let mut decline = false;
+    let mut json_output = false;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--from-appdata" => from_appdata = true,
+            "--dry-run" => dry_run = true,
+            "--decline" => decline = true,
+            "--json" => json_output = true,
+            other => return usage_error(&format!("data migrate: unexpected argument: {other}")),
+        }
+    }
+    if !from_appdata {
+        return usage_error("data migrate: --from-appdata is required; there is no implicit source");
+    }
+    if dry_run && decline {
+        return usage_error("data migrate: --dry-run and --decline contradict each other");
+    }
+
+    if decline {
+        return match crate::migrate::decline(storage, roots) {
+            Ok(record) => {
+                if json_output {
+                    emit_json(&json!({
+                        "declined": true,
+                        "root": storage.root().display().to_string(),
+                        "record": record,
+                    }));
+                } else {
+                    output::line(&format!(
+                        "recorded that the existing AppData configuration will not be imported; \
+                         nothing was copied into {}",
+                        storage.root().display()
+                    ));
+                }
+                EXIT_OK
+            }
+            Err(error) => {
+                output::error_line(&format!("{}: {error}", PRODUCT_NAME));
+                EXIT_USAGE
+            }
+        };
+    }
+
+    match crate::migrate::migrate(storage, roots, dry_run) {
+        Ok(report) => {
+            if json_output {
+                emit_json(&report.describe());
+            } else {
+                if report.unnecessary {
+                    output::line(
+                        "this installation already uses AppData; there is nothing to migrate",
+                    );
+                }
+                output::line(&format!("from      {}", report.source_root.display()));
+                output::line(&format!("to        {}", report.destination_root.display()));
+                for line in &report.recovered {
+                    output::line(&format!("recovered {line}"));
+                }
+                for item in &report.items {
+                    output::line(&format!(
+                        "{:<9} {}",
+                        item.state.as_str(),
+                        item.relative
+                    ));
+                }
+                for (path, reason) in &report.skipped {
+                    output::line(&format!("skipped   {path} ({reason})"));
+                }
+                if report.dry_run {
+                    output::line("dry run: nothing was copied");
+                } else if report.committed {
+                    if report.written.is_empty() {
+                        output::line("nothing to copy; the destination already matched");
+                    } else {
+                        output::line(&format!("copied {} file(s)", report.written.len()));
+                        output::line("the original AppData files were left untouched");
+                    }
+                }
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            output::error_line(&format!("{}: {error}", PRODUCT_NAME));
+            EXIT_USAGE
+        }
     }
 }
 
@@ -733,7 +911,7 @@ fn parse_number(text: &str) -> Option<u64> {
     }
 }
 
-fn handle_get(args: &[String]) -> i32 {
+fn handle_get(args: &[String], storage: &StorageContext) -> i32 {
     let mut control: Option<&'static str> = None;
     let mut monitor: Option<String> = None;
     let mut json_output = false;
@@ -770,7 +948,7 @@ fn handle_get(args: &[String]) -> i32 {
     };
 
     // A resident coordinator owns the hardware: route the read through it when it exists.
-    match crate::runtime::request(
+    match crate::runtime::request(storage, 
         "parameters.get",
         json!({"monitor": monitor, "control": control}),
     ) {
@@ -854,7 +1032,7 @@ fn handle_get(args: &[String]) -> i32 {
     }
 }
 
-fn handle_set(args: &[String]) -> i32 {
+fn handle_set(args: &[String], storage: &StorageContext) -> i32 {
     let mut control: Option<&'static str> = None;
     let mut raw_value: Option<String> = None;
     let mut monitor: Option<String> = None;
@@ -904,7 +1082,7 @@ fn handle_set(args: &[String]) -> i32 {
 
     // A resident coordinator owns the hardware: route the write through it when it exists.
     let unit = if raw { "native" } else { "percent" };
-    match crate::runtime::request(
+    match crate::runtime::request(storage, 
         "parameters.set",
         json!({"monitor": monitor, "control": control, "value": value, "unit": unit}),
     ) {
@@ -1267,7 +1445,7 @@ fn monitors_capabilities(args: &[String]) -> i32 {
     }
 }
 
-fn monitors_select(args: &[String]) -> i32 {
+fn monitors_select(args: &[String], storage: &StorageContext) -> i32 {
     let mut ids: Vec<String> = Vec::new();
     let mut remember = false;
     let mut none = false;
@@ -1304,7 +1482,7 @@ fn monitors_select(args: &[String]) -> i32 {
         return usage_error("monitors select: choose --monitor <id> (repeatable) or --none");
     }
 
-    match crate::runtime::request(
+    match crate::runtime::request(storage, 
         "monitors.select",
         json!({"monitor_ids": ids, "remember": remember}),
     ) {
@@ -1316,7 +1494,7 @@ fn monitors_select(args: &[String]) -> i32 {
     }
 }
 
-fn monitors_validate_value(args: &[String]) -> i32 {
+fn monitors_validate_value(args: &[String], storage: &StorageContext) -> i32 {
     let mut parameter: Option<&'static str> = None;
     let mut value: Option<u64> = None;
     let mut vcp: Option<u64> = None;
@@ -1395,7 +1573,7 @@ fn monitors_validate_value(args: &[String]) -> i32 {
         }
     }
 
-    match crate::runtime::request(
+    match crate::runtime::request(storage, 
         "monitors.validate_value",
         json!({
             "monitor": monitor,
@@ -1416,12 +1594,12 @@ fn monitors_validate_value(args: &[String]) -> i32 {
     }
 }
 
-fn handle_monitors(args: &[String]) -> i32 {
+fn handle_monitors(args: &[String], storage: &StorageContext) -> i32 {
     match args.first().map(String::as_str) {
         Some("list") => monitors_list(&args[1..]),
         Some("capabilities") => monitors_capabilities(&args[1..]),
-        Some("select") => monitors_select(&args[1..]),
-        Some("validate-value") => monitors_validate_value(&args[1..]),
+        Some("select") => monitors_select(&args[1..], storage),
+        Some("validate-value") => monitors_validate_value(&args[1..], storage),
         Some(other) => usage_error(&format!("monitors: unknown subcommand: {other}")),
         None => usage_error(
             "monitors: expected 'list', 'capabilities', 'select' or 'validate-value'",
@@ -1429,16 +1607,11 @@ fn handle_monitors(args: &[String]) -> i32 {
     }
 }
 
-fn dispatch_tray(args: &[String]) -> i32 {
+fn dispatch_tray(args: &[String], storage: &StorageContext) -> i32 {
     match args.first().map(String::as_str) {
         None => {
-            init_logging();
-            log_info!("broiler-tray: starting without a user interface (build skeleton)");
-            output::error_line(&format!(
-                "{}: this build has no tray, no selection dialog and no coordinator yet",
-                PRODUCT_NAME
-            ));
-            EXIT_OK
+            init_logging(storage);
+            crate::runtime::run_resident(storage.clone())
         }
         Some("--version") | Some("-V") | Some("version") => {
             print_version();
@@ -1449,7 +1622,8 @@ fn dispatch_tray(args: &[String]) -> i32 {
             EXIT_OK
         }
         Some("--internal-ddc-worker") => {
-            init_logging();
+            // The worker performs no file I/O, so it receives no data root: nothing it does can
+            // create a second copy of the user's configuration.
             output::error_line(&format!(
                 "{}: the internal DDC worker is not implemented in this build",
                 PRODUCT_NAME
@@ -1463,14 +1637,57 @@ fn dispatch_tray(args: &[String]) -> i32 {
     }
 }
 
+/// Split a global `--config-dir <path>` off the argument list.
+///
+/// The root is resolved here, once, and every later step receives the absolute result. A second
+/// `--config-dir` is a usage error rather than a silent last-one-wins.
+fn take_config_dir(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut explicit: Option<PathBuf> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config-dir" => {
+                if explicit.is_some() {
+                    return Err(String::from("--config-dir was given more than once"));
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(String::from("--config-dir requires a path"));
+                };
+                explicit = Some(PathBuf::from(value));
+                index += 2;
+            }
+            other => {
+                rest.push(other.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok((explicit, rest))
+}
+
 /// Entry point shared by both binaries.
 pub fn run(program: Program, args: &[String]) -> i32 {
+    let (explicit, rest) = match take_config_dir(args) {
+        Ok(parsed) => parsed,
+        Err(reason) => return usage_error(&reason),
+    };
+    let storage = match crate::storage::resolve(explicit.as_deref()) {
+        Ok(storage) => storage,
+        Err(error) => {
+            // No root means no work: an unmarked installation whose known folders are unavailable
+            // cannot guess one, and it must never invent a location.
+            output::error_line(&format!("{}: {error}", PRODUCT_NAME));
+            return EXIT_USAGE;
+        }
+    };
+
     match program {
-        Program::Console => dispatch_console(args),
+        Program::Console => dispatch_console(&rest, &storage),
         Program::Tray => {
             // A GUI-subsystem process has no console unless one is inherited.
             output::attach_console_if_needed();
-            dispatch_tray(args)
+            dispatch_tray(&rest, &storage)
         }
     }
 }
@@ -1478,9 +1695,33 @@ pub fn run(program: Program, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// One isolated data root for the whole test binary.
+    ///
+    /// No test may read, write or depend on the developer's real AppData directory, and no test may
+    /// depend on a user's running coordinator.
+    fn test_root() -> &'static StorageContext {
+        static STORAGE: OnceLock<StorageContext> = OnceLock::new();
+        STORAGE.get_or_init(|| {
+            let mut base = std::env::temp_dir();
+            base.push(format!("broiler-cli-{}-storage", std::process::id()));
+            StorageContext::for_test(&base)
+        })
+    }
+
+    // The handlers take the resolved root explicitly; these local wrappers keep each test focused on
+    // the command it exercises while still routing through the isolated root.
+    fn dispatch_console(args: &[String]) -> i32 {
+        super::dispatch_console(args, test_root())
+    }
+
+    fn dispatch_tray(args: &[String]) -> i32 {
+        super::dispatch_tray(args, test_root())
     }
 
     #[test]
@@ -1552,6 +1793,193 @@ mod tests {
         assert_eq!(EXIT_UNSUPPORTED, 5);
         assert_eq!(EXIT_TRANSPORT, 6);
         assert_eq!(EXIT_PARTIAL, 7);
+    }
+
+    #[test]
+    fn paths_describes_the_resolved_root_without_a_coordinator() {
+        assert_eq!(dispatch_console(&argv(&["paths"])), EXIT_OK);
+        assert_eq!(dispatch_console(&argv(&["paths", "--json"])), EXIT_OK);
+        assert_eq!(dispatch_console(&argv(&["paths", "--bogus"])), EXIT_USAGE);
+    }
+
+    #[test]
+    fn the_config_dir_option_is_taken_once_and_removed_from_the_arguments() {
+        let parsed = take_config_dir(&argv(&["--config-dir", "C:\\chosen", "paths", "--json"]))
+            .expect("parsed");
+        assert_eq!(parsed.0, Some(PathBuf::from("C:\\chosen")));
+        assert_eq!(parsed.1, argv(&["paths", "--json"]));
+
+        assert!(take_config_dir(&argv(&["--config-dir"])).is_err());
+        assert!(take_config_dir(&argv(&[
+            "--config-dir",
+            "a",
+            "--config-dir",
+            "b"
+        ]))
+        .is_err());
+        assert_eq!(
+            take_config_dir(&argv(&["paths"])).expect("parsed"),
+            (None, argv(&["paths"]))
+        );
+    }
+
+    #[test]
+    fn data_migrate_requires_an_explicit_source_and_consistent_flags() {
+        assert_eq!(dispatch_console(&argv(&["data"])), EXIT_USAGE);
+        assert_eq!(dispatch_console(&argv(&["data", "frobnicate"])), EXIT_USAGE);
+        assert_eq!(dispatch_console(&argv(&["data", "migrate"])), EXIT_USAGE);
+        assert_eq!(
+            dispatch_console(&argv(&[
+                "data",
+                "migrate",
+                "--from-appdata",
+                "--dry-run",
+                "--decline"
+            ])),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            dispatch_console(&argv(&["data", "migrate", "--from-appdata", "--bogus"])),
+            EXIT_USAGE
+        );
+    }
+
+    /// A disposable AppData source and a disposable portable destination.
+    struct Migration {
+        base: PathBuf,
+        roots: crate::storage::AppDataRoots,
+        storage: StorageContext,
+    }
+
+    impl Drop for Migration {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn migration(name: &str) -> Migration {
+        let mut base = std::env::temp_dir();
+        base.push(format!("broiler-cli-migrate-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let roots = crate::storage::AppDataRoots {
+            roaming: base.join("Roaming"),
+            local: base.join("Local"),
+        };
+        let storage = StorageContext::for_test(&base.join("app").join("data"));
+        Migration {
+            base,
+            roots,
+            storage,
+        }
+    }
+
+    impl Migration {
+        fn source_file(&self, relative: &str, text: &str) {
+            let source = crate::storage::appdata_of(&self.roots);
+            let path = source
+                .root()
+                .join(relative.replace('/', &std::path::MAIN_SEPARATOR.to_string()));
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("source dir");
+            std::fs::write(path, text).expect("source file");
+        }
+    }
+
+    #[test]
+    fn data_migrate_dry_run_then_copy_then_decline_through_the_command_surface() {
+        let fixture = migration("surface");
+        fixture.source_file(
+            "settings.toml",
+            "# hand written\nschema_version = 1\n\n[tray]\nleft_click = \"cycle\"\n",
+        );
+        fixture.source_file(
+            "profiles/night.toml",
+            "schema_version = 1\nid = \"night\"\nname = \"Night\"\nicon = \"night\"\n\n[monitor]\nbrightness = 0\n",
+        );
+
+        // Dry run: reports the work, changes nothing.
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata", "--dry-run"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_OK
+        );
+        assert!(!fixture.storage.settings_file().exists());
+
+        // The real copy, through the same command surface.
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_OK
+        );
+        assert!(std::fs::read_to_string(fixture.storage.settings_file())
+            .expect("settings")
+            .starts_with("# hand written\n"));
+        // The original AppData files are still there.
+        let source = crate::storage::appdata_of(&fixture.roots);
+        assert!(source.settings_file().exists());
+
+        // A second run is a no-op, and declining after an import is refused rather than recorded.
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_OK
+        );
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata", "--decline"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_USAGE
+        );
+    }
+
+    #[test]
+    fn data_migrate_declines_explicitly_without_copying() {
+        let fixture = migration("decline");
+        fixture.source_file("settings.toml", "schema_version = 1\n");
+
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata", "--decline"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_OK
+        );
+        assert!(!fixture.storage.settings_file().exists());
+        let record = crate::migrate::recorded_decision(&fixture.storage).expect("record");
+        assert_eq!(record.appdata_import, "declined");
+    }
+
+    #[test]
+    fn data_migrate_stops_on_a_conflicting_destination() {
+        let fixture = migration("conflict");
+        fixture.source_file("settings.toml", "schema_version = 1\n\n[tray]\nleft_click = \"cycle\"\n");
+        std::fs::create_dir_all(fixture.storage.root()).expect("root");
+        std::fs::write(fixture.storage.settings_file(), "different\n").expect("conflict");
+
+        assert_eq!(
+            run_data(
+                &argv(&["migrate", "--from-appdata"]),
+                &fixture.storage,
+                &fixture.roots
+            ),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.storage.settings_file()).expect("kept"),
+            "different\n"
+        );
     }
 
     #[test]

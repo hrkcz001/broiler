@@ -14,6 +14,7 @@ use crate::coordinator::Coordinator;
 use crate::daemon::Daemon;
 use crate::instance::InstanceLock;
 use crate::lifecycle::StartupOutcome;
+use crate::win::ui::Answer;
 use crate::ipc::{Failure, Request, Response, PROTOCOL_VERSION};
 use crate::pipe::{self, Client, Endpoint};
 use crate::transport::Transport;
@@ -209,6 +210,16 @@ pub fn startup_message(
     }
 }
 
+/// Whether startup may show a window to resolve an outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// Never open a window: stop with the message instead. This is what an unattended command and a
+    /// test need, and it keeps a decision path free of UI.
+    Never,
+    /// Ask the user when the outcome needs an answer.
+    WhenNeeded,
+}
+
 /// Decide what this launch should do and, for a one-shot outcome, apply it exactly once.
 ///
 /// Hardware is only touched by the `ApplyOnce` branch, and that branch writes solely through the
@@ -216,24 +227,24 @@ pub fn startup_message(
 pub fn startup_step<C: crate::transport::Transport>(
     coordinator: &mut Coordinator<C>,
     storage: &StorageContext,
+    ask: Ask,
 ) -> StartupStep {
-    let outcome = match coordinator.startup_outcome() {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            log_error!("startup decision failed: {}", error.message);
-            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
-            return StartupStep::Exit(6);
-        }
-    };
-    log_info!("startup outcome: {}", outcome.as_str());
+    // Two outcomes are resolvable by asking, not by giving up: a required selection and a directory
+    // with no profiles. Both can legitimately come back unchanged, so the loop is bounded instead of
+    // trusting the user to make progress.
+    for attempt in 0..=MAX_ASK_ROUNDS {
+        let outcome = match coordinator.startup_outcome() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log_error!("startup decision failed: {}", error.message);
+                output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
+                return StartupStep::Exit(6);
+            }
+        };
+        log_info!("startup outcome: {}", outcome.as_str());
+        let step = plan_startup(&outcome);
 
-    let step = plan_startup(&outcome);
-    if let Some(message) = startup_message(&outcome, storage) {
-        log_info!("{message}");
-        output::error_line(&format!("{}: {message}", PRODUCT_NAME));
-    }
-    match &step {
-        StartupStep::ApplyOnce { profile, targets } => {
+        if let StartupStep::ApplyOnce { profile, targets } = &step {
             log_info!(
                 "applying profile {profile} to {} target(s) and exiting",
                 targets.len()
@@ -242,18 +253,109 @@ pub fn startup_step<C: crate::transport::Transport>(
                 "profile.apply",
                 &serde_json::json!({"id": profile, "monitor_ids": targets}),
             );
-            match result {
-                Ok(result) => return StartupStep::Exit(crate::cli::report_apply(&result, false)),
+            return match result {
+                Ok(result) => StartupStep::Exit(crate::cli::report_apply(&result, false)),
                 Err(error) => {
                     log_error!("profile {} was not applied: {}", profile, error.message);
                     output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
-                    return StartupStep::Exit(6);
+                    StartupStep::Exit(6)
+                }
+            };
+        }
+
+        if matches!(step, StartupStep::Serve) {
+            return step;
+        }
+
+        let code = match step {
+            StartupStep::Exit(code) => code,
+            _ => unreachable!("handled above"),
+        };
+        if attempt == MAX_ASK_ROUNDS || ask == Ask::Never {
+            report_stop(&outcome, storage);
+            return StartupStep::Exit(code);
+        }
+
+        match &outcome {
+            StartupOutcome::ShowSelection { remember, .. } => {
+                match ask_for_selection(coordinator, *remember) {
+                    // Cancel changes nothing, and a startup that has no selection simply exits.
+                    Some(Answer::Cancelled) | None => return StartupStep::Exit(0),
+                    Some(Answer::Confirmed { ids, remember }) => {
+                        if let Err(error) = coordinator.handle(
+                            "monitors.select",
+                            &serde_json::json!({"monitor_ids": ids, "remember": remember}),
+                        ) {
+                            log_error!("the selection was not recorded: {}", error.message);
+                            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message));
+                            return StartupStep::Exit(6);
+                        }
+                    }
                 }
             }
+            StartupOutcome::SetupWindow => match ask_for_profiles(storage) {
+                None | Some(crate::win::ui::SetupAnswer::Exit) => {
+                    report_stop(&outcome, storage);
+                    return StartupStep::Exit(code);
+                }
+                Some(crate::win::ui::SetupAnswer::OpenDirectory) => {
+                    if let Err(reason) = crate::win::ui::open_directory(&storage.profiles_dir()) {
+                        log_error!("{reason}");
+                    }
+                }
+                Some(crate::win::ui::SetupAnswer::Reload) => {
+                    if let Err(error) = coordinator.handle("reload", &serde_json::Value::Null) {
+                        log_error!("profiles were not reloaded: {}", error.message);
+                    }
+                }
+            },
+            _ => {
+                report_stop(&outcome, storage);
+                return StartupStep::Exit(code);
+            }
         }
-        StartupStep::Exit(_) | StartupStep::Serve => {}
     }
-    step
+    // The loop can only leave through one of the returns above.
+    StartupStep::Exit(0)
+}
+
+/// How many times startup asks instead of stopping, so a persistent answer cannot loop forever.
+const MAX_ASK_ROUNDS: usize = 2;
+
+fn report_stop(outcome: &StartupOutcome, storage: &StorageContext) {
+    if let Some(message) = startup_message(outcome, storage) {
+        log_info!("{message}");
+        output::error_line(&format!("{}: {message}", PRODUCT_NAME));
+    }
+}
+
+/// Show the checkbox dialog and return the answer, or `None` when no window could be shown.
+fn ask_for_selection<C: crate::transport::Transport>(
+    coordinator: &mut Coordinator<C>,
+    remember: bool,
+) -> Option<Answer> {
+    let monitors = coordinator.monitors().ok()?;
+    if monitors.is_empty() {
+        return None;
+    }
+    let entries = crate::win::ui::entries_for(&monitors);
+    Some(crate::win::ui::select_monitors(
+        "broiler: select monitors",
+        "Choose the monitors broiler controls.",
+        &entries,
+        remember,
+    ))
+}
+
+/// Show the zero-profile setup window, or `None` when no window could be shown.
+fn ask_for_profiles(storage: &StorageContext) -> Option<crate::win::ui::SetupAnswer> {
+    let message = format!(
+        "There is no profile in {}.\n\nAdd a profile file there, then choose Reload. {} never \
+         creates a profile for you.",
+        storage.profiles_dir().display(),
+        PRODUCT_NAME
+    );
+    Some(crate::win::ui::setup_window("broiler: no profiles", &message))
 }
 
 /// A coordinator over a transient worker, for the decision paths that must work without a resident
@@ -286,7 +388,7 @@ pub fn startup_step_for_storage(storage: &StorageContext) -> StartupStep {
             return StartupStep::Exit(code);
         }
     };
-    startup_step(&mut coordinator, storage)
+    startup_step(&mut coordinator, storage, Ask::WhenNeeded)
 }
 
 /// Run the resident coordinator until it is asked to stop. Returns the process exit code.
@@ -366,7 +468,7 @@ pub fn run_resident(storage: StorageContext) -> i32 {
     // means apply once and exit, and only a real multi-profile setup stays resident. Without this
     // the tray would become resident at logon with nothing to control and never apply anything.
     let mut coordinator_state = coordinator_state;
-    if let StartupStep::Exit(code) = startup_step(&mut coordinator_state, &storage) {
+    if let StartupStep::Exit(code) = startup_step(&mut coordinator_state, &storage, Ask::WhenNeeded) {
         log_info!("startup finished with exit code {code}");
         return code;
     }
@@ -549,7 +651,7 @@ mod tests {
         )
         .with_profiles_dir(storage.profiles_dir())
         .with_storage(storage.clone());
-        let step = startup_step(&mut coordinator, &storage);
+        let step = startup_step(&mut coordinator, &storage, Ask::Never);
         let transport = coordinator.into_transport();
         let _ = std::fs::remove_dir_all(base);
         (step, transport)

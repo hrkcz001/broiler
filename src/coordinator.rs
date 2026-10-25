@@ -326,6 +326,11 @@ impl<T: Transport> Coordinator<T> {
         self.transport
     }
 
+    /// The present monitors, for a surface that has to list them.
+    pub fn monitors(&mut self) -> Result<Vec<crate::transport::MonitorSummary>, Failure> {
+        self.transport.monitors().map_err(transport_failure)
+    }
+
     /// Enumerate the present monitors and apply the documented startup decision.
     ///
     /// The resident loop and the CLI both need this answer before anything is written, so it is one

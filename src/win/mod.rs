@@ -10,4 +10,5 @@ pub mod edid;
 pub mod process;
 pub mod registry;
 pub mod topology;
+pub mod ui;
 pub mod wide;

@@ -60,7 +60,7 @@ fn help_text() -> String {
          \n\
          Monitors and parameters:\n\
          \x20 monitors list [--json] | monitors capabilities --monitor <id> [--json]\n\
-         \x20 monitors select --monitor <id> [--remember] | monitors select --none\n\
+         \x20 monitors select --monitor <id> [--remember] | --none | --dialog\n\
          \x20 monitors validate-value <parameter> <value> --vcp <code> --monitor <id> --confirm-write\n\
          \x20 get <parameter> --monitor <id> | set <parameter> <value> --monitor <id> [--wait]\n\
          \n\
@@ -77,9 +77,10 @@ fn help_text() -> String {
          \n\
          Implemented: storage resolution and copy-only migration, monitor discovery, high-level\n\
          brightness and contrast reads and writes, profile parsing and planning, the resident\n\
-         coordinator, and the bounded log.\n\
-         Not implemented in this build: the tray and its windows, the selection dialog, colour\n\
-         temperature and the remaining conditional controls, speaker volume and mute, and\n\
+         coordinator, the startup lifecycle, the monitor selection dialog and the zero-profile\n\
+         setup window, and the bounded log.\n\
+         Not implemented in this build: tray icons and the profile flyout, the settings window,\n\
+         colour temperature and the remaining conditional controls, speaker volume and mute, and\n\
          startup registration. A command that is not implemented reports it and exits 2.\n\
          Exit codes: 0 success, 2 validation error, 3 daemon unavailable, 4 missing target,\n\
          5 unsupported control, 6 transport or verification failure, 7 partial application.",
@@ -271,6 +272,93 @@ fn handle_start(args: &[String], storage: &StorageContext) -> i32 {
         }
         Err(reason) => {
             output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
+            EXIT_TRANSPORT
+        }
+    }
+}
+
+/// The checkbox dialog, opened explicitly. Recording the answer goes through the coordinator when one
+/// is running so its in-memory settings stay current, and through the file otherwise.
+///
+/// A selection of nothing is a deliberate answer: it records an empty selection and stops controlling
+/// anything, which is different from Cancel.
+fn select_with_dialog(storage: &StorageContext, remember: bool) -> i32 {
+    let transport = match crate::runtime::TransientTransport::new() {
+        Ok(transport) => transport,
+        Err(reason) => {
+            output::error_line(&format!("{}: {reason}", PRODUCT_NAME));
+            return EXIT_TRANSPORT;
+        }
+    };
+    use crate::transport::Transport;
+    let mut transport = transport;
+    let monitors = match transport.monitors() {
+        Ok(monitors) => monitors,
+        Err(error) => {
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.message()));
+            return EXIT_TRANSPORT;
+        }
+    };
+    if monitors.is_empty() {
+        output::error_line(&format!(
+            "{}: there is no controllable monitor to select",
+            PRODUCT_NAME
+        ));
+        return EXIT_TARGET;
+    }
+    let entries = crate::win::ui::entries_for(&monitors);
+    match crate::win::ui::select_monitors(
+        "broiler: select monitors",
+        "Choose the monitors broiler controls.",
+        &entries,
+        remember,
+    ) {
+        crate::win::ui::Answer::Cancelled => {
+            output::line("selection unchanged");
+            EXIT_OK
+        }
+        crate::win::ui::Answer::Confirmed { ids, remember } => {
+            record_selection(storage, &ids, remember)
+        }
+    }
+}
+
+/// Store the confirmed selection, through the coordinator when it is running.
+fn record_selection(storage: &StorageContext, ids: &[String], remember: bool) -> i32 {
+    if crate::runtime::is_running(storage) {
+        return match crate::runtime::request(
+            storage,
+            "monitors.select",
+            json!({"monitor_ids": ids, "remember": remember}),
+        ) {
+            Ok(result) => {
+                emit_json(&result);
+                EXIT_OK
+            }
+            Err(error) => report_client_error(&error),
+        };
+    }
+    // No coordinator: write the two settings fields and leave everything else exactly as it is.
+    let mut settings = match crate::config::settings::load(&storage.settings_file()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
+            return EXIT_USAGE;
+        }
+    };
+    settings.monitor_ids = ids.to_vec();
+    settings.remember = remember;
+    match crate::config::settings::save(&storage.settings_file(), &settings) {
+        Ok(()) => {
+            emit_json(&json!({
+                "selection": settings.monitor_ids,
+                "remember": settings.remember,
+                "storage": storage.describe(),
+            }));
+            EXIT_OK
+        }
+        Err(error) => {
+            output::error_line(&format!("{}: {}", PRODUCT_NAME, error.render()));
             EXIT_TRANSPORT
         }
     }
@@ -1480,10 +1568,12 @@ fn monitors_select(args: &[String], storage: &StorageContext) -> i32 {
     }
 
     if dialog {
-        return usage_error(
-            "monitors select: the selection dialog arrives with the user-interface gate; \
-             use --monitor <id> or --none",
-        );
+        if !ids.is_empty() || none {
+            return usage_error(
+                "monitors select: --dialog cannot be combined with --monitor or --none",
+            );
+        }
+        return select_with_dialog(storage, remember);
     }
     if none && !ids.is_empty() {
         return usage_error("monitors select: --none cannot be combined with --monitor");
@@ -1726,6 +1816,15 @@ mod tests {
 
     // The handlers take the resolved root explicitly; these local wrappers keep each test focused on
     // the command it exercises while still routing through the isolated root.
+    /// An isolated root and its base directory, for tests that write settings.
+    fn fresh(name: &str) -> (StorageContext, PathBuf) {
+        let mut base = std::env::temp_dir();
+        base.push(format!("broiler-cli-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch");
+        (StorageContext::for_test(&base.join("data")), base)
+    }
+
     fn dispatch_console(args: &[String]) -> i32 {
         super::dispatch_console(args, test_root())
     }
@@ -1831,6 +1930,49 @@ mod tests {
             take_config_dir(&argv(&["paths"])).expect("parsed"),
             (None, argv(&["paths"]))
         );
+    }
+
+    #[test]
+    fn a_confirmed_selection_is_recorded_without_touching_the_other_settings() {
+        let (storage, base) = fresh("select-record");
+        std::fs::create_dir_all(storage.root()).expect("root");
+        std::fs::write(
+            storage.settings_file(),
+            "# hand written\nschema_version = 1\n\n[tray]\nleft_click = \"cycle\"\n\n[selection]\nremember = false\nmonitor_ids = []\n",
+        )
+        .expect("settings");
+
+        assert_eq!(
+            record_selection(&storage, &[String::from("mon-a"), String::from("mon-b")], true),
+            EXIT_OK
+        );
+
+        let text = std::fs::read_to_string(storage.settings_file()).expect("settings");
+        assert!(text.starts_with("# hand written\n"), "{text}");
+        assert!(text.contains("left_click = \"cycle\""), "{text}");
+        let settings = crate::config::settings::load(&storage.settings_file()).expect("reload");
+        assert_eq!(
+            settings.monitor_ids,
+            vec![String::from("mon-a"), String::from("mon-b")]
+        );
+        assert!(settings.remember);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn an_empty_confirmed_selection_is_recorded_as_empty() {
+        let (storage, base) = fresh("select-empty");
+        std::fs::create_dir_all(storage.root()).expect("root");
+        std::fs::write(
+            storage.settings_file(),
+            "schema_version = 1\n\n[selection]\nremember = true\nmonitor_ids = [\"mon-a\"]\n",
+        )
+        .expect("settings");
+
+        assert_eq!(record_selection(&storage, &[], true), EXIT_OK);
+        let settings = crate::config::settings::load(&storage.settings_file()).expect("reload");
+        assert!(settings.monitor_ids.is_empty());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

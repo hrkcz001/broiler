@@ -8,9 +8,9 @@ Three distinct kinds of value, never interchangeable:
 
 | Kind | Written as | Meaning |
 |---|---|---|
-| Percent | `35`, `{ percent = 35 }` | Fraction of the monitor's validated usable range, 0..100 |
-| Native continuous | `{ raw = 0x80 }` | Exact value in the monitor's reported unit, within its reported minimum/maximum |
-| Discrete choice | `0x0B`, `{ raw = 0x0B }`, `"6500k"` | One member of a device-reported value set, or a named standard meaning |
+| Percent | `35`, `{ percent = 35 }` | Fraction of the monitor's usable range, 0..100. Continuous controls only. |
+| Native | `{ raw = 0x80 }`, `{ raw = 5 }` | One exact byte for that control, validated against the device's range or enumerated set |
+| Named intent | `"6500k"`, `"srgb"`, `{ kelvin = 6500 }` | A requested standard meaning that the daemon resolves to one native value |
 
 Rules:
 
@@ -19,8 +19,9 @@ Rules:
 3. A native value outside the validated range or discrete set is rejected. No clamping, no substitution, no silent fallback to percent.
 4. Percent and raw cannot be combined in one control. `{ percent = 35, raw = 0x40 }` is an error.
 5. Discrete controls never accept percentages.
-6. Every applied write records requested value and unit, resolved native value, backend used, observed readback, timestamp and verification state.
-7. TOML has no distinct hexadecimal runtime type; hex is presentation syntax. Diagnostics print both decimal and hex for native values.
+6. There is no separate "discrete value" syntax. The native value is an integer payload; it is not universally one byte. Standard non-table VCP values can use 16 bits, and each control still requires its own encoding/range checks. Whether a control is a range or an enumerated set is a property of the monitor, discovered at runtime from its capabilities and code type; the config author never declares it. `{ raw = 5 }` is therefore the same syntax for an enumerated `0x14` preset and for a range-limited continuous value. Percentage is rejected for enumerated controls, because a preset index is a choice, not a point on a percentage scale.
+7. Every applied write records requested value and unit, resolved native value, backend used, observed readback, timestamp and verification state.
+8. TOML has no distinct hexadecimal runtime type; hex is presentation syntax. Diagnostics print both decimal and hex for native values.
 
 Percent mapping uses the monitor's reported minimum and maximum, not an assumed 0..100 range:
 
@@ -36,13 +37,13 @@ Readback comparison uses the resolved native value, not the unrepresentable perc
 |---|---|---|---|
 | `brightness` | `0x10` | continuous | `Get/SetMonitorBrightness` first, else `0x10` |
 | `contrast` | `0x12` | continuous | `Get/SetMonitorContrast` first, else `0x12` |
-| `color_temperature` | `0x14` or `0x0C` | discrete or continuous request | `Get/SetMonitorColorTemperature` first, else validated VCP path |
-| `color_preset` | `0x14` | discrete | `0x14` only |
+| `color_temperature` | `0x14` (enumerated) or `0x0C` (request) | native integer, set- or range-validated per device | `Get/SetMonitorColorTemperature` first, else validated VCP path |
+| `color_preset` | `0x14` | enumerated | `0x14` only |
 | `rgb_gain.red` | `0x16` | continuous | `Get/SetMonitorRedGreenOrBlueGain` first, else `0x16` |
 | `rgb_gain.green` | `0x18` | continuous | same, else `0x18` |
 | `rgb_gain.blue` | `0x1A` | continuous | same, else `0x1A` |
 | `volume` | `0x62` | continuous, restricted | `0x62` |
-| `mute` | `0x8D` | discrete, audio only | `0x8D` with confirmed encoding |
+| `mute` | `0x8D` | enumerated, audio only | `0x8D` with confirmed encoding |
 
 Not writable in v1, in any form: `0x0B` (read-only increment metadata), `0x04`, `0x05`, `0x06`, `0x08` (factory restores), `0x0A`, `0x60` (input source), `0x87` (sharpness), `0xD6` (power mode), `0xDC` (display mode), `0xDF`/`0xAC`/`0xAE` (read-only telemetry), table controls, and any vendor code. There is no generic `set-vcp` command.
 
@@ -56,16 +57,18 @@ Not writable in v1, in any form: `0x0B` (read-only increment metadata), `0x04`, 
 
 ## Color temperature
 
-Three forms, exactly one per profile:
+Exactly one per profile, in one of two shapes: a named intent, or a native value tagged with the VCP code that carries it.
 
 ```toml
-color_temperature = "6500k"                        # Kelvin intent
-color_temperature = { kelvin = 6500 }              # Kelvin intent, explicit
-color_temperature = { vcp = 0x14, raw = 0x05 }     # exact discrete preset
-color_temperature = { vcp = 0x0C, raw = 0x23 }     # exact native request
+color_temperature = "6500k"                        # named intent
+color_temperature = { kelvin = 6500 }              # named intent, explicit
+color_temperature = { vcp = 0x14, raw = 5 }        # native integer for the preset code
+color_temperature = { vcp = 0x0C, raw = 35 }       # native integer for the request code
 ```
 
-Accepted named temperatures: `4000k`, `5000k`, `6500k`, `7500k`, `8200k`, `9300k`, `10000k`, `11500k`. This list mirrors the Windows high-level enumeration and the standard simple preset labels. It is a request vocabulary, not a claim that every display implements every entry.
+Both `raw` forms are the same kind of value: one native integer, exactly as sent. They differ only in which code receives it and therefore in how it is validated. `vcp = 0x14` is the enumerated preset code: the byte must be one of the values that monitor accepts, and `5` is a preset index, not five percent. `vcp = 0x0C` is the request code: the byte is checked against that monitor's reported request range. The literal `0x14`/`0x0C` is a code, the literal after `raw =` is a value — never mix those roles.
+
+Accepted named temperatures (named intent only; a native value is not a temperature in Kelvin): `4000k`, `5000k`, `6500k`, `7500k`, `8200k`, `9300k`, `10000k`, `11500k`. This list mirrors the Windows high-level enumeration and the standard simple preset labels. It is a request vocabulary, not a claim that every display implements every entry.
 
 Resolution order for Kelvin intent:
 
@@ -76,7 +79,7 @@ Resolution order for Kelvin intent:
 
 The backend is chosen before the first write. Never retry a different mechanism after an uncertain or timed-out write.
 
-Discrete preset semantics: the native value is the VCP payload, not a VCP code, percentage, or Windows enum ordinal. Standard simple values include `0x01` sRGB, `0x02` native, `0x03` 4000 K, `0x04` 5000 K, `0x05` 6500 K, `0x06` 7500 K, `0x07` 8200 K, `0x08` 9300 K, `0x09` 10000 K, `0x0A` 11500 K, `0x0B` to `0x0D` user presets. A device may implement a different or smaller set; only values it actually accepts are writable. Named Kelvin strings map onto these labels only when the device confirms that meaning.
+Preset-code semantics: the native value is the VCP payload, not a VCP code, a percentage, or a Windows enum ordinal. This project's own reference display is configured this way today: The owner configured two endpoints in Twinkle Tray: brightness 0 (night) selects native value 5 of `0x14`, and brightness 100 selects value 8. This does NOT establish the full supported set, imply support for 6 or 7, or request interpolation. Standard simple labels for 5 and 8 are 6500 K and 9300 K; their meaning on this device remains to be verified. broiler represents this use case as two profiles with explicit native choices, not an automatic brightness-to-temperature curve. Standard simple values include `0x01` sRGB, `0x02` native, `0x03` 4000 K, `0x04` 5000 K, `0x05` 6500 K, `0x06` 7500 K, `0x07` 8200 K, `0x08` 9300 K, `0x09` 10000 K, `0x0A` 11500 K, `0x0B` to `0x0D` user presets. A device may implement a different or smaller set; only values it actually accepts are writable. Named Kelvin strings map onto these labels only when the device confirms that meaning.
 
 Temperature request semantics: `0x0C` is continuous in the standard definition, with device-specific baseline, increment and range. `0x0B` reports the increment as read-only metadata. A conversion of the form `baseline + request * increment` may be offered only after validating the actual baseline/increment for that display. Without a validated conversion, an explicit native request is still writable but is shown in native units, never labelled with an invented Kelvin value.
 

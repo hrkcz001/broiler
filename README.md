@@ -125,7 +125,7 @@ Those numbers are examples, not a calibration recommendation. Omitted parameters
 
 ### Percentages, native integers and hexadecimal choices
 
-Values do not all share a 0..100 range:
+Values do not all share a 0..100 range. There is exactly one native syntax, `{ raw = N }`, whether the monitor accepts a range or a short list of values:
 
 ```toml
 [monitor]

@@ -522,6 +522,18 @@ The repository license is Apache-2.0; copyright holder is exactly `hrkcz001 2026
 
 - Zero profiles need a setup path; default profiles are not silently fabricated.
 - Multiple-profile startup preserves monitor state unless a future explicit startup-apply feature is added.
+
+> Implemented 2026-10-25 (repair gate R2). "Preserve" now means *read*: at startup the coordinator
+> reads once, per monitor and control, the union of the controls the loaded profiles explicitly
+> request, and compares the device's native values with the native targets the planner itself would
+> write. A complete agreement is reported as `matched` and never as applied; complete disagreement is
+> `custom`; anything less than complete evidence is `unknown`; a monitor that has not been observed is
+> `checking`. The result is one coordinator-owned snapshot that the icon, the tooltip, the flyout and
+> `status` all read, with the evidence timestamp next to it. A persisted per-monitor record — profile
+> id plus content fingerprint — only breaks a tie between candidates the reads already proved, and is
+> dropped when the write that produced it did not verify. No write, no polling and no
+> brightness-temperature linking takes place during an observation. `src/reconcile.rs` holds the
+> comparison, `src/state.rs` the tie-break history, and `docs/status-2026-10-25-r2.md` the evidence.
 - A reload is not an automatic hardware write or exit trigger.
 - A stable monitor identity is conditional on usable identity evidence, not guaranteed by a hash.
 - A silent zero-monitor exit means the app cannot later detect hotplug without being restarted.

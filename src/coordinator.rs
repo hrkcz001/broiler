@@ -18,6 +18,7 @@ use crate::config::value::{percent_to_native, ControlValue, DeviceValueSupport};
 use crate::config::Profile;
 use crate::ipc::{Failure, PROTOCOL_VERSION};
 use crate::plan::{self, PlanError};
+use crate::reconcile::{self, CurrentProfile, Evidence, HistoryHint, Observed};
 use crate::transport::{ControlReading, MonitorSummary, Transport, TransportError};
 
 /// Controls with an executable write path in this build, in the transport's own spelling.
@@ -30,6 +31,10 @@ const WRITE_PATH_CONTROLS: &[&str] = &["brightness", "contrast"];
 fn build_writes(control: &str) -> bool {
     WRITE_PATH_CONTROLS.contains(&control)
 }
+
+/// Controls this build can read. Everything else a profile requests is recorded as unavailable for
+/// observation, which makes a candidate containing it unverified instead of silently ignored.
+const READABLE_CONTROLS: &[&str] = &["brightness", "contrast"];
 
 /// Controls a profile requests that this build cannot write at all.
 fn unimplemented_controls(profile: &Profile) -> Vec<&'static str> {
@@ -206,6 +211,13 @@ pub struct Coordinator<T: Transport> {
     /// What the last command published, so a caller can see that a change was announced rather than
     /// applied silently. Production reads it only for the log; a test asserts on it.
     last_published: Vec<String>,
+    /// The single current-state answer per monitor. Icon, tooltip, flyout and `status` all read this,
+    /// so they cannot disagree with each other or with the last observation.
+    current: std::collections::HashMap<String, CurrentProfile>,
+    /// The persisted applied history, used only to break a tie between equally validated profiles.
+    state: crate::state::State,
+    /// Where the history is stored, when this coordinator owns a data root.
+    state_path: Option<PathBuf>,
     /// The data root this coordinator owns. Every filesystem decision goes through it, and a client
     /// that resolved another root is refused rather than answered about data it never read.
     storage: Option<crate::storage::StorageContext>,
@@ -257,6 +269,9 @@ impl<T: Transport> Coordinator<T> {
             readings: std::collections::HashMap::new(),
             dirty: Vec::new(),
             last_published: Vec::new(),
+            current: std::collections::HashMap::new(),
+            state: crate::state::State::default(),
+            state_path: None,
             storage: None,
             ui_window: 0,
             shutdown_requested: false,
@@ -270,8 +285,17 @@ impl<T: Transport> Coordinator<T> {
         self
     }
 
-    /// Attach the resolved data root this coordinator owns.
+    /// Attach the resolved data root this coordinator owns, and load the persisted history from it.
     pub fn with_storage(mut self, storage: crate::storage::StorageContext) -> Coordinator<T> {
+        let (state, usable) = crate::state::load(&storage.state_file());
+        if !usable {
+            crate::log_error!(
+                "the local state file {} could not be used; the applied history is treated as empty",
+                storage.state_file().display()
+            );
+        }
+        self.state = state;
+        self.state_path = Some(storage.state_file());
         self.storage = Some(storage);
         self
     }
@@ -311,6 +335,140 @@ impl<T: Transport> Coordinator<T> {
     /// The icon name of a profile id, for the tray and the flyout rows.
     pub fn profile_icon(&self, id: &str) -> Option<&str> {
         self.registry.find(id).map(|profile| profile.icon.as_str())
+    }
+
+    /// The single current-state answer for one monitor.
+    ///
+    /// Every surface reads this: the tray icon, the tooltip, the flyout marker and `status`. A monitor
+    /// that was never observed is `checking`, which is the truth before the first read completes.
+    pub fn current(&self, monitor: &str) -> CurrentProfile {
+        self.current
+            .get(monitor)
+            .cloned()
+            .unwrap_or_else(CurrentProfile::checking)
+    }
+
+    /// Every control any loaded profile explicitly requests, in a stable order.
+    ///
+    /// This is the whole read set of an observation: nothing else is read, so an observation costs the
+    /// union of what the profiles ask for and no speculative probing.
+    fn requested_controls(&self) -> Vec<&'static str> {
+        let mut controls: Vec<&'static str> = Vec::new();
+        for profile in self.registry.profiles() {
+            for control in profile.requested_control_names() {
+                if !controls.contains(&control) {
+                    controls.push(control);
+                }
+            }
+        }
+        controls
+    }
+
+    /// Read once, compare, and record what each monitor is currently in. Never writes.
+    ///
+    /// Each control of the union is read exactly once per monitor through the single serialized
+    /// transport. The comparison is then done by [`reconcile::classify`], which uses the planner's own
+    /// conversion, so the answer is `matched` — never `applied` — when the reads merely agree.
+    pub fn reconcile(&mut self, monitors: &[String]) -> Vec<String> {
+        // A monitor that is no longer present keeps no claim: an answer about a display someone
+        // unplugged is not evidence, and a reconnect must start from a fresh observation rather than
+        // from a snapshot of another connection generation.
+        if let Ok(present) = self.transport.monitors() {
+            let present: Vec<String> = present.into_iter().map(|monitor| monitor.id).collect();
+            self.current
+                .retain(|monitor, _| present.contains(monitor) || monitors.contains(monitor));
+        }
+        let controls = self.requested_controls();
+        let mut observed: Vec<String> = Vec::new();
+        for monitor in monitors {
+            let mut evidence = Evidence::new(monitor, &crate::clock::iso_local());
+            for control in &controls {
+                if !READABLE_CONTROLS.contains(control) {
+                    evidence.record(
+                        control,
+                        Observed::Unavailable(format!(
+                            "this build has no read path for {control}"
+                        )),
+                    );
+                    continue;
+                }
+                match self.transport.read(monitor, control) {
+                    Ok(reading) => {
+                        self.remember_reading(monitor, control, &reading);
+                        evidence.record(
+                            control,
+                            Observed::Value {
+                                current: reading.current,
+                                minimum: reading.minimum,
+                                maximum: reading.maximum,
+                            },
+                        );
+                    }
+                    // A positive refusal is evidence about the display, not about the channel.
+                    Err(TransportError::Unsupported(message)) => {
+                        evidence.record(control, Observed::Unsupported(message));
+                    }
+                    Err(error) => {
+                        evidence.record(control, Observed::Failed(error.message().to_string()));
+                    }
+                }
+            }
+
+            let hint = self.state.applied.get(monitor).map(|record| HistoryHint {
+                profile_id: record.profile_id.clone(),
+                fingerprint: record.fingerprint.clone(),
+            });
+            let current = reconcile::classify(self.registry.profiles(), &evidence, hint.as_ref());
+            crate::log_info!(
+                "{monitor}: observation {} -> {} ({})",
+                evidence.observed_at,
+                current.state.as_str(),
+                current.profile_id.as_deref().unwrap_or("-")
+            );
+            if let Some(reason) = &current.reason {
+                crate::log_info!("{monitor}: {}", reason);
+            }
+            self.current.insert(monitor.clone(), current);
+            observed.push(monitor.clone());
+        }
+        self.mark_changed(&observed);
+        observed
+    }
+
+    /// Record a verified application: the hardware now demonstrably is this profile.
+    fn note_applied(&mut self, monitor: &str, profile: &Profile) {
+        let at = crate::clock::iso_local();
+        self.last_applied
+            .insert(monitor.to_string(), profile.id.clone());
+        self.current
+            .insert(monitor.to_string(), CurrentProfile::applied(&profile.id, &at));
+        self.state
+            .record_applied(monitor, &profile.id, &reconcile::fingerprint(profile), &at);
+        self.persist_state();
+    }
+
+    /// Drop any claim about a monitor after a write whose effect is not verified.
+    ///
+    /// A partial or unknown outcome means the hardware is in a state nobody observed. The old answer is
+    /// invalidated immediately; the history entry is forgotten too, because it may no longer describe
+    /// the display.
+    fn note_unverified(&mut self, monitor: &str, reason: &str) {
+        self.last_applied.remove(monitor);
+        self.current
+            .insert(monitor.to_string(), CurrentProfile::unknown(reason));
+        self.state.forget(monitor);
+        self.persist_state();
+    }
+
+    fn persist_state(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        if let Err(error) = crate::state::save(&path, &self.state) {
+            // History is a tie-break, so a failed write degrades one refinement and nothing else. It
+            // is logged rather than silently ignored.
+            crate::log_error!("cannot record the applied history in {}: {error}", path.display());
+        }
     }
 
     /// The last value seen for one control, without touching the hardware.
@@ -438,6 +596,14 @@ impl<T: Transport> Coordinator<T> {
         }
 
         self.last_applied.remove(monitor);
+        // A direct change is not a profile any more, but only a read may decide what it is: the claim is
+        // dropped here and the observation below replaces it with evidence.
+        self.current.insert(
+            monitor.to_string(),
+            CurrentProfile::unknown("the value was changed directly; re-reading the display"),
+        );
+        self.state.forget(monitor);
+        self.persist_state();
         // The readback is a fresh observation of this control, so the cache carries it with the range
         // the earlier read reported rather than losing that range.
         let (minimum, maximum) = self
@@ -453,6 +619,9 @@ impl<T: Transport> Coordinator<T> {
         self.readings
             .insert((monitor.to_string(), control.to_string()), observed);
         self.mark_changed(std::slice::from_ref(&monitor.to_string()));
+        // Reconcile by reading, which is safe: one write has completed and verified, so no writer is in
+        // doubt. This keeps a direct change from leaving a stale profile claim behind.
+        self.reconcile(std::slice::from_ref(&monitor.to_string()));
         Ok(json!({
             "monitor": monitor,
             "control": control,
@@ -753,12 +922,16 @@ impl<T: Transport> Coordinator<T> {
             };
 
             if status == "applied" {
-                self.last_applied
-                    .insert(monitor.clone(), profile.id.clone());
+                // Every requested field was written and the readback matched, which is the one case
+                // where the coordinator may claim the hardware is in this profile.
+                self.note_applied(&monitor, &profile);
             } else {
                 // A partial or failed apply leaves the monitor in an unverified state; an older
                 // profile id must not stay labelled active.
-                self.last_applied.remove(&monitor);
+                self.note_unverified(
+                    &monitor,
+                    "the last apply did not complete, so the display state is unknown",
+                );
             }
             // Whatever the outcome, this monitor's icon, tooltip and flyout row changed.
             self.mark_changed(std::slice::from_ref(&monitor));
@@ -820,16 +993,36 @@ impl<T: Transport> Coordinator<T> {
         match method {
             "ping" => Ok(json!({"protocol": PROTOCOL_VERSION})),
             "status" => {
-                let monitors = self
-                    .transport
-                    .monitors()
-                    .map_err(transport_failure)?
-                    .into_iter()
+                // `--refresh` asks for a fresh observation; an ordinary status answers from the cached
+                // one, because a status command must never turn into a DDC read on a persistent loop.
+                if params
+                    .get("refresh")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let targets = self.resident_targets();
+                    self.reconcile(&targets);
+                }
+                let present = self.transport.monitors().map_err(transport_failure)?;
+                let monitors = present
+                    .iter()
                     .map(|monitor| {
+                        let current = self.current(&monitor.id);
                         json!({
                             "id": monitor.id,
                             "friendly_name": monitor.friendly_name,
                             "connector": monitor.connector,
+                            // One snapshot per monitor, the same one the icon, the tooltip and the
+                            // flyout use.
+                            "current": {
+                                "state": current.state.as_str(),
+                                "profile": current.profile_id(),
+                                "profile_name": current
+                                    .profile_id()
+                                    .and_then(|id| self.profile_name(id)),
+                                "reason": current.reason,
+                                "observed_at": current.observed_at,
+                            },
                         })
                     })
                     .collect::<Vec<Value>>();
@@ -1031,8 +1224,10 @@ impl<T: Transport> Coordinator<T> {
                 match ProfileRegistry::load_dir(&directory) {
                     Ok(registry) => {
                         self.registry = registry;
-                        // Names and icons may have changed under every icon and row.
+                        // Names and icons may have changed under every icon and row, and the set of
+                        // candidate profiles changed, so a fresh observation replaces the old answer.
                         let targets = self.resident_targets();
+                        self.reconcile(&targets);
                         self.mark_changed(&targets);
                         Ok(json!({
                             "reloaded": true,
@@ -1051,7 +1246,14 @@ impl<T: Transport> Coordinator<T> {
             }
             "profile.next" => {
                 let monitor = string_param(params, "monitor")?;
-                let current = self.last_applied.get(&monitor).cloned();
+                // Cycle starts after the profile the coordinator currently reports, whether that came
+                // from an observation or from an apply of this process. With nothing known it starts at
+                // the first profile in registry order.
+                let current = self
+                    .current
+                    .get(&monitor)
+                    .and_then(|current| current.profile_id().map(str::to_string))
+                    .or_else(|| self.last_applied.get(&monitor).cloned());
                 let next = match current.as_deref() {
                     Some(id) => self
                         .registry
@@ -1252,6 +1454,8 @@ mod tests {
             directory.join("settings.toml"),
         )
         .with_profiles_dir(directory.to_path_buf())
+        // The history lives in the same disposable root, so a test never touches the user's state.
+        .with_storage(crate::storage::StorageContext::for_test(directory))
     }
 
     #[test]
@@ -1719,6 +1923,169 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).expect("read"),
             "schema_version = \n"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    // -----------------------------------------------------------------------
+    // R2: read-only preserve reconciliation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_observation_writes_nothing_and_reports_matched_not_applied() {
+        let directory = scratch("reconcile-read-only");
+        // The display already reports 20, which is what the `night` profile asks for.
+        let transport =
+            FakeTransport::with_monitor("mon-a", "Panel").with_value("mon-a", "brightness", 20);
+        let profiles = vec![
+            sample_profile("day", 10, "brightness = 80"),
+            sample_profile("night", 20, "brightness = 20"),
+        ];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        assert_eq!(
+            coordinator.current("mon-a").state,
+            crate::reconcile::CurrentState::Checking,
+            "nothing is known before the first observation"
+        );
+
+        let observed = coordinator.reconcile(&[String::from("mon-a")]);
+        assert_eq!(observed, vec![String::from("mon-a")]);
+
+        let current = coordinator.current("mon-a");
+        assert_eq!(current.state, crate::reconcile::CurrentState::Matched);
+        assert_eq!(current.profile_id(), Some("night"));
+        assert!(current.observed_at.is_some());
+        // A read-only match is not an application, and it wrote nothing.
+        assert_eq!(current.state.as_str(), "matched");
+        assert!(
+            coordinator.transport.writes.is_empty(),
+            "an observation must never write to the hardware"
+        );
+        // The same answer every surface reads: the icon comes from the matched profile.
+        assert_eq!(coordinator.profile_icon("night"), Some("day"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_status_refresh_observes_once_and_an_ordinary_status_does_not_read_hardware() {
+        let directory = scratch("status-refresh");
+        let transport =
+            FakeTransport::with_monitor("mon-a", "Panel").with_value("mon-a", "brightness", 80);
+        let profiles = vec![sample_profile("day", 10, "brightness = 80")];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        // Without refresh the cached snapshot is all that is consulted.
+        let status = coordinator.handle("status", &json!({"refresh": false})).expect("status");
+        assert_eq!(status["monitors"][0]["current"]["state"], "checking");
+
+        let status = coordinator.handle("status", &json!({"refresh": true})).expect("status");
+        assert_eq!(status["monitors"][0]["current"]["state"], "matched");
+        assert_eq!(status["monitors"][0]["current"]["profile"], "day");
+        assert_eq!(status["monitors"][0]["current"]["profile_name"], "day");
+        assert!(coordinator.transport.writes.is_empty());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_cycle_starts_after_the_observed_profile_and_not_at_the_first_one() {
+        let directory = scratch("next-after-observed");
+        // The hardware is in `night`; a cycle must go to `day`, not back to `night`.
+        let transport =
+            FakeTransport::with_monitor("mon-a", "Panel").with_value("mon-a", "brightness", 20);
+        let profiles = vec![
+            sample_profile("day", 10, "brightness = 80"),
+            sample_profile("night", 20, "brightness = 20"),
+        ];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+        coordinator.reconcile(&[String::from("mon-a")]);
+        assert_eq!(coordinator.current("mon-a").profile_id(), Some("night"));
+
+        let result = coordinator
+            .handle("profile.next", &json!({"monitor": "mon-a"}))
+            .expect("cycle");
+        assert_eq!(result["monitors"][0]["monitor"], "mon-a");
+        assert_eq!(result["profile"], "day");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_unsupported_read_leaves_the_monitor_unknown_and_claims_no_profile() {
+        let directory = scratch("reconcile-unsupported");
+        // Contrast is part of the profile but the display does not offer it.
+        let transport = FakeTransport::with_monitor("mon-a", "Panel")
+            .with_value("mon-a", "brightness", 40)
+            .without_control("mon-a", "contrast");
+        let profiles = vec![sample_profile("day", 10, "brightness = 40\ncontrast = 70")];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        coordinator.reconcile(&[String::from("mon-a")]);
+        let current = coordinator.current("mon-a");
+        assert_eq!(current.state, crate::reconcile::CurrentState::Unknown);
+        assert_eq!(current.profile_id(), None);
+        assert!(current.reason.as_deref().unwrap_or("").contains("contrast"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_persisted_history_breaks_a_tie_and_a_failed_apply_drops_it() {
+        let directory = scratch("reconcile-history");
+        // Two profiles with identical requests: reads alone cannot tell them apart.
+        let transport =
+            FakeTransport::with_monitor("mon-a", "Panel").with_value("mon-a", "brightness", 50);
+        let profiles = vec![
+            sample_profile("alpha", 10, "brightness = 50"),
+            sample_profile("bravo", 20, "brightness = 50"),
+        ];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+
+        // Without history, registry order decides.
+        coordinator.reconcile(&[String::from("mon-a")]);
+        assert_eq!(coordinator.current("mon-a").profile_id(), Some("alpha"));
+
+        // Applying the second one records the history and the verified state.
+        coordinator
+            .handle("profile.apply", &json!({"id": "bravo", "monitor": "mon-a"}))
+            .expect("apply");
+        assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Applied);
+        assert!(directory.join("state.json").exists(), "the history is persisted");
+
+        // A later observation prefers the profile the history names.
+        coordinator.reconcile(&[String::from("mon-a")]);
+        assert_eq!(coordinator.current("mon-a").profile_id(), Some("bravo"));
+
+        // A failed apply leaves nothing verified, and the recorded history goes with it.
+        coordinator.transport.failing_writes.push((
+            String::from("mon-a"),
+            String::from("brightness"),
+            TransportError::Timeout(String::from("no answer")),
+        ));
+        coordinator
+            .handle("profile.apply", &json!({"id": "bravo", "monitor": "mon-a"}))
+            .expect("apply reports a failure rather than aborting");
+        assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Unknown);
+        let text = std::fs::read_to_string(directory.join("state.json")).expect("state");
+        assert!(!text.contains("bravo"), "{text}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_monitor_that_was_unplugged_loses_its_claim() {
+        let directory = scratch("reconcile-reconnect");
+        let transport =
+            FakeTransport::with_monitor("mon-a", "Panel").with_value("mon-a", "brightness", 40);
+        let profiles = vec![sample_profile("day", 10, "brightness = 40")];
+        let mut coordinator = coordinator_with(transport, profiles, &directory);
+        coordinator.reconcile(&[String::from("mon-a")]);
+        assert_eq!(coordinator.current("mon-a").profile_id(), Some("day"));
+
+        // The display disappears: a later observation must not keep answering about it.
+        coordinator.transport.unplug("mon-a");
+        coordinator.reconcile(&[]);
+        assert_eq!(
+            coordinator.current("mon-a").state,
+            crate::reconcile::CurrentState::Checking,
+            "a stale claim about a disconnected display must not survive"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

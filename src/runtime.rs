@@ -496,14 +496,29 @@ pub fn run_resident(storage: StorageContext) -> i32 {
     );
 
     let targets = resident_targets(&coordinator);
+
+    // Preserve means read, never apply: one observation of the controls the loaded profiles request,
+    // before the first icon is shown, so the tray opens on evidence instead of a neutral guess. This
+    // is a bounded read pass through the single worker and writes nothing.
+    {
+        let observed = match coordinator.lock() {
+            Ok(mut guard) => guard.reconcile(&targets),
+            Err(_) => Vec::new(),
+        };
+        log_info!(
+            "observation completed for {} of {} monitor(s) before serving",
+            observed.len(),
+            targets.len()
+        );
+    }
+
     let specs: Vec<crate::tray::IconSpec> = targets
         .iter()
         .enumerate()
         .map(|(position, monitor)| crate::tray::IconSpec {
             monitor: monitor.clone(),
-            // A persisted profile id proves nothing about the current hardware state, so the icon
-            // starts neutral.
-            glyph: crate::tray::Glyph::Monitor,
+            // The icon starts on whatever the observation proved, and neutral when it proved nothing.
+            glyph: initial_glyph(&coordinator, monitor),
             index: position + 1,
             badges: true,
         })
@@ -654,6 +669,35 @@ fn resident_targets(
     }
 }
 
+/// The icon name of the profile a monitor is currently in, from the shared snapshot.
+///
+/// `None` when no profile is certified, which is what makes the icon neutral instead of a guess.
+fn current_icon<T: crate::transport::Transport>(
+    coordinator: &Coordinator<T>,
+    monitor: &str,
+) -> Option<String> {
+    let current = coordinator.current(monitor);
+    let id = current.profile_id()?;
+    coordinator
+        .profile_icon(id)
+        .map(str::to_string)
+        .or_else(|| Some(id.to_string()))
+}
+
+/// The glyph a tray icon starts with: the certified profile's, or the neutral monitor.
+fn initial_glyph(
+    coordinator: &Arc<Mutex<Coordinator<crate::transport::WorkerTransport>>>,
+    monitor: &str,
+) -> crate::tray::Glyph {
+    let name = coordinator
+        .lock()
+        .ok()
+        .and_then(|guard| current_icon(&guard, monitor));
+    name.as_deref()
+        .map(crate::tray::Glyph::from_name)
+        .unwrap_or(crate::tray::Glyph::Monitor)
+}
+
 /// The display name of each controlled monitor, in slot order.
 ///
 /// Captured once, when the icons are built. A surface that needs a monitor name then reads memory
@@ -693,12 +737,20 @@ fn click_behaviour<T: crate::transport::Transport>(
         .unwrap_or(crate::config::settings::LeftClick::Cycle)
 }
 
-/// The state label a tooltip or a flyout header shows for one monitor: the profile's display name when
-/// this coordinator verified one, and `Custom` otherwise.
+/// The state label a tooltip or a flyout header shows for one monitor.
+///
+/// It is a pure function of the coordinator's one current snapshot, so the label cannot disagree with
+/// the icon or with `status`. `matched` and `applied_verified` both name the profile the user sees;
+/// the two states differ in provenance, which `status` reports and the tooltip does not need to.
 fn state_label<T: crate::transport::Transport>(coordinator: &Coordinator<T>, monitor: &str) -> String {
-    match coordinator.applied_profile(monitor) {
+    let current = coordinator.current(monitor);
+    match current.profile_id() {
         Some(id) => coordinator.profile_name(id).unwrap_or(id).to_string(),
-        None => String::from("Custom"),
+        None => match current.state {
+            crate::reconcile::CurrentState::Checking => String::from("Checking"),
+            crate::reconcile::CurrentState::Unknown => String::from("Unknown"),
+            _ => String::from("Custom"),
+        },
     }
 }
 
@@ -820,7 +872,9 @@ fn tray_flyout_content(
         .get(slot)
         .cloned()
         .unwrap_or_else(|| id.clone());
-    let current = guard.applied_profile(&id).map(str::to_string);
+    // The marker comes from the same snapshot as the icon and the tooltip, so the flyout cannot claim
+    // a profile the other surfaces do not.
+    let current = guard.current(&id).profile_id().map(str::to_string);
     let listed = guard
         .handle("profiles.list", &serde_json::Value::Null)
         .ok()
@@ -1036,24 +1090,12 @@ fn applied_fields(result: &serde_json::Value) -> Vec<String> {
     lines
 }
 
-/// The icon name of the profile the coordinator verified for this monitor, if any.
+/// The icon name of the profile this monitor is currently in, if one is certified.
 fn tray_glyph(user: *mut std::ffi::c_void, slot: usize) -> Option<String> {
     let host = unsafe { host(user) }?;
     let id = host.targets.get(slot)?.clone();
-    let mut guard = host.coordinator.lock().ok()?;
-    let profile_id = guard.applied_profile(&id)?.to_string();
-    let listed = guard
-        .handle("profiles.list", &serde_json::Value::Null)
-        .ok()?;
-    let profiles = listed.get("profiles")?.as_array()?;
-    let icon = profiles
-        .iter()
-        .find(|profile| profile.get("id").and_then(serde_json::Value::as_str) == Some(&profile_id))?
-        .get("icon")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&profile_id)
-        .to_string();
-    Some(icon)
+    let guard = host.coordinator.lock().ok()?;
+    current_icon(&guard, &id)
 }
 
 /// The reason a row reports as failed.
@@ -1438,8 +1480,9 @@ mod tests {
         .with_profiles_dir(storage.profiles_dir())
         .with_storage(storage);
 
-        // The default before anything was verified is Custom, not a guess.
-        assert_eq!(state_label(&coordinator, "mon-a"), "Custom");
+        // Before any observation the honest answer is that nobody knows yet.
+        assert_eq!(state_label(&coordinator, "mon-a"), "Checking");
+
         coordinator
             .handle("profile.apply", &serde_json::json!({"id": "night", "monitor": "mon-a"}))
             .expect("apply");
@@ -1448,6 +1491,30 @@ mod tests {
             "Night mode",
             "the tooltip must show the name the user wrote, not the file id"
         );
+        assert_eq!(
+            coordinator.current("mon-a").state,
+            crate::reconcile::CurrentState::Applied
+        );
+
+        // A direct change is not the profile any more: the reads decide, and they say Custom.
+        coordinator
+            .handle(
+                "parameters.set",
+                &serde_json::json!({"monitor": "mon-a", "control": "brightness", "value": 60, "unit": "native"}),
+            )
+            .expect("direct set");
+        assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Custom);
+        assert_eq!(state_label(&coordinator, "mon-a"), "Custom");
+
+        // Back to the profile's own value, and a read-only observation certifies it as matched — not
+        // applied, because nothing was written this time.
+        coordinator
+            .handle(
+                "parameters.set",
+                &serde_json::json!({"monitor": "mon-a", "control": "brightness", "value": 40, "unit": "native"}),
+            )
+            .expect("direct set");
+        assert_eq!(coordinator.current("mon-a").state, crate::reconcile::CurrentState::Matched);
         assert_eq!(
             crate::tray::tooltip(1, 1, "Panel", &state_label(&coordinator, "mon-a"), Some(40)),
             "Panel - Night mode, 40%"

@@ -171,15 +171,18 @@ fn report_client_error(error: &crate::runtime::ClientError) -> i32 {
 
 fn handle_status(args: &[String], storage: &StorageContext) -> i32 {
     let mut json_output = false;
+    let mut refresh = false;
     for argument in args {
         match argument.as_str() {
             "--json" => json_output = true,
-            "--refresh" => {}
+            // `--refresh` asks the coordinator for one fresh read-only observation. Without it,
+            // status answers from the cached snapshot and touches no hardware.
+            "--refresh" => refresh = true,
             other => return usage_error(&format!("status: unexpected argument: {other}")),
         }
     }
 
-    match crate::runtime::request(storage, "status", json!(null)) {
+    match crate::runtime::request(storage, "status", json!({"refresh": refresh})) {
         Ok(result) => {
             if json_output {
                 emit_json(&result);
@@ -187,12 +190,32 @@ fn handle_status(args: &[String], storage: &StorageContext) -> i32 {
                 let monitors = result
                     .get("monitors")
                     .and_then(|value| value.as_array())
-                    .map(|list| list.len())
-                    .unwrap_or(0);
+                    .cloned()
+                    .unwrap_or_default();
                 let profiles = result.get("profiles").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 output::line(&format!(
-                    "running, {monitors} monitor(s), {profiles} profile(s)"
+                    "running, {} monitor(s), {profiles} profile(s)",
+                    monitors.len()
                 ));
+                for monitor in &monitors {
+                    let name = monitor
+                        .get("friendly_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let current = monitor.get("current").cloned().unwrap_or(json!(null));
+                    let state = current
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let profile = current
+                        .get("profile_name")
+                        .or_else(|| current.get("profile"))
+                        .and_then(serde_json::Value::as_str);
+                    match profile {
+                        Some(profile) => output::line(&format!("  {name}: {profile} ({state})")),
+                        None => output::line(&format!("  {name}: {state}")),
+                    }
+                }
             }
             EXIT_OK
         }

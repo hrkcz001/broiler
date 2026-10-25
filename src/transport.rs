@@ -272,6 +272,13 @@ impl FakeTransport {
         self
     }
 
+    /// Simulate a display disappearing, for the reconnect path: what is read afterwards is a different
+    /// connection generation, so nothing learned before may be reused.
+    pub fn unplug(&mut self, monitor: &str) {
+        self.monitors.retain(|entry| entry.id != monitor);
+        self.values.retain(|(id, _), _| id != monitor);
+    }
+
     /// Fail the first write of this control on this monitor with the given error.
     pub fn fail_write(
         mut self,
